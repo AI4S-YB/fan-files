@@ -1,0 +1,22 @@
+# Fan-Files Default Configuration
+# Copy to ~/.fan-files/config.toml and customize
+
+[scan]
+include = ["/data"]
+exclude = ["/tmp", "*.tmp"]
+
+[watch]
+include = ["/data"]
+exclude = ["/tmp", "*.tmp", ".*"]
+
+[embedding]
+model = "all-MiniLM-L6-v2"
+
+[plugins]
+dir = "~/.fan-files/plugins"
+
+[retention]
+deleted_keep_days = 30
+
+[schedule]
+full_sync = "03:00"
