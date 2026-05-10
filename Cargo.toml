@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fan-core",
+    "crates/fan-plugin-sdk",
+    "crates/fan-files",
+    "plugins/generic-detector",
+    "plugins/fastq-interpreter",
+]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["full"] }

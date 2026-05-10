@@ -1,0 +1,3 @@
+target/
+.fan-files/
+*.wasm

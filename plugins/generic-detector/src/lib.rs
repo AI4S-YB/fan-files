@@ -1,0 +1,1 @@
+// generic-detector plugin - placeholder

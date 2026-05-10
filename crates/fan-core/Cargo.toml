@@ -1,0 +1,21 @@
+[package]
+name = "fan-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fan-plugin-sdk = { path = "../fan-plugin-sdk" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+walkdir = "2"
+notify = { version = "7", features = ["macos_fsevent"] }
+rusqlite = { version = "0.34", features = ["bundled", "blob"] }
+tantivy = "0.22"
+ort = "2.0.0-rc.12"
+wasmtime = "27"
+tokio = { workspace = true }
+toml = "0.8"
+sha2 = "0.10"
+mime_guess = "2"

@@ -1,0 +1,15 @@
+[package]
+name = "fan-files"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fan-files"
+path = "src/main.rs"
+
+[dependencies]
+fan-core = { path = "../fan-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

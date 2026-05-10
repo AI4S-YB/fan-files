@@ -1,0 +1,1 @@
+// fastq-interpreter plugin - placeholder
