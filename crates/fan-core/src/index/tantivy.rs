@@ -112,4 +112,12 @@ impl TantivyIndex {
         writer.commit()?;
         Ok(())
     }
+
+    /// Flush any pending changes to disk. This is a no-op if there are no
+    /// pending documents or deletes, so it is safe to call at any time.
+    pub fn commit(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.commit()?;
+        Ok(())
+    }
 }
