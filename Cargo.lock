@@ -628,6 +628,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fan-core",
+ "fan-plugin-sdk",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
