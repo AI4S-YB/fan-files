@@ -15,3 +15,10 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
