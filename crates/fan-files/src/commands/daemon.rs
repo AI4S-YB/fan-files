@@ -1,4 +1,5 @@
 use fan_core::config::Config;
+use fan_core::detector::BuiltinDetector;
 use fan_core::index::IndexEngine;
 use fan_core::plugin::registry::PluginRegistry;
 use fan_core::scanner::Scanner;
@@ -20,10 +21,9 @@ pub fn run(config: &Config) {
     let mut scan_count = 0;
 
     for file_info in scanner.scan() {
-        let format_info = plugins.detect_format(
-            &file_info.path.to_string_lossy(),
-            &file_info.magic_bytes,
-        );
+        let path_str = file_info.path.to_string_lossy();
+        let format_info = plugins.detect_format(&path_str, &file_info.magic_bytes)
+            .or_else(|| BuiltinDetector::detect(&path_str, &file_info.magic_bytes));
         match index.index_file(&file_info, format_info.as_ref()) {
             Ok(_) => scan_count += 1,
             Err(e) => error!("Failed to index {}: {}", file_info.path.display(), e),
@@ -53,10 +53,9 @@ pub fn run(config: &Config) {
                 for path in &paths {
                     if path.exists() {
                         if let Some(file_info) = scanner.scan_single(path) {
-                            let format_info = plugins.detect_format(
-                                &file_info.path.to_string_lossy(),
-                                &file_info.magic_bytes,
-                            );
+                            let path_str = file_info.path.to_string_lossy();
+                            let format_info = plugins.detect_format(&path_str, &file_info.magic_bytes)
+                                .or_else(|| BuiltinDetector::detect(&path_str, &file_info.magic_bytes));
                             match index.index_file(&file_info, format_info.as_ref()) {
                                 Ok(_) => info!("Re-indexed: {}", path.display()),
                                 Err(e) => error!("Failed to re-index {}: {}", path.display(), e),
