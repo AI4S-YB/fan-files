@@ -1,9 +1,12 @@
 use fan_core::config::Config;
 use fan_core::detector::BuiltinDetector;
 use fan_core::index::IndexEngine;
+use fan_core::interpreter::InterpreterRegistry;
 use fan_core::plugin::registry::PluginRegistry;
 use fan_core::scanner::Scanner;
 use fan_core::watcher::FileWatcher;
+use fan_plugin_sdk::{FileContext, FormatInfo};
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
@@ -16,10 +19,12 @@ pub fn run(config: &Config) {
     let n = plugins.discover().unwrap_or(0);
     info!("Discovered {} plugins", n);
 
+    let interpreter_registry = InterpreterRegistry::new();
+
     let scanner = Scanner::new(config.scan.include.clone(), config.scan.exclude.clone());
 
     // Initial full scan
-    run_full_scan(&index, &scanner, &plugins);
+    run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
 
     let sync_time = parse_sync_time(&config.schedule.full_sync);
 
@@ -60,7 +65,7 @@ pub fn run(config: &Config) {
             && current_hour_min.1 < sync_time.1 + 10
         {
             info!("Running scheduled full sync...");
-            run_full_scan(&index, &scanner, &plugins);
+            run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
             last_sync_day = Some(current_day);
         }
 
@@ -86,7 +91,17 @@ pub fn run(config: &Config) {
                                     BuiltinDetector::detect(&path_str, &file_info.magic_bytes)
                                 });
                             match index.index_file(&file_info, format_info.as_ref()) {
-                                Ok(_) => info!("Re-indexed: {}", path.display()),
+                                Ok(file_id) => {
+                                    info!("Re-indexed: {}", path.display());
+                                    // Run context interpretation after indexing
+                                    run_interpretation(
+                                        &index,
+                                        file_id,
+                                        file_info.path.as_ref(),
+                                        format_info.as_ref(),
+                                        &interpreter_registry,
+                                    );
+                                }
                                 Err(e) => {
                                     error!("Failed to re-index {}: {}", path.display(), e)
                                 }
@@ -117,7 +132,12 @@ pub fn run(config: &Config) {
     info!("Daemon shutting down");
 }
 
-fn run_full_scan(index: &IndexEngine, scanner: &Scanner, plugins: &PluginRegistry) {
+fn run_full_scan(
+    index: &IndexEngine,
+    scanner: &Scanner,
+    plugins: &PluginRegistry,
+    interpreter_registry: &InterpreterRegistry,
+) {
     info!("Starting full scan...");
     let start = Instant::now();
     let mut count = 0u64;
@@ -127,7 +147,17 @@ fn run_full_scan(index: &IndexEngine, scanner: &Scanner, plugins: &PluginRegistr
             .detect_format(&path_str, &file_info.magic_bytes)
             .or_else(|| BuiltinDetector::detect(&path_str, &file_info.magic_bytes));
         match index.index_file(&file_info, format_info.as_ref()) {
-            Ok(_) => count += 1,
+            Ok(file_id) => {
+                count += 1;
+                // Run context interpretation after indexing
+                run_interpretation(
+                    index,
+                    file_id,
+                    file_info.path.as_ref(),
+                    format_info.as_ref(),
+                    interpreter_registry,
+                );
+            }
             Err(e) => error!("Failed to index {}: {}", file_info.path.display(), e),
         }
     }
@@ -137,6 +167,54 @@ fn run_full_scan(index: &IndexEngine, scanner: &Scanner, plugins: &PluginRegistr
         count,
         start.elapsed().as_secs_f64()
     );
+}
+
+/// Build a FileContext from a file path, its format info, and its surrounding directory
+fn build_file_context(
+    file_path: &Path,
+    format_info: Option<&FormatInfo>,
+) -> FileContext {
+    use fan_core::interpreter;
+
+    FileContext {
+        file_path: file_path.to_string_lossy().to_string(),
+        siblings: interpreter::list_siblings(file_path),
+        directory_tree: interpreter::directory_tree(file_path, 3),
+        metadata_files: interpreter::find_metadata_files(file_path),
+        file_header_b64: String::new(), // Skip for MVP
+        format_tags: format_info
+            .map(|f| vec![f.file_type.clone()])
+            .unwrap_or_default(),
+    }
+}
+
+/// Run context interpretation on an indexed file and store bio metadata
+fn run_interpretation(
+    index: &IndexEngine,
+    file_id: i64,
+    file_path: &Path,
+    format_info: Option<&FormatInfo>,
+    interpreter_registry: &InterpreterRegistry,
+) {
+    let ctx = build_file_context(file_path, format_info);
+
+    if let Some(bio_meta) = interpreter_registry.best_interpretation(&ctx, 0.3) {
+        if let Err(e) = index.sqlite.update_bio_metadata(file_id, &bio_meta) {
+            error!(
+                "Failed to update bio metadata for {}: {}",
+                file_path.display(),
+                e
+            );
+        } else if bio_meta.assay_type.is_some() || bio_meta.species.is_some() {
+            info!(
+                "Bio metadata inferred for {}: assay={:?}, species={:?}, tags={:?}",
+                file_path.display(),
+                bio_meta.assay_type,
+                bio_meta.species,
+                bio_meta.tags,
+            );
+        }
+    }
 }
 
 fn parse_sync_time(s: &str) -> (u32, u32) {
