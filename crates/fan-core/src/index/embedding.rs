@@ -1,39 +1,74 @@
 use crate::config::Config;
-use std::io::Read;
-use std::path::PathBuf;
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 pub struct EmbeddingEngine {
+    model: Option<Arc<Mutex<TextEmbedding>>>,
     model_name: String,
     dim: usize,
-    model_ready: bool,
+    available: bool,
 }
 
 impl EmbeddingEngine {
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
         let model_name = config.embedding.model.clone();
         let dim = Self::model_dim(&model_name);
-        let mut model_ready = false;
 
-        // Try to ensure the ONNX model file exists (download if needed).
-        match Self::ensure_model(&model_name) {
-            Ok(path) => {
-                info!("ONNX model available at {}", path.display());
-                model_ready = true;
+        // Try to load the real embedding model.
+        match Self::load_model(&model_name) {
+            Ok(model) => {
+                info!(
+                    "Loaded embedding model '{}' ({} dims) via fastembed",
+                    model_name, dim
+                );
+                Ok(Self {
+                    model: Some(Arc::new(Mutex::new(model))),
+                    model_name,
+                    dim,
+                    available: true,
+                })
             }
             Err(e) => {
                 warn!(
-                    "ONNX model not available: {}. Using hash-based embeddings.",
-                    e
+                    "Failed to load embedding model '{}': {}. Falling back to hash-based embeddings.",
+                    model_name, e
                 );
+                Ok(Self {
+                    model: None,
+                    model_name,
+                    dim,
+                    available: false,
+                })
             }
         }
+    }
 
-        Ok(Self {
-            model_name,
-            dim,
-            model_ready,
-        })
+    fn load_model(model_name: &str) -> Result<TextEmbedding, Box<dyn std::error::Error>> {
+        let model = match model_name {
+            "all-MiniLM-L6-v2" => EmbeddingModel::AllMiniLML6V2,
+            "all-mpnet-base-v2" => EmbeddingModel::AllMpnetBaseV2,
+            "gte-small" => EmbeddingModel::BGESmallENV15,
+            "gte-base" => EmbeddingModel::BGEBaseENV15,
+            other => {
+                return Err(format!("unsupported embedding model: {}", other).into());
+            }
+        };
+
+        let cache_dir = crate::config::dirs_fan().join("models");
+        std::fs::create_dir_all(&cache_dir).ok();
+
+        let options = TextInitOptions::new(model)
+            .with_show_download_progress(true)
+            .with_cache_dir(cache_dir);
+
+        info!(
+            "Initializing fastembed model '{}' (model will be auto-downloaded if needed)...",
+            model_name
+        );
+
+        let text_embedding = TextEmbedding::try_new(options)?;
+        Ok(text_embedding)
     }
 
     fn model_dim(model_name: &str) -> usize {
@@ -52,45 +87,6 @@ impl EmbeddingEngine {
         }
     }
 
-    /// Ensure the ONNX model file exists on disk, downloading it from HuggingFace if necessary.
-    fn ensure_model(model_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let dir = crate::config::dirs_fan().join("models");
-        std::fs::create_dir_all(&dir).ok();
-        let path = dir.join(model_name).with_extension("onnx");
-
-        if path.exists() {
-            return Ok(path);
-        }
-
-        let url = format!(
-            "https://huggingface.co/sentence-transformers/{}/resolve/main/onnx/model.onnx",
-            model_name
-        );
-
-        info!("Downloading ONNX model from {} ...", url);
-        let response = ureq::get(&url).call().map_err(|e| {
-            format!(
-                "Failed to download model '{}' from {}: {}. Place it manually at {}",
-                model_name,
-                url,
-                e,
-                path.display()
-            )
-        })?;
-
-        let mut bytes = Vec::new();
-        response.into_reader().read_to_end(&mut bytes)?;
-
-        std::fs::write(&path, &bytes)?;
-        info!(
-            "Downloaded ONNX model to {} ({} bytes)",
-            path.display(),
-            bytes.len()
-        );
-
-        Ok(path)
-    }
-
     /// The name of the configured embedding model (e.g. "all-MiniLM-L6-v2").
     pub fn model_name(&self) -> &str {
         &self.model_name
@@ -98,18 +94,33 @@ impl EmbeddingEngine {
 
     /// Generate an embedding vector for a single text string.
     ///
-    /// Uses a locality-sensitive hash-based embedding that produces
-    /// meaningful vectors for semantic similarity comparison.
+    /// Uses real sentence-transformer inference if the model is available,
+    /// otherwise falls back to locality-sensitive hash embedding.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        Ok(hash_embed(text, self.dim))
+        if let Some(ref model) = self.model {
+            let mut model = model.lock().unwrap();
+            let embeddings = model.embed(vec![text.to_string()], None)?;
+            Ok(embeddings.into_iter().next().unwrap_or_else(|| vec![0.0; self.dim]))
+        } else {
+            Ok(hash_embed(text, self.dim))
+        }
     }
 
     /// Generate embedding vectors for multiple text strings.
+    ///
+    /// Uses batched sentence-transformer inference if the model is available,
+    /// otherwise falls back to per-text hash embedding.
     pub fn embed_batch(
         &self,
         texts: &[String],
     ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
-        Ok(texts.iter().map(|t| hash_embed(t, self.dim)).collect())
+        if let Some(ref model) = self.model {
+            let mut model = model.lock().unwrap();
+            let embeddings = model.embed(texts.to_vec(), None)?;
+            Ok(embeddings)
+        } else {
+            Ok(texts.iter().map(|t| hash_embed(t, self.dim)).collect())
+        }
     }
 
     /// The dimensionality of the embeddings produced by this engine.
@@ -117,9 +128,9 @@ impl EmbeddingEngine {
         self.dim
     }
 
-    /// Whether the ONNX model file is present on disk and ready for future inference.
+    /// Whether a real embedding model is loaded and ready for inference.
     pub fn is_available(&self) -> bool {
-        self.model_ready
+        self.available
     }
 }
 

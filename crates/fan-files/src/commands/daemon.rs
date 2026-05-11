@@ -157,6 +157,8 @@ fn run_full_scan(
                     format_info.as_ref(),
                     interpreter_registry,
                 );
+                // Generate and store embedding
+                run_embedding(index, file_id, file_info.path.as_ref());
             }
             Err(e) => error!("Failed to index {}: {}", file_info.path.display(), e),
         }
@@ -215,6 +217,73 @@ fn run_interpretation(
             );
         }
     }
+}
+
+/// Generate embedding vector for a file and store it
+fn run_embedding(index: &IndexEngine, file_id: i64, file_path: &Path) {
+    if !index.embedding.is_available() {
+        return;
+    }
+
+    let text = build_embedding_text(index, file_id, file_path);
+    match index.embedding.embed(&text) {
+        Ok(vec) => {
+            if let Err(e) = index.sqlite.store_embedding(file_id, &vec) {
+                error!("Failed to store embedding for {}: {}", file_path.display(), e);
+            }
+        }
+        Err(e) => {
+            error!("Failed to generate embedding for {}: {}", file_path.display(), e);
+        }
+    }
+}
+
+/// Build a text representation of a file for embedding generation.
+/// Combines filename, format, bio metadata for richer semantic representation.
+fn build_embedding_text(index: &IndexEngine, file_id: i64, file_path: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Filename (without full path)
+    if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
+        parts.push(name.to_string());
+    }
+
+    // File type from format info
+    if let Ok(Some(entry)) = index.sqlite.get_by_id(file_id) {
+        if let Some(ref fmt) = entry.format_info {
+            parts.push(fmt.file_type.clone());
+        }
+
+        // Bio metadata fields
+        if let Some(ref meta) = entry.bio_metadata {
+            if let Some(ref assay) = meta.assay_type {
+                parts.push(assay.clone());
+            }
+            if let Some(ref species) = meta.species {
+                parts.push(species.clone());
+            }
+            if let Some(ref tissue) = meta.tissue {
+                parts.push(tissue.clone());
+            }
+            if let Some(ref project) = meta.project {
+                parts.push(project.clone());
+            }
+            for tag in &meta.tags {
+                parts.push(tag.clone());
+            }
+        }
+
+        // Parent directory names (contain contextual info)
+        for ancestor in file_path.ancestors().skip(1).take(2) {
+            if let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) {
+                if !name.is_empty() && name != "/" {
+                    parts.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    parts.join(" ")
 }
 
 fn parse_sync_time(s: &str) -> (u32, u32) {

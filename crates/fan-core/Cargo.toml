@@ -13,7 +13,7 @@ walkdir = "2"
 notify = { version = "7", features = ["macos_fsevent"] }
 rusqlite = { version = "0.34", features = ["bundled", "blob"] }
 tantivy = "0.22"
-ort = "2.0.0-rc.12"
+fastembed = { version = "5", default-features = false, features = ["hf-hub", "hf-hub-native-tls", "ort-download-binaries-native-tls"] }
 wasmtime = "27"
 tokio = { workspace = true }
 toml = "0.8"
