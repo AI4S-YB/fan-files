@@ -17,6 +17,8 @@ pub struct Config {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub schedule: ScheduleConfig,
+    #[serde(default)]
+    pub llm: LlmConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +110,30 @@ impl Default for ScheduleConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+}
+
+fn default_llm_model() -> String {
+    "gpt-4o-mini".into()
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            api_key: String::new(),
+            model: default_llm_model(),
+        }
+    }
+}
+
 fn default_socket() -> PathBuf {
     dirs_fan().join("fan.sock")
 }
@@ -151,6 +177,7 @@ impl Default for Config {
             schedule: ScheduleConfig {
                 full_sync: default_sync_time(),
             },
+            llm: LlmConfig::default(),
         }
     }
 }
