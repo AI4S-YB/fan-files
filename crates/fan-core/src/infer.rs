@@ -122,6 +122,37 @@ pub fn run_inference(
         }
     }
 
+    // 7. Back-sync LLM metadata to file-level bio_metadata
+    let mut files_updated = 0;
+    for proj in &output.projects {
+        if let Some(&_proj_id) = project_name_to_id.get(&proj.name) {
+            let assay_val = proj.assay_type.clone().unwrap_or_default();
+            let species_val = proj.species.clone().unwrap_or_default();
+            for dir in &proj.dirs {
+                for (file_id, file_path, _) in &all_files {
+                    if file_path.starts_with(dir) {
+                        if let Ok(Some(entry)) = sqlite.get_by_id(*file_id) {
+                            let mut meta = entry.bio_metadata.unwrap_or_default();
+                            if !assay_val.is_empty() {
+                                meta.assay_type = Some(assay_val.clone());
+                            }
+                            if !species_val.is_empty() {
+                                meta.species = Some(species_val.clone());
+                            }
+                            meta.project = Some(proj.name.clone());
+                            if let Err(e) = sqlite.update_bio_metadata(*file_id, &meta) {
+                                warn!("Failed to back-sync metadata for {}: {}", file_path, e);
+                            } else {
+                                files_updated += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    info!("Back-synced LLM metadata to {} files", files_updated);
+
     Ok((projects_created, output.relations.len()))
 }
 
