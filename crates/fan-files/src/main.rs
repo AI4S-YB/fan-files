@@ -48,13 +48,36 @@ enum Commands {
     Infer,
     /// List projects, or show details if a project name is given
     Projects {
-        /// Optional project name to show details
-        name: Option<String>,
+        #[command(subcommand)]
+        action: Option<ProjectAction>,
+    },
+    /// Show or clear pending review items
+    Pending {
+        #[arg(long)]
+        clear: bool,
     },
     /// Generate Claude Code skill file
     GenerateSkill {
         #[arg(long, default_value = "skill/fan-files.md")]
         output: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Show project details
+    Show {
+        name: String,
+    },
+    /// Update project metadata
+    Update {
+        name: String,
+        #[arg(long)]
+        species: Option<String>,
+        #[arg(long, value_name = "high|medium|low")]
+        confidence: Option<String>,
+        #[arg(long)]
+        assay_type: Option<String>,
     },
 }
 
@@ -71,7 +94,14 @@ fn main() {
         Commands::Info { path, json } => commands::info::run(&config, &path, json),
         Commands::Status => commands::status::run(&config),
         Commands::Infer => commands::infer::run(&config),
-        Commands::Projects { name } => commands::projects::run(&config, name.as_deref()),
+        Commands::Projects { action } => match action {
+            Some(ProjectAction::Show { name }) => commands::projects::run(&config, Some(name.as_str())),
+            Some(ProjectAction::Update { name, species, confidence, assay_type }) => {
+                commands::projects::run_update(&config, &name, species.as_deref(), confidence.as_deref(), assay_type.as_deref())
+            }
+            None => commands::projects::run(&config, None),
+        },
+        Commands::Pending { clear } => commands::pending::run(clear),
         Commands::GenerateSkill { output } => skill::run(&output),
     }
 }

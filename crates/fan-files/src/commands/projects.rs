@@ -91,3 +91,48 @@ fn truncate(s: &str, max: usize) -> &str {
         s
     }
 }
+
+pub fn run_update(
+    config: &Config,
+    name: &str,
+    species: Option<&str>,
+    confidence: Option<&str>,
+    assay_type: Option<&str>,
+) {
+    let data_dir = fan_core::config::dirs_fan().join("data");
+    let sqlite = match SqliteStore::open(&data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to open index: {}", e);
+            return;
+        }
+    };
+    let store = ProjectStore::new(Arc::clone(&sqlite.conn));
+
+    match store.get_by_name(name) {
+        Ok(Some(proj)) => {
+            let mut updated = false;
+            if let Some(sp) = species {
+                store
+                    .update_species(proj.id, sp, "manual", confidence.unwrap_or("high"))
+                    .ok();
+                println!(
+                    "Updated {}: species={}, confidence={}",
+                    name,
+                    sp,
+                    confidence.unwrap_or("high")
+                );
+                updated = true;
+            }
+            if assay_type.is_some() {
+                if updated {
+                    eprintln!("Note: assay_type update not yet implemented (use species + confidence for now)");
+                } else {
+                    eprintln!("assay_type update not yet implemented (use species + confidence for now)");
+                }
+            }
+        }
+        Ok(None) => eprintln!("Project '{}' not found.", name),
+        Err(e) => eprintln!("Error: {}", e),
+    }
+}
