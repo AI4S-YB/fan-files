@@ -78,28 +78,28 @@ pub fn run_inference(
             }
         }
 
-        // 5. BOLD species confirmation (only if enabled and confidence is low/medium)
+        // 5. EBI BLAST species confirmation (only if enabled and confidence is low/medium)
         if bold_enabled
             && (proj.species_confidence.as_deref() == Some("low")
                 || proj.species_confidence.as_deref() == Some("medium"))
         {
             if let Some(blast_file) = bold::find_blast_file(&proj.dirs) {
                 info!(
-                    "Attempting BOLD species identification for '{}' using {}",
+                    "Attempting EBI BLAST species identification for '{}' using {}",
                     proj.name, blast_file
                 );
                 match bold::extract_sequence(&blast_file, 500) {
                     Ok(seq) => match bold::identify_species(&seq) {
                         Ok(Some(species)) => {
-                            info!("BOLD identified species for '{}': {}", proj.name, species);
+                            info!("EBI BLAST identified species for '{}': {}", proj.name, species);
                             project_store
-                                .update_species(id, &species, "bold_api", "high")
+                                .update_species(id, &species, "ebi_blast", "high")
                                 .ok();
                         }
                         Ok(None) => {
-                            info!("BOLD could not identify species for '{}'", proj.name)
+                            info!("EBI BLAST could not identify species for '{}'", proj.name)
                         }
-                        Err(e) => warn!("BOLD API error for '{}': {}", proj.name, e),
+                        Err(e) => warn!("EBI BLAST API error for '{}': {}", proj.name, e),
                     },
                     Err(e) => warn!(
                         "Sequence extraction failed for '{}': {}",
