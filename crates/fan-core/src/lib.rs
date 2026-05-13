@@ -1,3 +1,4 @@
+pub mod bold;
 pub mod config;
 pub mod detector;
 pub mod index;

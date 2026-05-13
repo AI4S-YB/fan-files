@@ -23,6 +23,7 @@ toml = "0.8"
 sha2 = "0.10"
 mime_guess = "2"
 ureq = { version = "2", features = ["native-tls"] }
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

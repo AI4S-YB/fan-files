@@ -899,6 +899,7 @@ dependencies = [
  "candle-nn",
  "candle-onnx",
  "fan-plugin-sdk",
+ "flate2",
  "mime_guess",
  "notify",
  "rusqlite",
