@@ -2,10 +2,10 @@ use crate::types::{FileEntry, IndexStatus, RawFileInfo};
 use fan_plugin_sdk::{BioMetadata, FormatInfo};
 use rusqlite::{params, Connection};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteStore {
@@ -14,7 +14,7 @@ impl SqliteStore {
         let conn = Connection::open(data_dir.join("index.db"))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         let store = Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         };
         store.migrate()?;
         Ok(store)
@@ -56,6 +56,31 @@ impl SqliteStore {
                 relation_type TEXT NOT NULL,
                 score REAL NOT NULL DEFAULT 0.0,
                 UNIQUE(file_a_id, file_b_id, relation_type)
+            );
+            CREATE TABLE IF NOT EXISTS project (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                assay_type TEXT,
+                species TEXT,
+                species_confidence TEXT,
+                species_source TEXT,
+                root_dirs TEXT,
+                summary TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS project_file (
+                project_id INTEGER NOT NULL REFERENCES project(id),
+                file_id INTEGER NOT NULL REFERENCES files(id),
+                PRIMARY KEY (project_id, file_id)
+            );
+            CREATE TABLE IF NOT EXISTS project_relation (
+                project_a_id INTEGER NOT NULL REFERENCES project(id),
+                project_b_id INTEGER NOT NULL REFERENCES project(id),
+                relation_type TEXT NOT NULL,
+                score REAL NOT NULL DEFAULT 0.0,
+                reason TEXT,
+                PRIMARY KEY (project_a_id, project_b_id, relation_type)
             );",
         )?;
         Ok(())
