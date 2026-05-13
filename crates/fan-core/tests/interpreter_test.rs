@@ -195,10 +195,10 @@ fn test_generic_fallback() {
     let results = registry.interpret(&ctx);
     assert!(!results.is_empty());
 
-    // The best score should come from GenericInterpreter (score 0.1)
+    // The best score should come from GenericInterpreter
     let best = &results[0];
     assert_eq!(best.interpreter_name, "generic-interpreter");
-    assert_eq!(best.score, 0.1);
+    assert_eq!(best.score, 0.5);
 
     // Generic still tries to detect from path
     assert!(best.metadata.project.is_some() || best.metadata.assay_type.is_none());
@@ -243,8 +243,8 @@ fn test_interpreter_score_zero_for_mismatch() {
     };
 
     let results = registry.interpret(&ctx);
-    // GenericInterpreter (0.1) should be the only one above 0
+    // GenericInterpreter should be the only one above 0
     let best = &results[0];
     assert_eq!(best.interpreter_name, "generic-interpreter");
-    assert!(results.iter().all(|r| r.score <= 0.1));
+    assert!(results.iter().all(|r| r.score <= 0.5));
 }

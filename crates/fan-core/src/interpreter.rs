@@ -289,7 +289,7 @@ impl ContextInterpreter for GenericInterpreter {
     }
 
     fn score(&self, _ctx: &FileContext) -> f64 {
-        0.1 // Always applies as last resort
+        0.5 // Always-on fallback — lower than specific interpreters
     }
 
     fn extract(&self, ctx: &FileContext) -> BioMetadata {
