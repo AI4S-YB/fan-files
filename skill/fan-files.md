@@ -5,47 +5,50 @@ description: Use when analyzing bioinformatics data - find data files, reference
 
 # Fan-Files: Server Data Intelligence
 
-You have access to a tool called `fan-files` that knows about ALL files on this server.
-Use it whenever you need to find data files, reference genomes, or discover related datasets.
+You have access to `fan-files`, a tool that indexes ALL files on this server and uses LLM to infer biological metadata (project, species, assay type).
 
-## When to Use fan-files
+## Commands
 
-### Before Starting Analysis
-When a user asks you to analyze data, FIRST check what's available:
+### Search for data
 ```
-fan-files search "<description of what you need>"
+fan-files search "<natural language query>" [--json]
 ```
 Examples:
-- `fan-files search "human reference genome hg38"`
-- `fan-files search "lung cancer RNA-seq data"`
-- `fan-files search "gene annotation file GTF"`
+- `fan-files search "apple RNA-seq data"`
+- `fan-files search "reference genome"`
+- `fan-files search "rose phenotype"`
 
-### During Analysis
-When you sense the user might benefit from additional data:
+### List available projects (LLM-inferred)
 ```
-fan-files suggest <current_project_directory>
+fan-files projects                     # list all projects
+fan-files projects <project_name>      # show project details
 ```
 
-### Listing Available Resources
+### Get file details
+```
+fan-files info <path> [--json]
+```
+
+### Suggest related data
+```
+fan-files suggest <project_directory> [--json]
+```
+
+### List files by type or tag
 ```
 fan-files list --category genome
-fan-files list --category rnaseq
-fan-files list --tag human
+fan-files list --tag human [--json]
 ```
 
-### Getting File Details
-```
-fan-files info <path>
-```
-
-### Checking System Status
+### Check system status
 ```
 fan-files status
 ```
 
 ## Best Practices
 
-1. Always check before using a reference genome - the server likely has it indexed
-2. Suggest complementary data - if user analyzes RNA-seq, check for matching ChIP-seq or ATAC-seq
-3. Use --json when you need to parse results programmatically
-4. Be proactive - mention available data even if the user didn't ask
+1. **Before any analysis**: run `fan-files search` to discover available data
+2. **Check projects**: `fan-files projects` to see what datasets the server has
+3. **Get context**: `fan-files info <path>` for detailed metadata on a file
+4. **Use --json** when you need parseable output
+5. **Be proactive** — mention available related data to the user even if they didn't ask

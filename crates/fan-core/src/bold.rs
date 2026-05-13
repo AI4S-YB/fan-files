@@ -85,39 +85,45 @@ pub fn find_blast_file(project_dirs: &[String]) -> Option<String> {
     })
 }
 
-/// Extract first max_bp base pairs of sequence from a FASTA file (supports .gz)
+/// Extract first max_bp base pairs of sequence from a FASTA file (supports .gz).
+/// Reads byte-by-byte to avoid loading huge lines into memory.
 pub fn extract_sequence(
     file_path: &str,
     max_bp: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let path = Path::new(file_path);
     let file = std::fs::File::open(path)?;
-    let reader: Box<dyn Read> = if file_path.ends_with(".gz") {
+    let mut reader: Box<dyn Read> = if file_path.ends_with(".gz") {
         Box::new(flate2::read::GzDecoder::new(file))
     } else {
         Box::new(file)
     };
 
-    use std::io::BufRead;
+    let mut header = String::new();
     let mut seq = String::new();
     let mut in_seq = false;
-    for line in std::io::BufReader::new(reader).lines() {
-        let line = line?;
-        if line.starts_with('>') {
-            if in_seq {
-                break;
-            }
+    let mut buf = [0u8; 1];
+
+    loop {
+        if reader.read(&mut buf)? == 0 { break; }
+        let ch = buf[0] as char;
+
+        if ch == '>' {
+            if in_seq { break; } // second header, stop
             in_seq = true;
-            seq.push_str(&line);
-            seq.push('\n');
+            // Read header line (short — just the first line after >)
+            header.push(ch);
+            loop {
+                if reader.read(&mut buf)? == 0 { break; }
+                header.push(buf[0] as char);
+                if buf[0] == b'\n' { break; }
+            }
             continue;
         }
-        if in_seq {
-            seq.push_str(&line);
-            seq.push('\n');
-            if seq.len() >= max_bp {
-                break;
-            }
+
+        if in_seq && !ch.is_whitespace() {
+            seq.push(ch);
+            if seq.len() >= max_bp { break; }
         }
     }
 
@@ -125,7 +131,8 @@ pub fn extract_sequence(
         return Err("No sequence found in file".into());
     }
 
-    Ok(seq)
+    info!("Extracted {}bp from {} (header: {})", seq.len(), file_path, header.trim());
+    Ok(format!("{}\n{}", header.trim(), &seq[..seq.len().min(max_bp)]))
 }
 
 /// Identify species using EBI BLAST REST API.
@@ -139,7 +146,7 @@ pub fn identify_species(sequence: &str) -> Result<Option<String>, Box<dyn std::e
         .timeout(Duration::from_secs(15))
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_form(&[
-            ("email", "fan-files@example.com"),
+            ("email", "yz@moilab.net"),
             ("program", "blastn"),
             ("database", "ena_sequence"),
             ("sequence", sequence),
