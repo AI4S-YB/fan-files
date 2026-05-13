@@ -1,4 +1,3 @@
-use crate::bold;
 use crate::llm::LlmClient;
 use crate::project::ProjectStore;
 use std::collections::HashMap;
@@ -10,7 +9,6 @@ pub fn run_inference(
     project_store: &ProjectStore,
     llm_client: &LlmClient,
     scan_root: &str,
-    bold_enabled: bool,
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     if !llm_client.is_configured() {
         info!("LLM not configured, skipping inference");
@@ -77,40 +75,9 @@ pub fn run_inference(
                 }
             }
         }
-
-        // 5. EBI BLAST species confirmation (only if enabled and confidence is low/medium)
-        if bold_enabled
-            && (proj.species_confidence.as_deref() == Some("low")
-                || proj.species_confidence.as_deref() == Some("medium"))
-        {
-            if let Some(blast_file) = bold::find_blast_file(&proj.dirs) {
-                info!(
-                    "Attempting EBI BLAST species identification for '{}' using {}",
-                    proj.name, blast_file
-                );
-                match bold::extract_sequence(&blast_file, 500) {
-                    Ok(seq) => match bold::identify_species(&seq) {
-                        Ok(Some(species)) => {
-                            info!("EBI BLAST identified species for '{}': {}", proj.name, species);
-                            project_store
-                                .update_species(id, &species, "ebi_blast", "high")
-                                .ok();
-                        }
-                        Ok(None) => {
-                            info!("EBI BLAST could not identify species for '{}'", proj.name)
-                        }
-                        Err(e) => warn!("EBI BLAST API error for '{}': {}", proj.name, e),
-                    },
-                    Err(e) => warn!(
-                        "Sequence extraction failed for '{}': {}",
-                        proj.name, e
-                    ),
-                }
-            }
-        }
     }
 
-    // 6. Write project relations
+    // 5. Write project relations
     for rel in &output.relations {
         if let (Some(&a_id), Some(&b_id)) = (
             project_name_to_id.get(&rel.project_a),

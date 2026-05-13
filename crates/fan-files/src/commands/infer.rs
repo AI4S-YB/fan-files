@@ -32,7 +32,7 @@ pub fn run(config: &Config) {
     let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
 
     println!("Running LLM inference on indexed files...");
-    match infer::run_inference(&sqlite, &project_store, &llm_client, scan_root, config.llm.bold_enabled) {
+    match infer::run_inference(&sqlite, &project_store, &llm_client, scan_root) {
         Ok((projects, relations)) => {
             println!("Inference complete: {} projects, {} relations", projects, relations);
             if let Ok(all_projects) = project_store.all() {
