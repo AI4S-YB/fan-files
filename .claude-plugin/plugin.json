@@ -1,0 +1,18 @@
+{
+  "name": "fan-files",
+  "version": "0.1.0",
+  "description": "生物信息学服务器文件元数据检索引擎，让 Claude Code 拥有全服务器数据视野",
+  "author": {
+    "name": "AI4S-YB"
+  },
+  "homepage": "https://github.com/AI4S-YB/fan-files",
+  "repository": "https://github.com/AI4S-YB/fan-files",
+  "license": "MIT",
+  "keywords": [
+    "bioinformatics",
+    "file-indexing",
+    "metadata",
+    "genomics",
+    "omics"
+  ]
+}
