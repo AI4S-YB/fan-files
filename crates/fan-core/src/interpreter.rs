@@ -51,18 +51,6 @@ impl ContextInterpreter for FastqInterpreter {
             meta.tags.push("single-end".into());
         }
 
-        // Detect assay type from path
-        let assay = detect_assay_from_path(&path_lower);
-        if let Some(a) = assay {
-            meta.assay_type = Some(a);
-        }
-
-        // Detect species from path
-        let species = detect_species_from_path(&path_lower);
-        if let Some(s) = species {
-            meta.species = Some(s);
-        }
-
         // Extract project from directory tree
         let project = extract_project(&ctx.directory_tree);
         if let Some(p) = project {
@@ -104,19 +92,6 @@ impl ContextInterpreter for BamInterpreter {
 
     fn extract(&self, ctx: &FileContext) -> BioMetadata {
         let mut meta = BioMetadata::default();
-        let path_lower = ctx.file_path.to_lowercase();
-
-        // Detect assay type from path
-        let assay = detect_assay_from_path(&path_lower);
-        if let Some(a) = assay {
-            meta.assay_type = Some(a);
-        }
-
-        // Detect species
-        let species = detect_species_from_path(&path_lower);
-        if let Some(s) = species {
-            meta.species = Some(s);
-        }
 
         // Project from directory tree
         let project = extract_project(&ctx.directory_tree);
@@ -159,17 +134,6 @@ impl ContextInterpreter for VcfInterpreter {
 
     fn extract(&self, ctx: &FileContext) -> BioMetadata {
         let mut meta = BioMetadata::default();
-        let path_lower = ctx.file_path.to_lowercase();
-
-        let assay = detect_assay_from_path(&path_lower);
-        if let Some(a) = assay {
-            meta.assay_type = Some(a);
-        }
-
-        let species = detect_species_from_path(&path_lower);
-        if let Some(s) = species {
-            meta.species = Some(s);
-        }
 
         let project = extract_project(&ctx.directory_tree);
         if let Some(p) = project {
@@ -209,17 +173,6 @@ impl ContextInterpreter for Hdf5Interpreter {
 
     fn extract(&self, ctx: &FileContext) -> BioMetadata {
         let mut meta = BioMetadata::default();
-        let path_lower = ctx.file_path.to_lowercase();
-
-        let assay = detect_assay_from_path(&path_lower);
-        if let Some(a) = assay {
-            meta.assay_type = Some(a);
-        }
-
-        let species = detect_species_from_path(&path_lower);
-        if let Some(s) = species {
-            meta.species = Some(s);
-        }
 
         let project = extract_project(&ctx.directory_tree);
         if let Some(p) = project {
@@ -265,11 +218,6 @@ impl ContextInterpreter for AnnotationInterpreter {
         meta.assay_type = Some("annotation".into());
         meta.tags.push("reference".into());
 
-        let species = detect_species_from_path(&ctx.file_path.to_lowercase());
-        if let Some(s) = species {
-            meta.species = Some(s);
-        }
-
         let project = extract_project(&ctx.directory_tree);
         if let Some(p) = project {
             meta.project = Some(p);
@@ -294,17 +242,6 @@ impl ContextInterpreter for GenericInterpreter {
 
     fn extract(&self, ctx: &FileContext) -> BioMetadata {
         let mut meta = BioMetadata::default();
-        let path_lower = ctx.file_path.to_lowercase();
-
-        let assay = detect_assay_from_path(&path_lower);
-        if let Some(a) = assay {
-            meta.assay_type = Some(a);
-        }
-
-        let species = detect_species_from_path(&path_lower);
-        if let Some(s) = species {
-            meta.species = Some(s);
-        }
 
         let project = extract_project(&ctx.directory_tree);
         if let Some(p) = project {
@@ -443,115 +380,6 @@ pub fn find_metadata_files(file_path: &Path) -> Vec<String> {
         }
     }
     found
-}
-
-// ─── Heuristic Functions ─────────────────────────────────────
-
-fn detect_assay_from_path(path_lower: &str) -> Option<String> {
-    let patterns: &[(&[&str], &str)] = &[
-        (
-            &[
-                "rnaseq",
-                "rna-seq",
-                "rna_seq",
-                "transcriptom",
-                "mrna",
-            ],
-            "RNA-seq",
-        ),
-        (&["chipseq", "chip-seq", "chip_seq"], "ChIP-seq"),
-        (&["atacseq", "atac-seq", "atac_seq"], "ATAC-seq"),
-        (
-            &["wgs", "whole_genome", "wholegenome", "dna-seq"],
-            "WGS",
-        ),
-        (
-            &["wgbs", "methylation", "bisulfite", "bs-seq"],
-            "WGBS",
-        ),
-        (
-            &[
-                "singlecell",
-                "single_cell",
-                "scrna",
-                "scrnaseq",
-                "10x",
-            ],
-            "scRNA-seq",
-        ),
-        (
-            &["scatac", "sc-atac", "single_cell_atac"],
-            "scATAC-seq",
-        ),
-        (&["citeseq", "cite-seq"], "CITE-seq"),
-        (&["hichip", "hi-c"], "Hi-C"),
-        (
-            &["clip", "clip-seq", "eclip", "rip-seq"],
-            "CLIP-seq",
-        ),
-        (
-            &["mirna", "small_rna", "smallrna", "srna"],
-            "sRNA-seq",
-        ),
-        (&["riboseq", "ribo-seq"], "Ribo-seq"),
-        (
-            &["nanopore", "pacbio", "pb", "ont"],
-            "long-read-seq",
-        ),
-    ];
-
-    for (keywords, assay_name) in patterns {
-        if keywords.iter().any(|kw| path_lower.contains(kw)) {
-            return Some(assay_name.to_string());
-        }
-    }
-    None
-}
-
-fn detect_species_from_path(path_lower: &str) -> Option<String> {
-    let species_patterns: &[(&[&str], &str)] = &[
-        (
-            &["human", "homo_sapiens", "hsapiens", "hg38", "hg19"],
-            "human",
-        ),
-        (
-            &["mouse", "mus_musculus", "mmusculus", "mm10", "mm39"],
-            "mouse",
-        ),
-        (&["rat", "rattus", "rnorvegicus"], "rat"),
-        (
-            &["zebrafish", "danio", "drerio", "danrer"],
-            "zebrafish",
-        ),
-        (
-            &["drosophila", "dmel", "melanogaster", "dm6"],
-            "fruit fly",
-        ),
-        (
-            &["celegans", "elegans", "worm"],
-            "C. elegans",
-        ),
-        (
-            &["arabidopsis", "thaliana", "athaliana"],
-            "Arabidopsis",
-        ),
-        (
-            &["yeast", "cerevisiae", "scerevisiae", "saccer3"],
-            "yeast",
-        ),
-        (&["cattle", "cow", "btaurus", "bostau"], "cattle"),
-        (&["pig", "sscrofa", "sus_scrofa"], "pig"),
-        (&["chicken", "ggallus", "galgal"], "chicken"),
-        (&["macaque", "rhesus", "rhemac"], "macaque"),
-        (&["ecoli", "e_coli", "k12"], "E. coli"),
-    ];
-
-    for (keywords, species_name) in species_patterns {
-        if keywords.iter().any(|kw| path_lower.contains(kw)) {
-            return Some(species_name.to_string());
-        }
-    }
-    None
 }
 
 fn extract_project(directory_tree: &[String]) -> Option<String> {

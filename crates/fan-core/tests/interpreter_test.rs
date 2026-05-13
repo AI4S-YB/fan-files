@@ -23,7 +23,6 @@ fn test_fastq_rnaseq_detection() {
     let result = registry.best_interpretation(&ctx, 0.3);
     assert!(result.is_some(), "Expected best_interpretation to return BioMetadata");
     let meta = result.unwrap();
-    assert_eq!(meta.assay_type, Some("RNA-seq".into()));
     assert_eq!(meta.project, Some("lung_cancer".into()));
     assert!(
         meta.tags.contains(&"paired-end".to_string()),
@@ -47,7 +46,6 @@ fn test_fastq_single_end() {
     let result = registry.best_interpretation(&ctx, 0.3);
     assert!(result.is_some());
     let meta = result.unwrap();
-    assert_eq!(meta.assay_type, Some("WGS".into()));
     assert!(
         meta.tags.contains(&"single-end".to_string()),
         "Expected single-end tag, got tags: {:?}",
@@ -77,7 +75,6 @@ fn test_bam_chipseq_detection() {
     let result = registry.best_interpretation(&ctx, 0.3);
     assert!(result.is_some());
     let meta = result.unwrap();
-    assert_eq!(meta.assay_type, Some("ChIP-seq".into()));
     assert_eq!(meta.project, Some("leukemia".into()));
 }
 
@@ -96,7 +93,8 @@ fn test_human_species_detection() {
     let result = registry.best_interpretation(&ctx, 0.3);
     assert!(result.is_some());
     let meta = result.unwrap();
-    assert_eq!(meta.species, Some("human".into()));
+    // Species is no longer inferred by the interpreter
+    assert_eq!(meta.species, None);
 }
 
 #[test]
@@ -114,8 +112,9 @@ fn test_mouse_species_detection() {
     let result = registry.best_interpretation(&ctx, 0.3);
     assert!(result.is_some());
     let meta = result.unwrap();
-    assert_eq!(meta.species, Some("mouse".into()));
-    assert_eq!(meta.assay_type, Some("ATAC-seq".into()));
+    // Species and assay_type are no longer inferred by the interpreter
+    assert_eq!(meta.species, None);
+    assert_eq!(meta.assay_type, None);
 }
 
 #[test]
@@ -134,7 +133,8 @@ fn test_annotation_detection() {
     assert!(result.is_some());
     let meta = result.unwrap();
     assert_eq!(meta.assay_type, Some("annotation".into()));
-    assert_eq!(meta.species, Some("human".into()));
+    // Species is no longer inferred by the interpreter
+    assert_eq!(meta.species, None);
     assert!(
         meta.tags.contains(&"reference".to_string()),
         "Expected 'reference' tag for annotation files"
@@ -156,7 +156,6 @@ fn test_vcf_detection() {
     let result = registry.best_interpretation(&ctx, 0.3);
     assert!(result.is_some());
     let meta = result.unwrap();
-    assert_eq!(meta.assay_type, Some("WGS".into()));
     assert_eq!(meta.project, Some("cancer_study".into()));
 }
 
@@ -174,8 +173,8 @@ fn test_scrnaseq_detection() {
 
     let result = registry.best_interpretation(&ctx, 0.3);
     assert!(result.is_some());
-    let meta = result.unwrap();
-    assert_eq!(meta.assay_type, Some("scRNA-seq".into()));
+    let _meta = result.unwrap();
+    // assay_type is no longer inferred by the interpreter
 }
 
 #[test]
@@ -200,7 +199,7 @@ fn test_generic_fallback() {
     assert_eq!(best.interpreter_name, "generic-interpreter");
     assert_eq!(best.score, 0.5);
 
-    // Generic still tries to detect from path
+    // Generic no longer tries to detect from path, just project extraction
     assert!(best.metadata.project.is_some() || best.metadata.assay_type.is_none());
 }
 
@@ -226,7 +225,6 @@ fn test_project_extraction_skips_generic_dirs() {
     let meta = result.unwrap();
     // "rnaseq", "results", "projects", "data" are all generic, so project should be None
     assert_eq!(meta.project, None);
-    assert_eq!(meta.assay_type, Some("RNA-seq".into()));
 }
 
 #[test]
