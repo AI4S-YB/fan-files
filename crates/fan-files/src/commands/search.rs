@@ -64,7 +64,7 @@ pub fn run(config: &Config, query: &str, json: bool) {
     let mut results: Vec<SearchResult> = Vec::new();
     for (file_id, (combined_score, _)) in &sorted {
         if let Ok(Some(entry)) = index.sqlite.get_by_id(*file_id) {
-            results.push(SearchResult {
+            let mut r = SearchResult {
                 path: entry.path.to_string_lossy().to_string(),
                 score: *combined_score,
                 file_type: entry.format_info.as_ref().map(|f| f.file_type.clone()),
@@ -98,7 +98,12 @@ pub fn run(config: &Config, query: &str, json: bool) {
                     })
                     .unwrap_or_default(),
                 source: DataSource::Local,
-            });
+            };
+            // Enrich with project info
+            if let Some(proj_name) = get_project_for_path(&index.sqlite, &r.path) {
+                r.summary = format!("[project: {}] {}", proj_name, r.summary);
+            }
+            results.push(r);
         }
     }
 
@@ -115,6 +120,17 @@ pub fn run(config: &Config, query: &str, json: bool) {
             println!("No results found for: {}", query);
         }
     }
+}
+
+fn get_project_for_path(sqlite: &fan_core::index::sqlite::SqliteStore, file_path: &str) -> Option<String> {
+    let conn = sqlite.conn.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT p.name FROM project p
+         JOIN project_file pf ON p.id = pf.project_id
+         JOIN files f ON f.id = pf.file_id
+         WHERE f.path = ?1 LIMIT 1"
+    ).ok()?;
+    stmt.query_row(rusqlite::params![file_path], |row| row.get(0)).ok()
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {

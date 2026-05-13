@@ -925,6 +925,7 @@ dependencies = [
  "clap",
  "fan-core",
  "fan-plugin-sdk",
+ "rusqlite",
  "serde_json",
  "tokio",
  "tracing",
