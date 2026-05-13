@@ -14,11 +14,16 @@ pub fn run(config: &Config, query: &str, json: bool) {
 
     // 1. Tantivy full-text search
     let tantivy_results = index.tantivy.search(query, 50).unwrap_or_default();
-    let max_tantivy_score = tantivy_results
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(0.0f32, f32::max)
-        .max(1.0);
+
+    // If Tantivy returns nothing, fall back to SQLite LIKE search
+    let mut file_ids: Vec<(i64, f32)> = if tantivy_results.is_empty() {
+        index.sqlite.search_by_metadata(query, 50).unwrap_or_default()
+            .into_iter().map(|(id, score)| (id, score as f32)).collect()
+    } else {
+        tantivy_results
+    };
+
+    let max_tantivy_score = file_ids.iter().map(|(_, s)| *s).fold(0.0f32, f32::max).max(1.0);
 
     // 2. Semantic embedding search (if model available)
     let query_embedding = index.embedding.embed(query).ok();
@@ -36,9 +41,9 @@ pub fn run(config: &Config, query: &str, json: bool) {
     };
     let has_embeddings = !embedding_scores.is_empty();
 
-    // 3. Merge and score: Tantivy (0.6) + Embedding (0.4)
-    let mut merged: HashMap<i64, (f64, f32)> = HashMap::new(); // (combined_score, tantivy_score)
-    for (file_id, tantivy_score) in &tantivy_results {
+    // 3. Merge and score: Tantivy/SQLite (0.6) + Embedding (0.4)
+    let mut merged: HashMap<i64, (f64, f32)> = HashMap::new();
+    for (file_id, tantivy_score) in &file_ids {
         let norm_tantivy = *tantivy_score as f64 / max_tantivy_score as f64;
         let emb_score = embedding_scores.get(file_id).copied().unwrap_or(0.0);
         let combined = if has_embeddings {

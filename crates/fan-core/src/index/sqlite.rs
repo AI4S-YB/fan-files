@@ -226,6 +226,27 @@ impl SqliteStore {
         rows.collect()
     }
 
+    /// Fallback search: LIKE query on path + bio_metadata_json + format_info_json.
+    /// Returns (file_id, relevance_score) pairs.
+    pub fn search_by_metadata(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<(i64, i32)>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("%{}%", query);
+        let mut stmt = conn.prepare(
+            "SELECT id,
+                    (CASE WHEN path LIKE ?1 THEN 3 ELSE 0 END +
+                     CASE WHEN bio_metadata_json LIKE ?1 THEN 2 ELSE 0 END +
+                     CASE WHEN format_info_json LIKE ?1 THEN 1 ELSE 0 END) as score
+             FROM files WHERE deleted=0 AND (
+                 path LIKE ?1 OR bio_metadata_json LIKE ?1 OR format_info_json LIKE ?1
+             )
+             ORDER BY score DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect()
+    }
+
     pub fn store_embedding(&self, file_id: i64, vector: &[f32]) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         let bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
