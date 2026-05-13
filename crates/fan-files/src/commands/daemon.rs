@@ -1,13 +1,16 @@
 use fan_core::config::Config;
 use fan_core::detector::BuiltinDetector;
+use fan_core::infer;
 use fan_core::index::IndexEngine;
 use fan_core::interpreter::InterpreterRegistry;
+use fan_core::llm::LlmClient;
 use fan_core::plugin::registry::PluginRegistry;
+use fan_core::project::ProjectStore;
 use fan_core::scanner::Scanner;
 use fan_core::watcher::FileWatcher;
 use fan_plugin_sdk::{FileContext, FormatInfo};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
@@ -25,6 +28,20 @@ pub fn run(config: &Config) {
 
     // Initial full scan
     run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
+
+    // After initial scan, run LLM inference if configured
+    {
+        let llm_client = LlmClient::new(config.llm.clone());
+        if llm_client.is_configured() {
+            let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
+            let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
+            info!("Running LLM inference on indexed files...");
+            match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+                Ok((p, r)) => info!("LLM inference complete: {} projects, {} relations", p, r),
+                Err(e) => warn!("LLM inference failed: {}", e),
+            }
+        }
+    }
 
     let sync_time = parse_sync_time(&config.schedule.full_sync);
 
@@ -66,6 +83,21 @@ pub fn run(config: &Config) {
         {
             info!("Running scheduled full sync...");
             run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
+
+            // After scheduled scan, run LLM inference if configured
+            {
+                let llm_client = LlmClient::new(config.llm.clone());
+                if llm_client.is_configured() {
+                    let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
+                    let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
+                    info!("Running LLM inference on indexed files...");
+                    match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+                        Ok((p, r)) => info!("LLM inference complete: {} projects, {} relations", p, r),
+                        Err(e) => warn!("LLM inference failed: {}", e),
+                    }
+                }
+            }
+
             last_sync_day = Some(current_day);
         }
 
