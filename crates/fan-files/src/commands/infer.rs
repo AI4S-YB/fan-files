@@ -1,19 +1,12 @@
 use fan_core::config::Config;
-use fan_core::index::IndexEngine;
 use fan_core::infer;
+use fan_core::index::sqlite::SqliteStore;
 use fan_core::llm::LlmClient;
 use fan_core::project::ProjectStore;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub fn run(config: &Config) {
-    let index = match IndexEngine::open(config, true) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("Failed to open index: {}", e);
-            return;
-        }
-    };
-
     let llm_client = LlmClient::new(config.llm.clone());
     if !llm_client.is_configured() {
         eprintln!("LLM not configured.");
@@ -25,24 +18,23 @@ pub fn run(config: &Config) {
         return;
     }
 
-    let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
+    // Open only SQLite — skip Tantivy (mmap) and ONNX (90MB) to save memory
+    let data_dir = fan_core::config::dirs_fan().join("data");
+    let sqlite = match SqliteStore::open(&data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to open index: {}", e);
+            return;
+        }
+    };
 
-    let scan_root = config
-        .scan
-        .include
-        .first()
-        .map(|s| s.as_str())
-        .unwrap_or("/");
+    let project_store = ProjectStore::new(Arc::clone(&sqlite.conn));
+    let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
 
     println!("Running LLM inference on indexed files...");
-    match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root, config.llm.bold_enabled) {
+    match infer::run_inference(&sqlite, &project_store, &llm_client, scan_root, config.llm.bold_enabled) {
         Ok((projects, relations)) => {
-            println!(
-                "Inference complete: {} projects, {} relations",
-                projects, relations
-            );
-
-            // Display results
+            println!("Inference complete: {} projects, {} relations", projects, relations);
             if let Ok(all_projects) = project_store.all() {
                 for p in &all_projects {
                     println!();
