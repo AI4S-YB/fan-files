@@ -232,8 +232,8 @@ fn run_embedding(index: &IndexEngine, file_id: i64, file_path: &Path) {
                 error!("Failed to store embedding for {}: {}", file_path.display(), e);
             }
         }
-        Err(e) => {
-            error!("Failed to generate embedding for {}: {}", file_path.display(), e);
+        Err(_e) => {
+            // Binary files or files with no extractable text naturally fail embedding — not an error
         }
     }
 }

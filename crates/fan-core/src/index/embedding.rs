@@ -243,7 +243,11 @@ impl EmbeddingEngine {
         tokenizer: &tokenizers::Tokenizer,
         text: &str,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        // 1. Tokenize
+        // Skip empty or whitespace-only texts
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.len() < 2 {
+            return Err("text too short for embedding".into());
+        }
         let encoding = tokenizer
             .encode(text, false)
             .map_err(|e| format!("Tokenization error: {}", e))?;
@@ -301,34 +305,41 @@ impl EmbeddingEngine {
             .get(&model.output_name)
             .ok_or_else(|| format!("Output '{}' not found in ONNX outputs", model.output_name))?;
 
-        // token_embeddings shape: [1, seq_len, hidden_dim]
+        // Normalize to 3D: [batch, seq_len, hidden_dim]
+        let emb_3d = match token_embeddings.dims().len() {
+            3 => token_embeddings.clone(),
+            2 => token_embeddings.unsqueeze(0)?,
+            _ => return Err(format!("unexpected embedding shape: {:?}", token_embeddings.dims()).into()),
+        };
+        let dims = emb_3d.dims();
+        let hidden_dim = dims[2];
+        let seq_len = dims[1];
 
         // 6. Mean pooling with attention mask
-        // Expand mask to match embeddings shape: [1, seq_len] -> [1, seq_len, 1]
-        let mask_f32 = attention_mask.to_dtype(candle_core::DType::F32)?; // [1, seq_len]
-        let hidden_dim = token_embeddings.dims()[2];
+        let mask_len = attention_mask.dims()[1];
+        let use_len = seq_len.min(mask_len);
+        let attn_mask = attention_mask.narrow(1, 0, use_len)?;
+        let emb = emb_3d.narrow(1, 0, use_len)?;
 
-        // Broadcast mask to [1, seq_len, hidden_dim] manually
-        let mask_2d = mask_f32.unsqueeze(2)?; // [1, seq_len, 1]
-        let mask_shape = mask_2d.shape().clone();
-        let target_shape = &[mask_shape.dims()[0], mask_shape.dims()[1], hidden_dim];
-        let mask_broadcast = mask_2d.broadcast_as(target_shape)?; // [1, seq_len, hidden_dim]
+        let mask_f32 = attn_mask.to_dtype(candle_core::DType::F32)?;
+        let mask_2d = mask_f32.unsqueeze(2)?;
+        let mask_broadcast = mask_2d.broadcast_as(&[1usize, use_len, hidden_dim])?;
 
-        // Apply mask: zero out padding tokens
-        let masked = token_embeddings.broadcast_mul(&mask_broadcast)?;
+        let masked = emb.broadcast_mul(&mask_broadcast)?;
 
-        // Mean over sequence: sum / mask_count
-        let sum = masked.sum(1)?; // [1, hidden_dim]
-        let mask_count = mask_broadcast.sum(1)?; // [1, hidden_dim] — each element is # of valid tokens
-        // Avoid division by zero: mask_count is at least 1 for valid positions
-        let pooled = sum.broadcast_div(&mask_count)?; // [1, hidden_dim]
+        let sum = masked.sum(1)?;
+        let mask_count = mask_broadcast.sum(1)?;
+        // epsilon to avoid zero-div
+        let eps = mask_count.ones_like()?.affine(1e-9, 0.0)?;
+        let safe_count = mask_count.broadcast_add(&eps)?;
+        let pooled = sum.broadcast_div(&safe_count)?;
 
-        // Flatten to 1D
         let pooled_1d = pooled.flatten_all()?;
 
-        // L2 normalize
-        let norm = pooled_1d.sqr()?.sum_all()?.sqrt()?;
-        let normalized = (pooled_1d / norm)?;
+        // L2 normalize with epsilon safety
+        let norm_sq = pooled_1d.sqr()?.sum_all()?.sqrt()?;
+        let norm_safe = norm_sq.maximum(&Tensor::new(&[1e-12f32], &Device::Cpu)?)?;
+        let normalized = pooled_1d.broadcast_div(&norm_safe)?;
 
         let vec: Vec<f32> = normalized.to_vec1()?;
         Ok(vec)
