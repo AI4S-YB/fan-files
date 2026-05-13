@@ -115,4 +115,30 @@ impl ProjectStore {
             updated_at: row.get(9)?,
         })
     }
+
+    pub fn file_count(&self, project_id: i64) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM project_file WHERE project_id=?1",
+            rusqlite::params![project_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c as usize)
+    }
+
+    pub fn get_relations(&self, project_id: i64) -> rusqlite::Result<Vec<(String, String, f64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT CASE WHEN pr.project_a_id=?1 THEN p2.name ELSE p1.name END,
+                    pr.relation_type, pr.score
+             FROM project_relation pr
+             JOIN project p1 ON p1.id=pr.project_a_id
+             JOIN project p2 ON p2.id=pr.project_b_id
+             WHERE pr.project_a_id=?1 OR pr.project_b_id=?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![project_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect()
+    }
 }

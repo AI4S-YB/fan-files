@@ -46,6 +46,11 @@ enum Commands {
     Status,
     /// Run LLM inference on indexed files
     Infer,
+    /// List or show LLM-inferred projects
+    Projects {
+        /// Show details for a specific project
+        show: Option<String>,
+    },
     /// Generate Claude Code skill file
     GenerateSkill {
         #[arg(long, default_value = "skill/fan-files.md")]
@@ -66,6 +71,7 @@ fn main() {
         Commands::Info { path, json } => commands::info::run(&config, &path, json),
         Commands::Status => commands::status::run(&config),
         Commands::Infer => commands::infer::run(&config),
+        Commands::Projects { show } => commands::projects::run(&config, show.as_deref()),
         Commands::GenerateSkill { output } => skill::run(&output),
     }
 }
