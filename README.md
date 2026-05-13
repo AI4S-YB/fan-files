@@ -4,17 +4,17 @@
 
 ## 是什么
 
-部署在生物信息学服务器上的后台服务。自动扫描服务器所有文件，推断生物学业务上下文（实验类型、物种、参考基因组等），建立多层索引。当用户用 Claude Code 分析数据时，能以自然语言检索文件、发现可协同分析的相关数据。
+部署在生物信息学服务器上的后台服务。自动扫描服务器所有文件，通过 LLM 推断生物学业务上下文（实验类型、物种、数据项目），建立多层索引。Claude Code 能以自然语言检索文件、发现数据项目、找到可协同分析的相关数据。
 
 **核心场景：**
-- "服务器上有没有肺癌的 RNA-seq 数据？"
-- "我正在分析 RNA-seq，服务器上有匹配的 ChIP-seq 可以联合分析"
-- "列出所有人类参考基因组"
-- "这个 BAM 文件是什么实验类型的？"
+- "服务器上有什么数据？"
+- "有没有苹果的 RNA-seq 数据？"
+- "SMT2024 项目的物种是什么？"
+- "列出所有参考基因组"
 
 ## 安装
 
-### 从源码编译
+### 1. 编译二进制
 
 ```bash
 git clone git@github.com:AI4S-YB/fan-files.git
@@ -23,14 +23,9 @@ cargo build --release
 sudo cp target/release/fan-files /usr/local/bin/
 ```
 
-### 初始化配置
+### 2. 配置
 
-```bash
-mkdir -p ~/.fan-files
-fan-files generate-skill  # 生成 Claude Code Skill（可选）
-```
-
-编辑 `~/.fan-files/config.toml`，设置扫描目录：
+编辑 `~/.fan-files/config.toml`：
 
 ```toml
 [scan]
@@ -39,59 +34,57 @@ exclude = ["/tmp", "*.tmp"]
 
 [watch]
 include = ["/data"]
+
+# LLM 推理配置（DeepSeek / OpenAI / 兼容接口）
+[llm]
+endpoint = "https://api.deepseek.com/v1/chat/completions"
+api_key = "sk-你的key"
+model = "deepseek-chat"
+```
+
+### 3. 扫描 + 推理
+
+```bash
+fan-files daemon    # 扫描所有文件
+fan-files infer     # LLM 推断项目、物种、实验类型
 ```
 
 ## 使用
 
-### 启动守护进程
-
 ```bash
-fan-files daemon
+fan-files search "apple RNA-seq"      # 自然语言搜索
+fan-files projects                    # 列出所有数据项目
+fan-files projects SMT2024_genome     # 查看项目详情
+fan-files info /path/to/file.bam      # 查看文件元数据
+fan-files suggest /data/projects/xxx  # 数据推荐
+fan-files status                      # 索引状态
 ```
 
-首次启动会全量扫描配置的目录，之后持续监控文件变化。
+## 安装 Claude Code 插件
 
-### 检索文件
-
-```bash
-# 自然语言搜索
-fan-files search "人类的RNA-seq数据"
-
-# 列出某类数据
-fan-files list --category rnaseq
-
-# 按标签筛选
-fan-files list --tag human
-
-# JSON 输出（供 Claude Code 调用）
-fan-files search "参考基因组 hg38" --json
-```
-
-### 数据推荐
+### 方式一：全局插件（推荐，所有项目可用）
 
 ```bash
-fan-files suggest /data/projects/your_project
+# 安装
+ln -s /path/to/fan-files ~/.claude/plugins/fan-files
+
+# 升级
+cd /path/to/fan-files && git pull
+cargo build --release
+sudo cp target/release/fan-files /usr/local/bin/
+# 重启 Claude Code 即可
 ```
 
-### 查看文件详情
+### 方式二：项目级 Skill（仅当前项目）
 
 ```bash
-fan-files info /path/to/file.bam
+mkdir -p .claude/skills
+cp skills/fan-files.md .claude/skills/
 ```
-
-### 查看索引状态
-
-```bash
-fan-files status
-```
-
-### 配合 Claude Code 使用
-
-将生成的 `skill/fan-files.md` 放到 Claude Code 的 skills 目录，Claude 会自动在分析数据时调用上述命令。
 
 ## 技术栈
 
-Rust · SQLite · Tantivy · fastembed (ONNX) · wasmtime · notify
+Rust · SQLite · Tantivy · Candle (ONNX) · wasmtime · notify
 
 ## 协议
 
