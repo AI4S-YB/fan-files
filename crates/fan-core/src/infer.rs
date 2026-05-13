@@ -120,6 +120,29 @@ pub fn run_inference(
     }
     info!("Back-synced LLM metadata to {} files", files_updated);
 
+    // 8. Generate pending review items for low/medium confidence projects
+    let mut pending_items: Vec<crate::review::PendingItem> = Vec::new();
+    for proj in &output.projects {
+        let needs_review = proj.species_confidence.as_deref() == Some("low")
+            || proj.species_confidence.as_deref() == Some("medium");
+        if needs_review {
+            let candidates = generate_species_candidates(llm_client, proj);
+            pending_items.push(crate::review::PendingItem {
+                project: proj.name.clone(),
+                field: "species".into(),
+                current_value: proj.species.clone(),
+                confidence: proj.species_confidence.clone(),
+                candidates,
+                timestamp: crate::review::ReviewStore::now(),
+            });
+        }
+    }
+    if !pending_items.is_empty() {
+        let store = crate::review::ReviewStore::new();
+        store.save(&pending_items)?;
+        info!("Saved {} pending review items", pending_items.len());
+    }
+
     Ok((projects_created, output.relations.len()))
 }
 
@@ -153,4 +176,26 @@ fn collect_directory_summary(
         .into_iter()
         .map(|(path, (count, files))| (path, count, files))
         .collect()
+}
+
+fn generate_species_candidates(
+    llm_client: &LlmClient,
+    proj: &crate::llm::prompt::LlmProject,
+) -> Vec<String> {
+    if !llm_client.is_configured() {
+        return vec![];
+    }
+    let prompt = format!(
+        "数据项目 '{}' 的物种未知。根据项目名和上下文，列出最可能的4个物种名，以逗号分隔，只返回物种名。\n项目名: {}\n描述: {}",
+        proj.name,
+        proj.name,
+        proj.summary.as_deref().unwrap_or("")
+    );
+    match llm_client.infer_candidates(&prompt) {
+        Ok(candidates) => candidates,
+        Err(e) => {
+            warn!("Failed to generate candidates for {}: {}", proj.name, e);
+            vec![]
+        }
+    }
 }

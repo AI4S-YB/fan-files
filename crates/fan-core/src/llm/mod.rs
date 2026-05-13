@@ -59,4 +59,25 @@ impl LlmClient {
         prompt::parse_llm_response(content)
             .map_err(|e| format!("Failed to parse LLM JSON output: {}", e).into())
     }
+
+    /// Simple LLM call that returns a list of candidate strings
+    pub fn infer_candidates(&self, prompt: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 50
+        });
+        let response = ureq::post(&self.config.endpoint)
+            .set("Authorization", &format!("Bearer {}", self.config.api_key))
+            .set("Content-Type", "application/json")
+            .send_json(&body)
+            .map_err(|e| format!("LLM API call failed: {}", e))?;
+        let json: serde_json::Value = response.into_json()?;
+        let content = json["choices"][0]["message"]["content"]
+            .as_str().ok_or("No content")?;
+        Ok(content.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+    }
 }

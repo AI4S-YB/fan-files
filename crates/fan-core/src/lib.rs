@@ -6,6 +6,7 @@ pub mod interpreter;
 pub mod llm;
 pub mod plugin;
 pub mod project;
+pub mod review;
 pub mod scanner;
 pub mod suggest;
 pub mod types;
