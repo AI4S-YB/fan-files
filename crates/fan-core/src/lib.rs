@@ -2,6 +2,7 @@ pub mod bold;
 pub mod config;
 pub mod detector;
 pub mod index;
+pub mod infer;
 pub mod interpreter;
 pub mod llm;
 pub mod plugin;
