@@ -3,7 +3,7 @@ use fan_core::index::IndexEngine;
 use fan_core::suggest::SuggestEngine;
 
 pub fn run(config: &Config, path: &str, json: bool) {
-    let index = match IndexEngine::open(config) {
+    let index = match IndexEngine::open(config, true) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);

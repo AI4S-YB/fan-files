@@ -4,7 +4,7 @@ use fan_plugin_sdk::{DataSource, SearchResult};
 use std::collections::HashMap;
 
 pub fn run(config: &Config, query: &str, json: bool) {
-    let index = match IndexEngine::open(config) {
+    let index = match IndexEngine::open(config, true) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);

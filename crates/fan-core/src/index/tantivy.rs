@@ -9,12 +9,13 @@ use std::sync::Mutex;
 
 pub struct TantivyIndex {
     index: Index,
-    writer: Mutex<IndexWriter>,
+    writer: Option<Mutex<IndexWriter>>,
     schema: Schema,
 }
 
 impl TantivyIndex {
-    pub fn open(data_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Open the index. If read_only is true, no writer is created (safe for concurrent readers).
+    pub fn open(data_dir: &Path, read_only: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let index_dir = data_dir.join("tantivy");
         std::fs::create_dir_all(&index_dir).ok();
 
@@ -28,13 +29,13 @@ impl TantivyIndex {
         let dir = MmapDirectory::open(&index_dir)?;
         let index = Index::open_or_create(dir, schema.clone())?;
 
-        let writer = index.writer(50_000_000)?;
+        let writer = if read_only {
+            None
+        } else {
+            Some(Mutex::new(index.writer(50_000_000)?))
+        };
 
-        Ok(Self {
-            index,
-            writer: Mutex::new(writer),
-            schema,
-        })
+        Ok(Self { index, writer, schema })
     }
 
     pub fn index_file(
@@ -44,6 +45,8 @@ impl TantivyIndex {
         metadata_text: &str,
         tags: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let writer = self.writer.as_ref()
+            .ok_or("index opened in read-only mode")?;
         let file_id_field = self.schema.get_field("file_id").unwrap();
         let path_field = self.schema.get_field("path").unwrap();
         let metadata_field = self.schema.get_field("metadata").unwrap();
@@ -55,8 +58,7 @@ impl TantivyIndex {
         doc.add_text(metadata_field, metadata_text);
         doc.add_text(tags_field, tags.join(" "));
 
-        // Delete any existing doc for this file_id, then add the new one
-        let mut writer = self.writer.lock().unwrap();
+        let mut writer = writer.lock().unwrap();
         let id_term = tantivy::Term::from_field_i64(file_id_field, id);
         writer.delete_term(id_term);
         writer.add_document(doc)?;
@@ -105,19 +107,22 @@ impl TantivyIndex {
     }
 
     pub fn delete(&self, file_id: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let writer = self.writer.as_ref()
+            .ok_or("index opened in read-only mode")?;
         let file_id_field = self.schema.get_field("file_id").unwrap();
-        let mut writer = self.writer.lock().unwrap();
+        let mut writer = writer.lock().unwrap();
         let id_term = tantivy::Term::from_field_i64(file_id_field, file_id);
         writer.delete_term(id_term);
         writer.commit()?;
         Ok(())
     }
 
-    /// Flush any pending changes to disk. This is a no-op if there are no
-    /// pending documents or deletes, so it is safe to call at any time.
+    /// Flush any pending changes to disk.
     pub fn commit(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut writer = self.writer.lock().unwrap();
-        writer.commit()?;
+        if let Some(writer) = &self.writer {
+            let mut writer = writer.lock().unwrap();
+            writer.commit()?;
+        }
         Ok(())
     }
 }

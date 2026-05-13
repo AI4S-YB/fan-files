@@ -14,11 +14,11 @@ pub struct IndexEngine {
 }
 
 impl IndexEngine {
-    pub fn open(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn open(config: &Config, read_only: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let data_dir = crate::config::dirs_fan().join("data");
         Ok(Self {
             sqlite: SqliteStore::open(&data_dir)?,
-            tantivy: tantivy::TantivyIndex::open(&data_dir)?,
+            tantivy: tantivy::TantivyIndex::open(&data_dir, read_only)?,
             embedding: embedding::EmbeddingEngine::new(config)?,
         })
     }

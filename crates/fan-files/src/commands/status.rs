@@ -2,7 +2,7 @@ use fan_core::config::Config;
 use fan_core::index::IndexEngine;
 
 pub fn run(config: &Config) {
-    let index = match IndexEngine::open(config) {
+    let index = match IndexEngine::open(config, true) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);
