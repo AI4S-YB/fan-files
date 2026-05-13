@@ -2,6 +2,7 @@ pub mod config;
 pub mod detector;
 pub mod index;
 pub mod interpreter;
+pub mod llm;
 pub mod plugin;
 pub mod project;
 pub mod scanner;
