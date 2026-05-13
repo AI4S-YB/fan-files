@@ -55,6 +55,7 @@ impl LlmClient {
             .as_str()
             .ok_or("No content in LLM response")?;
 
+        info!("LLM raw response: {}", content);
         prompt::parse_llm_response(content)
             .map_err(|e| format!("Failed to parse LLM JSON output: {}", e).into())
     }

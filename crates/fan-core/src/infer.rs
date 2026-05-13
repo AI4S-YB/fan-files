@@ -10,6 +10,7 @@ pub fn run_inference(
     project_store: &ProjectStore,
     llm_client: &LlmClient,
     scan_root: &str,
+    bold_enabled: bool,
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     if !llm_client.is_configured() {
         info!("LLM not configured, skipping inference");
@@ -77,9 +78,10 @@ pub fn run_inference(
             }
         }
 
-        // 5. BOLD species confirmation for low/medium confidence projects
-        if proj.species_confidence.as_deref() == Some("low")
-            || proj.species_confidence.as_deref() == Some("medium")
+        // 5. BOLD species confirmation (only if enabled and confidence is low/medium)
+        if bold_enabled
+            && (proj.species_confidence.as_deref() == Some("low")
+                || proj.species_confidence.as_deref() == Some("medium"))
         {
             if let Some(blast_file) = bold::find_blast_file(&proj.dirs) {
                 info!(

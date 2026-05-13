@@ -8,7 +8,12 @@ pub fn system_prompt() -> &'static str {
         genome_annotation, variant_calling, epigenomics, transcriptomics, phenomics, germplasm 等\n\
      3. 推断物种信息（species）和置信度（species_confidence: high/medium/low）\n\
      4. 判断不同项目之间是否有关联（同一物种、互补实验类型等）\n\
-     5. 每个项目写一句简短描述（summary）"
+     5. 每个项目写一句简短描述（summary）\n\n\
+     请严格按照以下 JSON 格式返回，不要添加任何额外说明：\n\
+     {\"projects\": [{\"name\": \"项目名\", \"dirs\": [\"目录1\"], \"assay_type\": \"类型\", \
+     \"species\": \"物种\", \"species_confidence\": \"high\", \"summary\": \"描述\"}], \
+     \"relations\": [{\"project_a\": \"项目1\", \"project_b\": \"项目2\", \
+     \"relation\": \"关系类型\", \"score\": 0.8}]}"
 }
 
 use serde::Deserialize;
@@ -17,12 +22,15 @@ use serde::Deserialize;
 pub struct LlmOutput {
     pub projects: Vec<LlmProject>,
     #[serde(default)]
+    #[serde(alias = "relationships")]
     pub relations: Vec<LlmRelation>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct LlmProject {
+    #[serde(alias = "id")]
     pub name: String,
+    #[serde(alias = "paths")]
     pub dirs: Vec<String>,
     pub assay_type: Option<String>,
     pub species: Option<String>,
@@ -33,8 +41,11 @@ pub struct LlmProject {
 
 #[derive(Debug, Deserialize)]
 pub struct LlmRelation {
+    #[serde(alias = "project1")]
     pub project_a: String,
+    #[serde(alias = "project2")]
     pub project_b: String,
+    #[serde(alias = "relationship")]
     pub relation: String,
     pub score: f64,
 }

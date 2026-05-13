@@ -36,7 +36,7 @@ pub fn run(config: &Config) {
             let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
             let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
             info!("Running LLM inference on indexed files...");
-            match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+            match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root, config.llm.bold_enabled) {
                 Ok((p, r)) => info!("LLM inference complete: {} projects, {} relations", p, r),
                 Err(e) => warn!("LLM inference failed: {}", e),
             }
@@ -91,7 +91,7 @@ pub fn run(config: &Config) {
                     let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
                     let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
                     info!("Running LLM inference on indexed files...");
-                    match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+                    match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root, config.llm.bold_enabled) {
                         Ok((p, r)) => info!("LLM inference complete: {} projects, {} relations", p, r),
                         Err(e) => warn!("LLM inference failed: {}", e),
                     }

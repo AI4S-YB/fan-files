@@ -118,10 +118,16 @@ pub struct LlmConfig {
     pub api_key: String,
     #[serde(default = "default_llm_model")]
     pub model: String,
+    #[serde(default = "default_bold_enabled")]
+    pub bold_enabled: bool,
 }
 
 fn default_llm_model() -> String {
     "gpt-4o-mini".into()
+}
+
+fn default_bold_enabled() -> bool {
+    false
 }
 
 impl Default for LlmConfig {
@@ -130,6 +136,7 @@ impl Default for LlmConfig {
             endpoint: String::new(),
             api_key: String::new(),
             model: default_llm_model(),
+            bold_enabled: false,
         }
     }
 }

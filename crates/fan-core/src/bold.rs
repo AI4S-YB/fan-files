@@ -128,9 +128,11 @@ pub fn extract_sequence(
 /// Call BOLD API to identify species from a DNA sequence
 pub fn identify_species(sequence: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let url = "https://v4.boldsystems.org/index.php/Ids_OpenApi";
+    info!("Calling BOLD API (sequence length: {}bp)...", sequence.len());
 
     let response = ureq::post(url)
         .set("Content-Type", "application/x-www-form-urlencoded")
+        .timeout(std::time::Duration::from_secs(10))
         .send_form(&[
             ("sequence", sequence),
             ("db", "COX1_SPECIES_PUBLIC,COX1,COX1_SPECIES"),

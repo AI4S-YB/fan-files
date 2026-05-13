@@ -35,7 +35,7 @@ pub fn run(config: &Config) {
         .unwrap_or("/");
 
     println!("Running LLM inference on indexed files...");
-    match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+    match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root, config.llm.bold_enabled) {
         Ok((projects, relations)) => {
             println!(
                 "Inference complete: {} projects, {} relations",
