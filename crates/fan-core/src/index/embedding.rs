@@ -109,7 +109,7 @@ impl EmbeddingEngine {
             .first()
             .map(|vi| vi.name.clone())
             .unwrap_or_else(|| "last_hidden_state".to_string());
-        let max_seq_len = 512;
+        let max_seq_len = 128;
 
         info!(
             "Loaded ONNX model '{}' ({} dims). Inputs: {:?}, Output: '{}'",
@@ -304,29 +304,31 @@ impl EmbeddingEngine {
         // token_embeddings shape: [1, seq_len, hidden_dim]
 
         // 6. Mean pooling with attention mask
-        // Expand mask: [1, seq_len] -> [1, seq_len, 1]
-        let mask_expanded = attention_mask
-            .to_dtype(candle_core::DType::F32)?
-            .unsqueeze(2)?; // [1, seq_len, 1]
+        // Expand mask to match embeddings shape: [1, seq_len] -> [1, seq_len, 1]
+        let mask_f32 = attention_mask.to_dtype(candle_core::DType::F32)?; // [1, seq_len]
+        let hidden_dim = token_embeddings.dims()[2];
+
+        // Broadcast mask to [1, seq_len, hidden_dim] manually
+        let mask_2d = mask_f32.unsqueeze(2)?; // [1, seq_len, 1]
+        let mask_shape = mask_2d.shape().clone();
+        let target_shape = &[mask_shape.dims()[0], mask_shape.dims()[1], hidden_dim];
+        let mask_broadcast = mask_2d.broadcast_as(target_shape)?; // [1, seq_len, hidden_dim]
 
         // Apply mask: zero out padding tokens
-        let masked = token_embeddings.mul(&mask_expanded)?; // [1, seq_len, hidden_dim]
+        let masked = token_embeddings.broadcast_mul(&mask_broadcast)?;
 
-        // Sum over the sequence dimension
+        // Mean over sequence: sum / mask_count
         let sum = masked.sum(1)?; // [1, hidden_dim]
-        let mask_count = mask_expanded.sum(1)?; // [1, 1]
-
-        // Mean: divide by number of valid tokens (add epsilon to avoid division by zero)
-        let epsilon = Tensor::new(&[1e-9f32], &Device::Cpu)?;
-        let safe_count = mask_count.broadcast_add(&epsilon)?;
-        let pooled = sum.broadcast_div(&safe_count)?; // [1, hidden_dim]
+        let mask_count = mask_broadcast.sum(1)?; // [1, hidden_dim] — each element is # of valid tokens
+        // Avoid division by zero: mask_count is at least 1 for valid positions
+        let pooled = sum.broadcast_div(&mask_count)?; // [1, hidden_dim]
 
         // Flatten to 1D
         let pooled_1d = pooled.flatten_all()?;
 
         // L2 normalize
         let norm = pooled_1d.sqr()?.sum_all()?.sqrt()?;
-        let normalized = pooled_1d.broadcast_div(&norm)?;
+        let normalized = (pooled_1d / norm)?;
 
         let vec: Vec<f32> = normalized.to_vec1()?;
         Ok(vec)
