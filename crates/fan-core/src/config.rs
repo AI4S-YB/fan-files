@@ -19,6 +19,8 @@ pub struct Config {
     pub schedule: ScheduleConfig,
     #[serde(default)]
     pub llm: LlmConfig,
+    #[serde(default)]
+    pub public_data: PublicDataConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +136,23 @@ impl Default for LlmConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicDataConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub db_path: String,
+}
+
+impl Default for PublicDataConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: String::new(),
+        }
+    }
+}
+
 fn default_socket() -> PathBuf {
     dirs_fan().join("fan.sock")
 }
@@ -178,6 +197,7 @@ impl Default for Config {
                 full_sync: default_sync_time(),
             },
             llm: LlmConfig::default(),
+            public_data: PublicDataConfig::default(),
         }
     }
 }
