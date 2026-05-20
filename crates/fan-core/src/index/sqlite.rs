@@ -303,14 +303,18 @@ impl SqliteStore {
     ) -> rusqlite::Result<Vec<(String, String, String)>> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(&format!("ATTACH DATABASE '{}' AS public_sra", db_path))?;
-        let pattern = format!("%{}%", query);
+        // Use FTS5 for fast full-text search
+        let fts_query = query.split_whitespace()
+            .map(|w| format!("\"{}\"", w))
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut stmt = conn.prepare(
             "SELECT accession, organism_name, project_title
              FROM public_sra.sra_entries
-             WHERE organism_name LIKE ?1 OR project_title LIKE ?1
+             WHERE rowid IN (SELECT rowid FROM public_sra.sra_fts WHERE sra_fts MATCH ?1)
              LIMIT ?2"
         )?;
-        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
