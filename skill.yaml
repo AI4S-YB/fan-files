@@ -1,0 +1,45 @@
+# 唯一标识符
+name: fan-files
+# 语义化版本
+version: 0.1.0
+# 在 Marketplace 页面上显示的名称
+display_name: "Fan-Files 数据检索"
+# 一句话描述
+description: "服务器文件元数据检索引擎——扫描、推断、检索生物信息学数据，让 AI 助手拥有全服务器数据视野"
+# GitHub 用户名或组织名
+author: AI4S-YB
+# 开源许可证
+license: MIT
+# Skill 仓库地址
+homepage: https://github.com/AI4S-YB/fan-files
+# 运行配置
+runtime:
+  type: skill
+  min_fan_version: "0.1.0"
+# 此 Skill 对外暴露的能力
+provides:
+  - id: search-files
+    description: "自然语言搜索服务器文件，合并本地索引和公共 SRA 数据库结果"
+  - id: list-projects
+    description: "列出 LLM 推断的数据项目，查看项目详情和关联"
+  - id: manage-metadata
+    description: "交互式完善不确定性元数据（物种、实验类型），引导用户选择题补全"
+# 依赖
+requires: []
+# 搜索关键词
+keywords:
+  - bioinformatics
+  - file-indexing
+  - metadata
+  - genomics
+  - SRA
+  - data-discovery
+  - sequencing
+  - breeding
+# 分类
+category: community
+# 外部系统依赖
+external_deps:
+  - name: fan-files
+    install_hint: "cargo build --release && sudo cp target/release/fan-files /usr/local/bin/"
+    required: true
