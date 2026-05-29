@@ -60,26 +60,34 @@ fan-files suggest /data/projects/xxx  # 数据推荐
 fan-files status                      # 索引状态
 ```
 
-## 安装 Claude Code 插件
+## 安装 Claude Code Skill
 
-### 方式一：全局插件（推荐，所有项目可用）
+### 方式一：FAN Marketplace 安装（推荐）
 
 ```bash
-# 安装
-ln -s /path/to/fan-files ~/.claude/plugins/fan-files
+# 安装 fan-cli（一次性）
+git clone https://github.com/AI4S-YB/fan-marketplace.git
+cd fan-marketplace && npm install && npm link
+
+# 通过 Marketplace 安装 skill
+fan install fan-files
 
 # 升级
-cd /path/to/fan-files && git pull
-cargo build --release
-sudo cp target/release/fan-files /usr/local/bin/
-# 重启 Claude Code 即可
+fan update fan-files
 ```
 
-### 方式二：项目级 Skill（仅当前项目）
+### 方式二：全局插件
+
+```bash
+ln -s /path/to/fan-files ~/.claude/plugins/fan-files
+# 重启 Claude Code
+```
+
+### 方式三：项目级 Skill
 
 ```bash
 mkdir -p .claude/skills
-cp skills/fan-files.md .claude/skills/
+cp SKILL.md .claude/skills/fan-files.md
 ```
 
 ## 技术栈
