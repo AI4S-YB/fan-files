@@ -5,38 +5,48 @@ description: Use when analyzing bioinformatics data - find data files, reference
 
 # Fan-Files: Server Data Intelligence
 
-You have access to `fan-files`, a tool that indexes ALL files on this server and uses LLM to infer biological metadata (project, species, assay type). It also searches 6.8M+ public plant SRA records from CNCB-NGDC.
+You have access to `fan-files` for local file search and the public Plant SRA API on `47.95.117.10:8080` for 6.8M+ public plant records.
+
+## Data Search (Local + Public + LLM-driven)
+
+When searching for data, use a **3-step strategy**:
+
+### Step 1: Generate search variants with LLM
+Based on user's analysis goal, generate 3-5 search keyword variants. For example:
+- User: "找苹果的RNA-seq数据"
+- Variants: "Malus domestica RNA-Seq", "apple transcriptome", "Malus RNA-Seq", "apple expression"
+
+### Step 2: Search both sources
+```
+# Local search
+fan-files search "<keyword>" --json
+
+# Public SRA API (Deduplicated by BioProject)
+curl -s "http://47.95.117.10:8080/search?q=<keyword>&dedup=true&limit=10"
+```
+
+### Step 3: Merge and present
+- Group results by organism name and BioProject
+- Remove duplicate runs from the same project
+- Clearly label source: `[local]` / `[public]`
+- Present as: organism | project_title | source | accessions_count
 
 ## Commands
 
-### Search for data (local + public)
+### Local search
 ```
-fan-files search "<natural language query>" [--json]
-fan-files search "apple RNA-seq"
-fan-files search "reference genome Oryza"
-```
-Results merge local indexed files with public SRA database. Public results are prefixed with `[public]`.
-
-### List projects (LLM-inferred)
-```
-fan-files projects                     # list all projects with species, assay, file count
-fan-files projects <project_name>      # show project details (dirs, relations, metadata)
+fan-files search "<query>" [--json]
 ```
 
-### View file details
+### List projects
+```
+fan-files projects
+fan-files projects <name>
+```
+
+### File details
 ```
 fan-files info <path> [--json]
-```
-
-### Discover related data
-```
-fan-files suggest <project_directory> [--json]
-```
-
-### List files by type or tag
-```
-fan-files list --category genome
-fan-files list --tag human [--json]
 ```
 
 ### System status
@@ -44,22 +54,9 @@ fan-files list --tag human [--json]
 fan-files status
 ```
 
-## Metadata Review (Startup Check)
-
-At the start of each conversation, run `fan-files pending --json` in the background.
-If results are non-empty, tell the user: "服务器上有 N 个数据项目的信息需要完善。要现在处理吗？"
-
-When the user agrees, for each pending item:
-1. Show the project name, field, current guess
-2. Present candidates (A/B/C/D) for the user to choose, or accept free-text input
-3. Execute: `fan-files projects update <name> --species "<choice>" --confidence high`
-4. Move to next item
-5. When done: `fan-files pending --clear`
-
 ## Best Practices
 
-1. **Before any analysis**: run `fan-files search` to discover available data (both local and public)
-2. **Check projects**: `fan-files projects` to see what datasets the server has
-3. **Be proactive**: mention available related data even if the user didn't ask
-4. **Use --json**: when you need parseable output for programmatic processing
-5. **Public data**: search automatically includes plant SRA metadata — highlight public datasets when relevant
+1. **Generate search variants**: never search with user's raw input only — expand to Latin names, synonyms
+2. **Deduplicate**: public results are SRA runs — aggregate by BioProject
+3. **Both sources always**: local + public for every search
+4. **Present findings clearly**: organism → project title → how many runs → source
