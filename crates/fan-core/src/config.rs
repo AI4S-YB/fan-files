@@ -206,3 +206,44 @@ fn dirs_home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
 }
+
+/// 国内常见 LLM 厂商预设
+pub const LLM_PROVIDERS: &[LlmProvider] = &[
+    LlmProvider {
+        name: "DeepSeek",
+        endpoint: "https://api.deepseek.com/v1/chat/completions",
+        default_model: "deepseek-chat",
+        description: "国内推荐，性价比最高",
+    },
+    LlmProvider {
+        name: "通义千问 (Qwen)",
+        endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        default_model: "qwen-plus",
+        description: "阿里云，模型矩阵丰富",
+    },
+    LlmProvider {
+        name: "智谱 GLM",
+        endpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        default_model: "glm-4-flash",
+        description: "国产均衡，教育优惠",
+    },
+    LlmProvider {
+        name: "百度文心 (ERNIE)",
+        endpoint: "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions",
+        default_model: "ernie-4.0-turbo-8k",
+        description: "稳定性强，企业级",
+    },
+    LlmProvider {
+        name: "OpenAI / 自定义",
+        endpoint: "",
+        default_model: "gpt-4o-mini",
+        description: "自行填写 endpoint 和 key",
+    },
+];
+
+pub struct LlmProvider {
+    pub name: &'static str,
+    pub endpoint: &'static str,
+    pub default_model: &'static str,
+    pub description: &'static str,
+}
