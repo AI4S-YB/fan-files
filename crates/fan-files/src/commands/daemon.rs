@@ -66,6 +66,7 @@ pub fn run(config: &Config) {
     let retention_days = config.retention.deleted_keep_days;
     let mut last_sync_day: Option<u64> = None;
     let mut last_purge_day: Option<u64> = None;
+    let mut new_files_since_infer: u64 = 0;
 
     loop {
         let now_secs = SystemTime::now()
@@ -133,6 +134,21 @@ pub fn run(config: &Config) {
                                         format_info.as_ref(),
                                         &interpreter_registry,
                                     );
+                                    new_files_since_infer += 1;
+                                    // Auto-infer after 10+ new files
+                                    if new_files_since_infer >= 10 {
+                                        let llm_client = LlmClient::new(config.llm.clone());
+                                        if llm_client.is_configured() {
+                                            let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
+                                            let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
+                                            info!("Auto-triggering LLM inference after {} new files...", new_files_since_infer);
+                                            match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+                                                Ok((p, r)) => info!("Auto-infer complete: {} projects, {} relations", p, r),
+                                                Err(e) => warn!("Auto-infer failed: {}", e),
+                                            }
+                                            new_files_since_infer = 0;
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     error!("Failed to re-index {}: {}", path.display(), e)

@@ -18,6 +18,18 @@ pub fn run(config: &Config) {
             println!("Total tracked:   {}", status.total_files);
             println!("Deleted (soft):  {}", status.deleted_files);
 
+            // Show metadata coverage
+            let with_meta = index.sqlite.count_with_bio_metadata().unwrap_or(0);
+            let pct = if status.indexed_files > 0 {
+                (with_meta as f64 / status.indexed_files as f64) * 100.0
+            } else {
+                0.0
+            };
+            println!("Metadata coverage: {:.0}% ({}/{})", pct, with_meta, status.indexed_files);
+            if pct < 50.0 && status.indexed_files > 10 {
+                println!("  ⚠ Metadata coverage is low. Run 'fan-files infer' for better search results.");
+            }
+
             let fmt_ts = |ts: i64| -> String {
                 std::time::UNIX_EPOCH
                     .checked_add(std::time::Duration::from_secs(ts as u64))

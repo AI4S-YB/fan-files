@@ -272,6 +272,16 @@ impl SqliteStore {
         rows.collect()
     }
 
+    pub fn count_with_bio_metadata(&self) -> rusqlite::Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE bio_metadata_json IS NOT NULL AND bio_metadata_json != '' AND deleted=0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c as u64)
+    }
+
     pub fn status(&self) -> rusqlite::Result<IndexStatus> {
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
