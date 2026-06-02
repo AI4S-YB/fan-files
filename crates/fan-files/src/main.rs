@@ -61,6 +61,8 @@ enum Commands {
         #[arg(long, default_value = "skill/fan-files.md")]
         output: std::path::PathBuf,
     },
+    /// Interactive setup wizard
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -103,5 +105,6 @@ fn main() {
         },
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::GenerateSkill { output } => skill::run(&output),
+        Commands::Init => commands::init::run(&config),
     }
 }

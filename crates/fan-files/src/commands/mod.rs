@@ -1,6 +1,7 @@
 pub mod daemon;
 pub mod infer;
 pub mod info;
+pub mod init;
 pub mod list;
 pub mod pending;
 pub mod projects;
