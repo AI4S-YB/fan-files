@@ -1,5 +1,6 @@
 use fan_core::config::LLM_PROVIDERS;
 use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use fan_core::config::Config;
 
 pub fn run(config: &Config) {
@@ -128,7 +129,37 @@ fn run_step_3(config: &Config) {
 
     match input.as_str() {
         "1" => {
-            println!("  已启动后台扫描。'fan-files status' 查看进度。");
+            println!("  启动后台扫描...");
+            let log_path = fan_core::config::dirs_fan().join("daemon.log");
+
+            match std::env::current_exe() {
+                Ok(bin) => {
+                    let log_file = std::fs::File::create(&log_path)
+                        .expect("Failed to create daemon log");
+                    let result = Command::new(&bin)
+                        .arg("daemon")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(log_file))
+                        .stderr(Stdio::null())
+                        .spawn();
+
+                    match result {
+                        Ok(child) => {
+                            println!("  ✅ 后台扫描已启动 (PID: {})", child.id());
+                            println!("  日志: {}", log_path.display());
+                            println!("  'fan-files status' 查看进度");
+                        }
+                        Err(e) => {
+                            eprintln!("  ❌ 启动失败: {}", e);
+                            eprintln!("  请手动运行 'fan-files daemon'");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  ❌ 找不到可执行文件: {}", e);
+                    eprintln!("  请手动运行 'fan-files daemon'");
+                }
+            }
         }
         "2" => {
             println!("  启动扫描（Ctrl+C 停止）...");
