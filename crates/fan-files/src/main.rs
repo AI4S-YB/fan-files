@@ -56,6 +56,8 @@ enum Commands {
         #[arg(long)]
         clear: bool,
     },
+    /// Update fan-files to the latest version
+    Update,
     /// Generate Claude Code skill file
     GenerateSkill {
         #[arg(long, default_value = "skill/fan-files.md")]
@@ -104,6 +106,7 @@ fn main() {
             None => commands::projects::run(&config, None),
         },
         Commands::Pending { clear } => commands::pending::run(clear),
+        Commands::Update => commands::update::run(),
         Commands::GenerateSkill { output } => skill::run(&output),
         Commands::Init => commands::init::run(&config),
     }
