@@ -1,5 +1,4 @@
 mod commands;
-mod skill;
 
 use clap::{Parser, Subcommand};
 use fan_core::config::Config;
@@ -60,11 +59,6 @@ enum Commands {
     Update,
     /// Uninstall fan-files
     Uninstall,
-    /// Generate Claude Code skill file
-    GenerateSkill {
-        #[arg(long, default_value = "skill/fan-files.md")]
-        output: std::path::PathBuf,
-    },
     /// Interactive setup wizard
     Init,
 }
@@ -110,7 +104,6 @@ fn main() {
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::Update => commands::update::run(),
         Commands::Uninstall => commands::uninstall::run(),
-        Commands::GenerateSkill { output } => skill::run(&output),
         Commands::Init => commands::init::run(&config),
     }
 }
