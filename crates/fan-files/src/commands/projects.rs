@@ -3,7 +3,7 @@ use fan_core::index::sqlite::SqliteStore;
 use fan_core::project::ProjectStore;
 use std::sync::Arc;
 
-pub fn run(config: &Config, show_name: Option<&str>) {
+pub fn run(_config: &Config, show_name: Option<&str>) {
     let data_dir = fan_core::config::dirs_fan().join("data");
     let sqlite = match SqliteStore::open(&data_dir) {
         Ok(s) => s,
@@ -93,7 +93,7 @@ fn truncate(s: &str, max: usize) -> &str {
 }
 
 pub fn run_update(
-    config: &Config,
+    _config: &Config,
     name: &str,
     species: Option<&str>,
     confidence: Option<&str>,

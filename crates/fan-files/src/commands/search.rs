@@ -1,10 +1,9 @@
 use fan_core::config::Config;
-use fan_core::index::IndexEngine;
 use fan_plugin_sdk::{DataSource, SearchResult};
 use std::collections::HashMap;
 
 pub fn run(config: &Config, query: &str, json: bool) {
-    let index = match IndexEngine::open(config, true) {
+    let index = match fan_core::index::open_index(config, fan_core::index::IndexMode::ReadOnly) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);
@@ -16,7 +15,7 @@ pub fn run(config: &Config, query: &str, json: bool) {
     let tantivy_results = index.tantivy.search(query, 50).unwrap_or_default();
 
     // If Tantivy returns nothing, fall back to SQLite LIKE search
-    let mut file_ids: Vec<(i64, f32)> = if tantivy_results.is_empty() {
+    let file_ids: Vec<(i64, f32)> = if tantivy_results.is_empty() {
         index.sqlite.search_by_metadata(query, 50).unwrap_or_default()
             .into_iter().map(|(id, score)| (id, score as f32)).collect()
     } else {

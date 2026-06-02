@@ -1,8 +1,7 @@
 use fan_core::config::Config;
-use fan_core::index::IndexEngine;
 
 pub fn run(config: &Config) {
-    let index = match IndexEngine::open(config, true) {
+    let index = match fan_core::index::open_index(config, fan_core::index::IndexMode::ReadOnly) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);

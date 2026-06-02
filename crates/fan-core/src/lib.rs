@@ -1,6 +1,7 @@
 pub mod config;
 pub mod detector;
 pub mod index;
+pub use index::IndexMode;
 pub mod infer;
 pub mod interpreter;
 pub mod llm;

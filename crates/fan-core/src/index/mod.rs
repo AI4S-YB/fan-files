@@ -7,6 +7,11 @@ use crate::types::RawFileInfo;
 use fan_plugin_sdk::FormatInfo;
 use sqlite::SqliteStore;
 
+pub enum IndexMode {
+    ReadOnly,
+    ReadWrite,
+}
+
 pub struct IndexEngine {
     pub sqlite: SqliteStore,
     pub tantivy: tantivy::TantivyIndex,
@@ -34,4 +39,10 @@ impl IndexEngine {
             .index_file(id, &info.path, &metadata_text, &[])?;
         Ok(id)
     }
+}
+
+/// Open the index with the given mode. This is the canonical entry point
+/// for all CLI commands and daemon.
+pub fn open_index(config: &crate::config::Config, mode: IndexMode) -> Result<IndexEngine, Box<dyn std::error::Error>> {
+    IndexEngine::open(config, matches!(mode, IndexMode::ReadOnly))
 }

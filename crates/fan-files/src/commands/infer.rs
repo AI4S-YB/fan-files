@@ -3,7 +3,6 @@ use fan_core::infer;
 use fan_core::index::sqlite::SqliteStore;
 use fan_core::llm::LlmClient;
 use fan_core::project::ProjectStore;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 pub fn run(config: &Config) {
