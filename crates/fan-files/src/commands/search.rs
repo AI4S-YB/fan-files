@@ -113,6 +113,15 @@ pub fn run(config: &Config, query: &str, json: bool) {
     }
 
 
+    // Check metadata coverage
+    let total = index.sqlite.status().unwrap().indexed_files;
+    let with_meta = index.sqlite.count_with_bio_metadata().unwrap_or(0);
+    let coverage_pct = if total > 0 { (with_meta as f64 / total as f64) * 100.0 } else { 0.0 };
+
+    if coverage_pct < 50.0 && total > 10 && !json {
+        eprintln!("⚠  Metadata coverage is low ({:.0}%). Run 'fan-files infer' for better results.", coverage_pct);
+    }
+
     if json {
         println!("{}", serde_json::to_string_pretty(&results).unwrap());
     } else {
