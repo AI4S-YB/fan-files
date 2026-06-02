@@ -19,10 +19,11 @@ runtime:
 # 此 Skill 对外暴露的能力
 provides:
   - id: search-files
+    description: "自然语言搜索服务器文件，语义+全文+结构化三层检索"
   - id: list-projects
-    description: "列出 LLM 推断的数据项目，查看项目详情和关联"
+    description: "列出 LLM 推断的数据项目，查看项目详情、物种、关联"
   - id: manage-metadata
-    description: "交互式完善不确定性元数据（物种、实验类型），引导用户选择题补全"
+    description: "交互式完善不确定性元数据（物种），引导用户选择题补全"
 # 依赖
 requires: []
 # 搜索关键词
@@ -39,5 +40,5 @@ category: community
 # 外部系统依赖
 external_deps:
   - name: fan-files
-    install_hint: "cargo build --release && sudo cp target/release/fan-files /usr/local/bin/"
+    install_hint: "curl -fsSL https://raw.githubusercontent.com/AI4S-YB/fan-files/main/install.sh | bash"
     required: true
