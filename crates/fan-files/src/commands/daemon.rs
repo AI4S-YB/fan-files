@@ -17,7 +17,13 @@ use tracing::{error, info, warn};
 pub fn run(config: &Config) {
     info!("Starting fan-files daemon...");
 
-    let index = fan_core::index::open_index(config, fan_core::index::IndexMode::ReadWrite).expect("Failed to open index engine");
+    let index = match fan_core::index::open_index(config, fan_core::index::IndexMode::ReadWrite) {
+        Ok(i) => i,
+        Err(e) => {
+            error!("Failed to open index engine: {}", e);
+            return;
+        }
+    };
     let mut plugins = PluginRegistry::new(config.plugins.dir.clone());
     let n = plugins.discover().unwrap_or(0);
     info!("Discovered {} plugins", n);
