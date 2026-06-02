@@ -112,12 +112,6 @@ pub fn run(config: &Config, query: &str, json: bool) {
         }
     }
 
-    // 5. Search public data
-    let public_results = search_public(config, query);
-    results.extend(public_results);
-
-    // Re-sort by score
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     if json {
         println!("{}", serde_json::to_string_pretty(&results).unwrap());
@@ -143,35 +137,6 @@ fn get_project_for_path(sqlite: &fan_core::index::sqlite::SqliteStore, file_path
          WHERE f.path = ?1 LIMIT 1"
     ).ok()?;
     stmt.query_row(rusqlite::params![file_path], |row| row.get(0)).ok()
-}
-
-fn search_public(config: &Config, query: &str) -> Vec<SearchResult> {
-    let public_cfg = &config.public_data;
-    if !public_cfg.enabled || public_cfg.db_path.is_empty() {
-        return vec![];
-    }
-
-    let data_dir = fan_core::config::dirs_fan().join("data");
-    let sqlite = match fan_core::index::sqlite::SqliteStore::open(&data_dir) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-
-    match sqlite.search_public(&public_cfg.db_path, query, 20) {
-        Ok(rows) => rows.into_iter().map(|(acc, org, title)| {
-            SearchResult {
-                path: format!("[public] {}", acc),
-                score: 1.0,
-                file_type: Some("SRA".into()),
-                assay_type: None,
-                species: Some(org),
-                tags: vec![],
-                summary: title,
-                source: DataSource::Public { origin: "plant_sra".into() },
-            }
-        }).collect(),
-        Err(_) => vec![],
-    }
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {

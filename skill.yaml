@@ -19,7 +19,6 @@ runtime:
 # 此 Skill 对外暴露的能力
 provides:
   - id: search-files
-    description: "自然语言搜索服务器文件，合并本地索引和公共 SRA 数据库结果"
   - id: list-projects
     description: "列出 LLM 推断的数据项目，查看项目详情和关联"
   - id: manage-metadata
@@ -32,7 +31,6 @@ keywords:
   - file-indexing
   - metadata
   - genomics
-  - SRA
   - data-discovery
   - sequencing
   - breeding
