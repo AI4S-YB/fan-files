@@ -14,80 +14,81 @@
 
 ## 安装
 
-### 1. 编译二进制
+### 一键安装（推荐）
 
 ```bash
-git clone git@github.com:AI4S-YB/fan-files.git
-cd fan-files
-cargo build --release
-sudo cp target/release/fan-files /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/AI4S-YB/fan-files/main/install.sh | bash
 ```
 
-### 2. 配置
+自动安装 Rust（如未装）、编译、部署到 `/usr/local/bin/fan-files`，并安装 Claude Code Skill。
 
-编辑 `~/.fan-files/config.toml`：
-
-```toml
-[scan]
-include = ["/data"]
-exclude = ["/tmp", "*.tmp"]
-
-[watch]
-include = ["/data"]
-
-# LLM 推理配置（DeepSeek / OpenAI / 兼容接口）
-[llm]
-endpoint = "https://api.deepseek.com/v1/chat/completions"
-api_key = "sk-你的key"
-model = "deepseek-chat"
-```
-
-### 3. 扫描 + 推理
+### 初始配置
 
 ```bash
-fan-files daemon    # 扫描所有文件
-fan-files infer     # LLM 推断项目、物种、实验类型
+fan-files init
 ```
+
+交互式向导：选择扫描目录 → 选择 LLM（DeepSeek/Qwen/GLM/ERNIE/OpenAI）→ 输入 API Key → 开始扫描。
+
+完成后自动运行 `daemon`（扫描+监控）和 `infer`（LLM 元数据推断）。
 
 ## 使用
 
 ```bash
-fan-files search "apple RNA-seq"      # 自然语言搜索
-fan-files projects                    # 列出所有数据项目
+fan-files search "apple RNA-seq"      # 自然语言搜索（本地 + 公共库）
+fan-files projects                    # 列出 LLM 推断的数据项目
 fan-files projects SMT2024_genome     # 查看项目详情
-fan-files info /path/to/file.bam      # 查看文件元数据
+fan-files projects update <name> --species "Apple" --confidence high  # 修正元数据
+fan-files pending                     # 查看待完善项目
+fan-files info /path/to/file.bam      # 文件详情
 fan-files suggest /data/projects/xxx  # 数据推荐
-fan-files status                      # 索引状态
+fan-files status                      # 索引状态 + 元数据覆盖率
 ```
 
-## 安装 Claude Code Skill
+### 全部命令
 
-### 方式一：FAN Marketplace 安装（推荐）
+```
+fan-files init         交互式配置向导
+fan-files daemon       启动守护进程（扫描 + 监控 + 自动 infer）
+fan-files infer        手动触发 LLM 元数据推断
+fan-files search       自然语言搜索
+fan-files projects     列出/查看/更新数据项目
+fan-files pending      查看待完善清单
+fan-files list         按类型/标签列出文件
+fan-files info         文件详情
+fan-files suggest      数据推荐
+fan-files status       索引状态 + 覆盖率
+fan-files update       升级到最新版本
+fan-files uninstall    卸载（可选保留数据）
+```
+
+## 升级
 
 ```bash
-# 安装 fan-cli（一次性）
-git clone https://github.com/AI4S-YB/fan-marketplace.git
-cd fan-marketplace && npm install && npm link
+fan-files update
+```
 
-# 通过 Marketplace 安装 skill
+自动 git pull、重新编译、更新二进制和 Skill。
+
+## 卸载
+
+```bash
+fan-files uninstall
+```
+
+| 选项 | 效果 |
+|------|------|
+| 仅卸载程序 | 删除二进制 + 源码 + skill，保留 `~/.fan-files/`（数据库、配置、模型） |
+| 完全卸载 | 删除上述全部 + `~/.fan-files/` |
+
+## Claude Code 集成
+
+安装脚本自动将 SKILL.md 安装到 `~/.claude/skills/`。重启 Claude Code 后，fan-files skill 自动激活。
+
+也可通过 FAN Marketplace 安装：
+
+```bash
 fan install fan-files
-
-# 升级
-fan update fan-files
-```
-
-### 方式二：全局插件
-
-```bash
-ln -s /path/to/fan-files ~/.claude/plugins/fan-files
-# 重启 Claude Code
-```
-
-### 方式三：项目级 Skill
-
-```bash
-mkdir -p .claude/skills
-cp SKILL.md .claude/skills/fan-files.md
 ```
 
 ## 技术栈
