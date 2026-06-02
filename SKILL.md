@@ -1,27 +1,58 @@
 ---
 name: fan-files
-description: Use when analyzing bioinformatics data - find data files, reference genomes, and related datasets on the server. Activates when user asks about available data, server files, sequencing data, or wants to discover datasets for analysis.
+description: Use when the user needs to install, configure, search, or manage bioinformatics data on the server. Activates for data discovery, file search, project management, metadata review, installing fan-files, setting up scanning, upgrading, or uninstalling.
 ---
 
 # Fan-Files: Server Data Intelligence
 
-You have access to `fan-files`, a tool that indexes ALL files on this server and uses LLM to infer biological metadata (project, species, assay type).
+You have access to `fan-files`, a tool that indexes ALL files on this server and uses LLM to infer biological metadata (project, species, assay type). You can perform ALL fan-files operations on behalf of the user — from installation to daily data search.
 
-## Core Commands
+## Administrative Commands
+
+### Installation
+User can ask you to install fan-files from scratch. Always install the Claude Code skill at the same time:
+```bash
+curl -fsSL https://raw.githubusercontent.com/AI4S-YB/fan-files/main/install.sh | bash
+cp /path/to/fan-files/SKILL.md ~/.claude/skills/fan-files.md
+```
+
+### First-time setup
+Run the interactive wizard:
+```bash
+fan-files init
+```
+It guides through: choose scan directories → select LLM provider → enter API key → start scanning. After init, the user can start using search immediately.
+
+### Start background scanning
+```bash
+fan-files daemon
+```
+Scans configured directories, watches for changes, auto-runs LLM inference when 10+ new files appear.
+
+### Upgrade to latest
+```bash
+fan-files update
+```
+
+### Uninstall
+```bash
+fan-files uninstall
+```
+Option 1: remove program + skill, keep data. Option 2: full wipe.
+
+## Daily Commands
 
 ### Discover data
 ```
 fan-files search "<natural language query>" [--json]
 ```
-Examples: `fan-files search "apple RNA-seq"`, `fan-files search "reference genome Oryza"`
 
 ### Browse projects (LLM-inferred)
 ```
-fan-files projects                       # list all projects
-fan-files projects <project_name>        # show project details
+fan-files projects                       # list all
+fan-files projects <project_name>        # details
 fan-files projects update <name> --species "Apple" --confidence high
 ```
-Items with low/medium confidence need manual review. Use `fan-files pending --json` to check.
 
 ### File details
 ```
@@ -33,34 +64,40 @@ fan-files info <path> [--json]
 fan-files suggest <project_directory> [--json]
 ```
 
+### Precise tag-based listing
+```
+fan-files list --tag paired-end
+fan-files list --category genome [--json]
+```
+
 ### System status
 ```
 fan-files status
 ```
-Shows indexed file count and metadata coverage percentage.
 
-## Metadata Quality (Important)
-
-### Before searching, check metadata coverage
-Run `fan-files status`. If metadata coverage is below 50%, search results will be incomplete.
-
-### If coverage is low
-Run `fan-files infer` to let the LLM re-analyze all files and infer project names, species, and assay types. The daemon auto-runs this after initial scan if LLM is configured.
-
-### Startup check
-At the start of each conversation, run `fan-files pending --json`. If non-empty, tell the user:
-"服务器上有 N 个数据项目的信息需要完善。要现在处理吗？"
-
-When the user agrees, for each pending item show the project, uncertain field, and candidates (A/B/C/D). Execute:
+### Re-run metadata inference
 ```
-fan-files projects update <name> --species "<choice>" --confidence high
+fan-files infer
 ```
-Finish with `fan-files pending --clear`.
+Use when `status` shows low metadata coverage or search returns nothing.
+
+## Metadata Quality Check (Startup + Periodic)
+
+At the start of each conversation, run:
+```bash
+fan-files pending --json
+```
+If non-empty, tell the user: "服务器上有 N 个数据项目的信息需要完善。要现在处理吗？"
+
+When the user agrees, for each pending item:
+1. Show project name, uncertain field, candidates (A/B/C/D)
+2. Execute: `fan-files projects update <name> --species "<choice>" --confidence high`
+3. Finish with: `fan-files pending --clear`
 
 ## Best Practices
 
-1. **Check coverage first**: run `fan-files status` to see if metadata is sufficient
-2. **Run infer if needed**: `fan-files infer` when coverage <50% or search returns nothing
-3. **Search both local and public**: use multiple keyword variants when searching
-4. **Use --json**: for parseable output when filtering results programmatically
-5. **Be proactive**: mention available data even if the user didn't ask
+1. **Startup check**: run `fan-files pending --json` each session
+2. **Coverage check**: if `fan-files status` shows <50% metadata, suggest `fan-files infer`
+3. **Multi-variant search**: generate Latin name + common name + abbreviation variants
+4. **Proactive discovery**: mention available related data even if user didn't ask
+5. **Use --json**: for programmatic parsing
