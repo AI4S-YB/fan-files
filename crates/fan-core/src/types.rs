@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub struct FileEntry {
     pub id: i64,
     pub path: PathBuf,
+    pub source_server: String,
     pub size: u64,
     pub mtime_secs: i64,
     pub hash_sha256: Option<String>,
@@ -23,11 +24,20 @@ pub struct FileEntry {
 #[derive(Debug, Clone)]
 pub struct RawFileInfo {
     pub path: PathBuf,
+    pub source_server: String,
     pub size: u64,
     pub mtime_secs: i64,
     pub hash_sha256: Option<String>,
     pub magic_bytes: Vec<u8>,
     pub mime_type: String,
+}
+
+/// 单台服务器的统计
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerStats {
+    pub server: String,
+    pub file_count: u64,
+    pub last_scan: Option<i64>,
 }
 
 /// 索引统计
@@ -39,4 +49,5 @@ pub struct IndexStatus {
     pub last_full_scan: Option<i64>,
     pub last_change: Option<i64>,
     pub db_size_bytes: u64,
+    pub servers: Vec<ServerStats>,
 }
