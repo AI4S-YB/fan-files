@@ -105,7 +105,7 @@ impl RemoteScanner {
     /// Run `find` on the remote server, return list of (path, size, mtime).
     pub fn discover_files(&self) -> Result<Vec<RemoteFileEntry>, String> {
         let find_cmd = format!(
-            "find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null",
+            "find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null || true",
             shell_escape(&self.scan_root)
         );
         let output = ssh_exec(&self.ssh_host, &find_cmd)?;
