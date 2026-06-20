@@ -12,11 +12,13 @@ fn test_scanner_discovers_files() {
     let scanner = Scanner::new(
         vec![tmp.path().to_string_lossy().to_string()],
         vec![],
+        "test".to_string(),
     );
 
     let files: Vec<_> = scanner.scan().collect();
     assert!(!files.is_empty());
     assert!(files.iter().any(|f| f.path == file_path));
+    assert_eq!(files[0].source_server, "test");
     assert_eq!(files[0].mime_type, "application/octet-stream"); // .fastq is not recognized by mime_guess
 }
 
@@ -29,6 +31,7 @@ fn test_scanner_excludes_patterns() {
     let scanner = Scanner::new(
         vec![tmp.path().to_string_lossy().to_string()],
         vec!["*.tmp".to_string()],
+        "test".to_string(),
     );
 
     let files: Vec<_> = scanner.scan().collect();
@@ -68,6 +71,7 @@ fn test_sqlite_upsert_and_get() {
 
     let info = RawFileInfo {
         path: PathBuf::from("/test/sample.fastq"),
+        source_server: "test".into(),
         size: 1024,
         mtime_secs: 1715299200,
         hash_sha256: None,
@@ -97,6 +101,7 @@ fn test_sqlite_mark_deleted() {
 
     let info = RawFileInfo {
         path: PathBuf::from("/test/to_delete.fastq"),
+        source_server: "test".into(),
         size: 512,
         mtime_secs: 1715299200,
         hash_sha256: None,
