@@ -61,6 +61,9 @@ enum Commands {
     Uninstall,
     /// Interactive setup wizard
     Init,
+    /// Manage registered servers
+    #[command(subcommand)]
+    Servers(ServersAction),
 }
 
 #[derive(Subcommand)]
@@ -78,6 +81,24 @@ enum ProjectAction {
         confidence: Option<String>,
         #[arg(long)]
         assay_type: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServersAction {
+    /// List all registered servers
+    List,
+    /// Add a new server (interactive)
+    Add {
+        name: String,
+    },
+    /// Remove a server
+    Remove {
+        name: String,
+    },
+    /// Scan a single server
+    Scan {
+        name: String,
     },
 }
 
@@ -105,5 +126,11 @@ fn main() {
         Commands::Update => commands::update::run(),
         Commands::Uninstall => commands::uninstall::run(),
         Commands::Init => commands::init::run(&config),
+        Commands::Servers(action) => match action {
+            ServersAction::List => commands::servers::list(&config),
+            ServersAction::Add { name } => commands::servers::add(&name),
+            ServersAction::Remove { name } => commands::servers::remove(&name),
+            ServersAction::Scan { name } => commands::servers::scan_one(&name),
+        },
     }
 }
