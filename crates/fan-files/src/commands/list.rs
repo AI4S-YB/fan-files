@@ -1,6 +1,6 @@
 use fan_core::config::Config;
 
-pub fn run(config: &Config, category: Option<&str>, tag: Option<&str>, json: bool) {
+pub fn run(config: &Config, category: Option<&str>, tag: Option<&str>, server: Option<&str>, json: bool) {
     let index = match fan_core::index::open_index(config, fan_core::index::IndexMode::ReadOnly) {
         Ok(i) => i,
         Err(e) => {
@@ -26,6 +26,13 @@ pub fn run(config: &Config, category: Option<&str>, tag: Option<&str>, json: boo
             .take(100)
             .collect()
     };
+
+    // Apply server filter if specified
+    let entries: Vec<_> = entries.into_iter()
+        .filter(|e| {
+            server.as_ref().map_or(true, |s| e.source_server == *s)
+        })
+        .collect();
 
     if json {
         let output: Vec<_> = entries

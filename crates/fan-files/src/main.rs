@@ -33,6 +33,8 @@ enum Commands {
         #[arg(long)]
         tag: Option<String>,
         #[arg(long)]
+        server: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     /// Get detailed metadata for a file
@@ -111,7 +113,7 @@ fn main() {
         Commands::Daemon => commands::daemon::run(&config),
         Commands::Search { query, json } => commands::search::run(&config, &query, json),
         Commands::Suggest { path, json } => commands::suggest::run(&config, &path, json),
-        Commands::List { category, tag, json } => commands::list::run(&config, category.as_deref(), tag.as_deref(), json),
+        Commands::List { category, tag, server, json } => commands::list::run(&config, category.as_deref(), tag.as_deref(), server.as_deref(), json),
         Commands::Info { path, json } => commands::info::run(&config, &path, json),
         Commands::Status => commands::status::run(&config),
         Commands::Infer => commands::infer::run(&config),
