@@ -19,6 +19,8 @@ pub struct Config {
     pub schedule: ScheduleConfig,
     #[serde(default)]
     pub llm: LlmConfig,
+    #[serde(default)]
+    pub servers: ServersConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,29 @@ impl Default for ScheduleConfig {
     }
 }
 
+/// 服务器注册表配置
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServersConfig {
+    #[serde(flatten)]
+    pub servers: std::collections::HashMap<String, ServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// SSH Host 名（~/.ssh/config 中定义），空字符串 = 本地
+    pub host: String,
+    /// 扫描根目录
+    pub scan_root: String,
+    /// 人类可读的描述（可选）
+    #[serde(default)]
+    pub label: Option<String>,
+    /// 是否参与扫描
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool { true }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     #[serde(default)]
@@ -178,6 +203,7 @@ impl Default for Config {
                 full_sync: default_sync_time(),
             },
             llm: LlmConfig::default(),
+            servers: ServersConfig::default(),
         }
     }
 }
@@ -193,6 +219,33 @@ impl Config {
             std::fs::create_dir_all(dirs_fan())?;
             std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
             Ok(cfg)
+        }
+    }
+
+    /// Return the list of (server_name, ServerConfig) for enabled servers.
+    /// If `servers` map is empty but `scan.include` is populated (old config),
+    /// implicitly treat that as a single "local" server.
+    pub fn enabled_servers(&self) -> Vec<(String, ServerConfig)> {
+        if self.servers.servers.is_empty() && !self.scan.include.is_empty() {
+            vec![(
+                "local".to_string(),
+                ServerConfig {
+                    host: String::new(),
+                    scan_root: self.scan.include.first().cloned().unwrap_or_default(),
+                    label: Some("本地 (自动迁移)".to_string()),
+                    enabled: true,
+                },
+            )]
+        } else {
+            let mut v: Vec<_> = self
+                .servers
+                .servers
+                .iter()
+                .filter(|(_, cfg)| cfg.enabled)
+                .map(|(name, cfg)| (name.clone(), cfg.clone()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
         }
     }
 }
