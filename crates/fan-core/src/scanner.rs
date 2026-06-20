@@ -7,11 +7,12 @@ use walkdir::WalkDir;
 pub struct Scanner {
     include_dirs: Vec<String>,
     exclude_patterns: Vec<String>,
+    source_server: String,
 }
 
 impl Scanner {
-    pub fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
-        Self { include_dirs: include, exclude_patterns: exclude }
+    pub fn new(include: Vec<String>, exclude: Vec<String>, source_server: String) -> Self {
+        Self { include_dirs: include, exclude_patterns: exclude, source_server }
     }
 
     pub fn scan(&self) -> impl Iterator<Item = RawFileInfo> + '_ {
@@ -39,6 +40,7 @@ impl Scanner {
         let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
         RawFileInfo {
             path: path.to_path_buf(),
+            source_server: self.source_server.clone(),
             size,
             mtime_secs: mtime,
             hash_sha256: None,
