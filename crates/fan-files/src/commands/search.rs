@@ -122,12 +122,25 @@ pub fn run(config: &Config, query: &str, json: bool) {
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&results).unwrap());
+        let enriched: Vec<serde_json::Value> = results.iter().map(|r| {
+            let display_path = lookup_server_prefix(&index.sqlite, &r.path);
+            serde_json::json!({
+                "path": display_path,
+                "score": r.score,
+                "file_type": r.file_type,
+                "assay_type": r.assay_type,
+                "species": r.species,
+                "tags": r.tags,
+                "summary": r.summary,
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&enriched).unwrap());
     } else {
         for r in &results {
+            let display_path = lookup_server_prefix(&index.sqlite, &r.path);
             println!(
                 "{:.3}  {}  {:?}  {:?}  {}",
-                r.score, r.path, r.assay_type, r.species, r.summary
+                r.score, display_path, r.assay_type, r.species, r.summary
             );
         }
         if results.is_empty() {
@@ -155,4 +168,20 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
         return 0.0;
     }
     dot / (na * nb)
+}
+
+/// Build display path: prepend "<server>:" if path's source_server is not "local".
+fn lookup_server_prefix(sqlite: &fan_core::index::sqlite::SqliteStore, path: &str) -> String {
+    let conn = sqlite.conn.lock().unwrap();
+    let server: Option<String> = conn
+        .query_row(
+            "SELECT source_server FROM files WHERE path=?1 LIMIT 1",
+            rusqlite::params![path],
+            |row| row.get(0),
+        )
+        .ok();
+    match server {
+        Some(ref s) if s != "local" => format!("{}:{}", s, path),
+        _ => path.to_string(),
+    }
 }
