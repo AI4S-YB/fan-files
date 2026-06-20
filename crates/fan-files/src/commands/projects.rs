@@ -27,16 +27,18 @@ fn list(store: &ProjectStore) {
                 println!("No projects found. Run 'fan-files infer' first.");
                 return;
             }
+            println!("{:<25} {:<22} {:<18} {:<10} {}", "Project", "Assay", "Species", "Server", "Files");
             for p in &projects {
                 let species = p.species.as_deref().unwrap_or("?");
                 let conf = p.species_confidence.as_deref().unwrap_or("?");
                 let assay = p.assay_type.as_deref().unwrap_or("?");
                 let file_count = store.file_count(p.id).unwrap_or(0);
                 println!(
-                    "{:<25} {:<22} {:<18} {} files",
+                    "{:<25} {:<22} {:<18} {:<10} {} files",
                     truncate(&p.name, 25),
                     assay,
                     format!("{} ({})", species, conf),
+                    p.source_server.as_deref().unwrap_or("?"),
                     file_count,
                 );
             }
@@ -49,6 +51,9 @@ fn show(store: &ProjectStore, name: &str) {
     match store.get_by_name(name) {
         Ok(Some(p)) => {
             println!("Project: {}", p.name);
+            if let Some(ref srv) = p.source_server {
+                println!("  Server:      {}", srv);
+            }
             if let Some(ref at) = p.assay_type {
                 println!("  Assay:       {}", at);
             }

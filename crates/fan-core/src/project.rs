@@ -12,6 +12,7 @@ pub struct Project {
     pub species_source: Option<String>,
     pub root_dirs: Option<String>,
     pub summary: Option<String>,
+    pub source_server: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -74,7 +75,7 @@ impl ProjectStore {
     pub fn get_by_name(&self, name: &str) -> rusqlite::Result<Option<Project>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, assay_type, species, species_confidence, species_source, root_dirs, summary, created_at, updated_at
+            "SELECT id, name, assay_type, species, species_confidence, species_source, root_dirs, summary, source_server, created_at, updated_at
              FROM project WHERE name=?1"
         )?;
         let mut rows = stmt.query_map(params![name], Self::map_row)?;
@@ -84,7 +85,7 @@ impl ProjectStore {
     pub fn all(&self) -> rusqlite::Result<Vec<Project>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, assay_type, species, species_confidence, species_source, root_dirs, summary, created_at, updated_at
+            "SELECT id, name, assay_type, species, species_confidence, species_source, root_dirs, summary, source_server, created_at, updated_at
              FROM project ORDER BY id"
         )?;
         let rows = stmt.query_map([], Self::map_row)?;
@@ -94,7 +95,7 @@ impl ProjectStore {
     pub fn get(&self, id: i64) -> rusqlite::Result<Option<Project>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, assay_type, species, species_confidence, species_source, root_dirs, summary, created_at, updated_at
+            "SELECT id, name, assay_type, species, species_confidence, species_source, root_dirs, summary, source_server, created_at, updated_at
              FROM project WHERE id=?1"
         )?;
         let mut rows = stmt.query_map(params![id], Self::map_row)?;
@@ -111,8 +112,9 @@ impl ProjectStore {
             species_source: row.get(5)?,
             root_dirs: row.get(6)?,
             summary: row.get(7)?,
-            created_at: row.get(8)?,
-            updated_at: row.get(9)?,
+            source_server: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
         })
     }
 
