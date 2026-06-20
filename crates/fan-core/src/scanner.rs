@@ -80,3 +80,137 @@ fn read_magic(path: &Path) -> Vec<u8> {
         })
         .unwrap_or_default()
 }
+
+/// RemoteScanner discovers files on a remote server via SSH.
+/// Uses `ssh <host> find <root> -type f -printf` for file listing
+/// and `ssh <host> head -c 512 <path> | base64` for magic bytes.
+pub struct RemoteScanner {
+    pub server_name: String,
+    pub ssh_host: String,
+    pub scan_root: String,
+}
+
+#[derive(Debug)]
+pub struct RemoteFileEntry {
+    pub path: String,
+    pub size: u64,
+    pub mtime_secs: i64,
+}
+
+impl RemoteScanner {
+    pub fn new(server_name: String, ssh_host: String, scan_root: String) -> Self {
+        Self { server_name, ssh_host, scan_root }
+    }
+
+    /// Run `find` on the remote server, return list of (path, size, mtime).
+    pub fn discover_files(&self) -> Result<Vec<RemoteFileEntry>, String> {
+        let find_cmd = format!(
+            "find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null",
+            shell_escape(&self.scan_root)
+        );
+        let output = ssh_exec(&self.ssh_host, &find_cmd)?;
+        let mut files = Vec::new();
+        for line in output.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            let size: u64 = parts[1].parse().unwrap_or(0);
+            let mtime_float: f64 = parts[2].parse().unwrap_or(0.0);
+            let mtime_secs = mtime_float as i64;
+            files.push(RemoteFileEntry {
+                path: parts[0].to_string(),
+                size,
+                mtime_secs,
+            });
+        }
+        Ok(files)
+    }
+
+    /// Fetch magic bytes (first 512 bytes) from a remote file via SSH.
+    pub fn fetch_magic_bytes(&self, remote_path: &str) -> Vec<u8> {
+        let cmd = format!(
+            "head -c 512 {} | base64 2>/dev/null",
+            shell_escape(remote_path)
+        );
+        match ssh_exec(&self.ssh_host, &cmd) {
+            Ok(output) => {
+                let trimmed = output.trim();
+                if trimmed.is_empty() {
+                    return Vec::new();
+                }
+                let single_line = trimmed.replace('\n', "").replace('\r', "");
+                base64_decode(&single_line).unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Scan: discover + optionally fetch magic bytes, yield RawFileInfo.
+    pub fn scan(&self, fetch_magic: bool) -> Result<Vec<RawFileInfo>, String> {
+        let entries = self.discover_files()?;
+        let mut results = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let magic_bytes = if fetch_magic {
+                self.fetch_magic_bytes(&entry.path)
+            } else {
+                Vec::new()
+            };
+            let mime = mime_guess::from_path(&entry.path)
+                .first_or_octet_stream()
+                .to_string();
+            results.push(RawFileInfo {
+                path: std::path::PathBuf::from(&entry.path),
+                source_server: self.server_name.clone(),
+                size: entry.size,
+                mtime_secs: entry.mtime_secs,
+                hash_sha256: None,
+                magic_bytes,
+                mime_type: mime,
+            });
+        }
+        Ok(results)
+    }
+}
+
+/// Execute a command via SSH, returning stdout on success.
+fn ssh_exec(host: &str, cmd: &str) -> Result<String, String> {
+    let output = std::process::Command::new("ssh")
+        .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, cmd])
+        .output()
+        .map_err(|e| format!("ssh failed to start: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ssh exited with {}: {}", output.status, stderr.trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Basic shell escaping for single-quoted strings.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Minimal base64 decode using only std.
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut buf = Vec::with_capacity(input.len() * 3 / 4);
+    let mut accum: u32 = 0;
+    let mut bits: u32 = 0;
+    for b in input.bytes() {
+        if b == b'=' { break; }
+        if b == b'\n' || b == b'\r' || b == b' ' { continue; }
+        let idx = CHARS.iter().position(|&c| c == b).ok_or("invalid base64 char")?;
+        accum = (accum << 6) | idx as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            buf.push((accum >> bits) as u8);
+        }
+    }
+    Ok(buf)
+}
