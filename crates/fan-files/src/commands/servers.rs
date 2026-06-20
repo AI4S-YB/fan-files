@@ -142,7 +142,7 @@ pub fn scan_one(name: &str) {
             server_cfg.host.clone(),
             server_cfg.scan_root.clone(),
         );
-        match remote.scan(true) {
+        match remote.scan(false) {
             Ok(entries) => {
                 let index = fan_core::index::open_index(&config, fan_core::index::IndexMode::ReadWrite)
                     .expect("Failed to open index");

@@ -957,6 +957,7 @@ dependencies = [
  "clap",
  "fan-core",
  "fan-plugin-sdk",
+ "mime_guess",
  "predicates",
  "rusqlite",
  "serde_json",
