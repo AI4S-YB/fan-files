@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 fan-core = { path = "../fan-core" }
 fan-plugin-sdk = { path = "../fan-plugin-sdk" }
+mime_guess = "2"
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde_json = { workspace = true }

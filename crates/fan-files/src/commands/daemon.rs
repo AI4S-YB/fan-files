@@ -6,6 +6,7 @@ use fan_core::interpreter::InterpreterRegistry;
 use fan_core::llm::LlmClient;
 use fan_core::plugin::registry::PluginRegistry;
 use fan_core::project::ProjectStore;
+use fan_core::scanner::RemoteScanner;
 use fan_core::scanner::Scanner;
 use fan_core::watcher::FileWatcher;
 use fan_plugin_sdk::{FileContext, FormatInfo};
@@ -30,17 +31,61 @@ pub fn run(config: &Config) {
 
     let interpreter_registry = InterpreterRegistry::new();
 
-    let scanner = Scanner::new(config.scan.include.clone(), config.scan.exclude.clone(), "local".to_string());
+    let servers = config.enabled_servers();
+    let local_server_names: Vec<String> = servers
+        .iter()
+        .filter(|(_, cfg)| cfg.host.is_empty())
+        .map(|(n, _)| n.clone())
+        .collect();
 
-    // Initial full scan
-    run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
+    // Initial full scan: local + remote
+    for (name, cfg) in &servers {
+        if cfg.host.is_empty() {
+            let scanner = Scanner::new(
+                vec![cfg.scan_root.clone()],
+                config.scan.exclude.clone(),
+                name.clone(),
+            );
+            info!("Starting local scan: {} ({})", name, cfg.scan_root);
+            run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
+        } else {
+            let remote = RemoteScanner::new(
+                name.clone(),
+                cfg.host.clone(),
+                cfg.scan_root.clone(),
+            );
+            info!("Starting remote scan: {} ({})", name, cfg.scan_root);
+            match remote.scan(false) {
+                Ok(entries) => {
+                    let start = Instant::now();
+                    let mut count = 0u64;
+                    for file_info in &entries {
+                        let path_str = file_info.path.to_string_lossy();
+                        let format_info = plugins
+                            .detect_format(&path_str, &file_info.magic_bytes)
+                            .or_else(|| BuiltinDetector::detect(&path_str, &file_info.magic_bytes));
+                        match index.index_file(file_info, format_info.as_ref()) {
+                            Ok(_) => count += 1,
+                            Err(e) => error!("Failed to index {}: {}", file_info.path.display(), e),
+                        }
+                    }
+                    index.tantivy.commit().ok();
+                    info!(
+                        "Remote scan complete: {} ({}) — {} files in {:.1}s",
+                        name, cfg.scan_root, count, start.elapsed().as_secs_f64()
+                    );
+                }
+                Err(e) => error!("Remote scan failed for {}: {}", name, e),
+            }
+        }
+    }
 
     // After initial scan, run LLM inference if configured
     {
         let llm_client = LlmClient::new(config.llm.clone());
         if llm_client.is_configured() {
             let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
-            let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
+            let scan_root = servers.first().map(|(_, c)| c.scan_root.as_str()).unwrap_or("/");
             info!("Running LLM inference on indexed files...");
             match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
                 Ok((p, r)) => info!("LLM inference complete: {} projects, {} relations", p, r),
@@ -49,26 +94,28 @@ pub fn run(config: &Config) {
         }
     }
 
-    let sync_time = parse_sync_time(&config.schedule.full_sync);
-
-    if config.watch.include.is_empty() {
-        warn!("No watch directories configured, daemon exiting after scan");
+    // File watcher: only for local servers
+    if local_server_names.is_empty() {
+        warn!("No local servers — file watcher disabled, daemon exiting after scan");
         return;
     }
 
-    let watcher = match FileWatcher::new(&config.watch.include) {
+    let watch_dirs: Vec<String> = servers
+        .iter()
+        .filter(|(_, cfg)| cfg.host.is_empty())
+        .map(|(_, cfg)| cfg.scan_root.clone())
+        .collect();
+
+    let watcher = match FileWatcher::new(&watch_dirs) {
         Ok(w) => w,
         Err(e) => {
             error!("Failed to start file watcher: {}", e);
             return;
         }
     };
-    info!("File watcher started");
-    info!(
-        "Scheduled full sync at {:02}:{:02} UTC daily",
-        sync_time.0, sync_time.1
-    );
+    info!("File watcher started for local servers");
 
+    let sync_time = parse_sync_time(&config.schedule.full_sync);
     let retention_days = config.retention.deleted_keep_days;
     let mut last_sync_day: Option<u64> = None;
     let mut last_purge_day: Option<u64> = None;
@@ -82,38 +129,72 @@ pub fn run(config: &Config) {
         let current_day = now_secs / 86400;
         let current_hour_min = hour_minute_from_secs(now_secs);
 
-        // Scheduled full sync: check if we're in the sync hour window and haven't synced today
         if last_sync_day != Some(current_day)
             && current_hour_min.0 == sync_time.0
             && current_hour_min.1 >= sync_time.1
             && current_hour_min.1 < sync_time.1 + 10
         {
             info!("Running scheduled full sync...");
-            run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
-
-            // After scheduled scan, run LLM inference if configured
-            {
-                let llm_client = LlmClient::new(config.llm.clone());
-                if llm_client.is_configured() {
-                    let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
-                    let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
-                    info!("Running LLM inference on indexed files...");
-                    match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
-                        Ok((p, r)) => info!("LLM inference complete: {} projects, {} relations", p, r),
-                        Err(e) => warn!("LLM inference failed: {}", e),
+            // Rescan local
+            for name in &local_server_names {
+                if let Some((_, cfg)) = servers.iter().find(|(n, _)| n == name) {
+                    let scanner = Scanner::new(
+                        vec![cfg.scan_root.clone()],
+                        config.scan.exclude.clone(),
+                        name.clone(),
+                    );
+                    run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
+                }
+            }
+            // Rescan remote
+            for (name, cfg) in &servers {
+                if !cfg.host.is_empty() {
+                    let remote = RemoteScanner::new(
+                        name.clone(),
+                        cfg.host.clone(),
+                        cfg.scan_root.clone(),
+                    );
+                    match remote.scan(false) {
+                        Ok(entries) => {
+                            let mut count = 0u64;
+                            for file_info in &entries {
+                                let path_str = file_info.path.to_string_lossy();
+                                let format_info = plugins
+                                    .detect_format(&path_str, &file_info.magic_bytes)
+                                    .or_else(|| BuiltinDetector::detect(&path_str, &file_info.magic_bytes));
+                                if let Ok(_) = index.index_file(file_info, format_info.as_ref()) {
+                                    count += 1;
+                                }
+                            }
+                            index.tantivy.commit().ok();
+                            info!("Scheduled remote scan: {} — {} files", name, count);
+                        }
+                        Err(e) => warn!("Scheduled remote scan failed for {}: {}", name, e),
                     }
                 }
             }
 
+            // LLM after scheduled scan
+            {
+                let llm_client = LlmClient::new(config.llm.clone());
+                if llm_client.is_configured() {
+                    let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
+                    let scan_root = servers.first().map(|(_, c)| c.scan_root.as_str()).unwrap_or("/");
+                    match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+                        Ok((p, r)) => info!("LLM inference: {} projects, {} relations", p, r),
+                        Err(e) => warn!("LLM inference failed: {}", e),
+                    }
+                }
+            }
+            new_files_since_infer = 0;
             last_sync_day = Some(current_day);
         }
 
-        // Daily purge of old deleted entries
         if last_purge_day != Some(current_day) {
             match index.sqlite.purge_old_deleted(retention_days) {
                 Ok(n) if n > 0 => info!("Purged {} old deleted entries", n),
                 Ok(_) => {}
-                Err(e) => error!("Failed to purge old entries: {}", e),
+                Err(e) => error!("Failed to purge: {}", e),
             }
             last_purge_day = Some(current_day);
         }
@@ -122,47 +203,25 @@ pub fn run(config: &Config) {
             Ok(paths) => {
                 for path in &paths {
                     if path.exists() {
-                        if let Some(file_info) = scanner.scan_single(path) {
+                        if let Some(ref local_name) = local_server_names.first() {
+                            let file_info = read_local_file_info(path, local_name);
                             let path_str = file_info.path.to_string_lossy();
                             let format_info = plugins
                                 .detect_format(&path_str, &file_info.magic_bytes)
-                                .or_else(|| {
-                                    BuiltinDetector::detect(&path_str, &file_info.magic_bytes)
-                                });
+                                .or_else(|| BuiltinDetector::detect(&path_str, &file_info.magic_bytes));
                             match index.index_file(&file_info, format_info.as_ref()) {
-                                Ok(file_id) => {
+                                Ok(_) => {
                                     info!("Re-indexed: {}", path.display());
-                                    // Run context interpretation after indexing
-                                    run_interpretation(
-                                        &index,
-                                        file_id,
-                                        file_info.path.as_ref(),
-                                        format_info.as_ref(),
-                                        &interpreter_registry,
-                                    );
                                     new_files_since_infer += 1;
-                                    // Auto-infer after 10+ new files
                                     if new_files_since_infer >= 10 {
-                                        let llm_client = LlmClient::new(config.llm.clone());
-                                        if llm_client.is_configured() {
-                                            let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
-                                            let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
-                                            info!("Auto-triggering LLM inference after {} new files...", new_files_since_infer);
-                                            match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
-                                                Ok((p, r)) => info!("Auto-infer complete: {} projects, {} relations", p, r),
-                                                Err(e) => warn!("Auto-infer failed: {}", e),
-                                            }
-                                            new_files_since_infer = 0;
-                                        }
+                                        auto_infer(&index, config, &servers);
+                                        new_files_since_infer = 0;
                                     }
                                 }
-                                Err(e) => {
-                                    error!("Failed to re-index {}: {}", path.display(), e)
-                                }
+                                Err(e) => error!("Failed to re-index {}: {}", path.display(), e),
                             }
                         }
                     } else {
-                        // File was removed
                         if let Err(e) = index.sqlite.mark_deleted(path) {
                             error!("Failed to mark deleted {}: {}", path.display(), e);
                         } else {
@@ -170,12 +229,9 @@ pub fn run(config: &Config) {
                         }
                     }
                 }
-                // Commit after processing batch
                 index.tantivy.commit().ok();
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Normal timeout — loop continues to check schedule
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 error!("Watcher channel disconnected");
                 break;
@@ -184,6 +240,52 @@ pub fn run(config: &Config) {
     }
 
     info!("Daemon shutting down");
+}
+
+fn read_local_file_info(path: &std::path::Path, server_name: &str) -> fan_core::types::RawFileInfo {
+    let meta = std::fs::metadata(path).ok();
+    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let magic = read_magic_local(path);
+    let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
+    fan_core::types::RawFileInfo {
+        path: path.to_path_buf(),
+        source_server: server_name.to_string(),
+        size,
+        mtime_secs: mtime,
+        hash_sha256: None,
+        magic_bytes: magic,
+        mime_type: mime,
+    }
+}
+
+fn read_magic_local(path: &std::path::Path) -> Vec<u8> {
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|mut f| {
+            use std::io::Read;
+            let mut buf = vec![0u8; 512];
+            let n = f.read(&mut buf).ok()?;
+            buf.truncate(n);
+            Some(buf)
+        })
+        .unwrap_or_default()
+}
+
+fn auto_infer(index: &IndexEngine, config: &Config, servers: &[(String, fan_core::config::ServerConfig)]) {
+    let llm_client = LlmClient::new(config.llm.clone());
+    if llm_client.is_configured() {
+        let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
+        let scan_root = servers.first().map(|(_, c)| c.scan_root.as_str()).unwrap_or("/");
+        match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+            Ok((p, r)) => info!("Auto-infer: {} projects, {} relations", p, r),
+            Err(e) => warn!("Auto-infer failed: {}", e),
+        }
+    }
 }
 
 fn run_full_scan(
