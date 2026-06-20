@@ -24,6 +24,7 @@ pub fn run(config: &Config, path: &str, json: bool) {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "path": entry.path.to_string_lossy(),
+                        "source_server": entry.source_server,
                         "size": entry.size,
                         "size_mb": format!("{:.2}", entry.size as f64 / 1_048_576.0),
                         "mtime": ts_to_str(entry.mtime_secs),
@@ -37,6 +38,14 @@ pub fn run(config: &Config, path: &str, json: bool) {
                 );
             } else {
                 println!("Path:       {}", entry.path.display());
+                if entry.source_server != "local" {
+                    let label = config.servers.servers
+                        .get(&entry.source_server)
+                        .and_then(|c| c.label.as_ref())
+                        .map(|l| format!(" ({})", l))
+                        .unwrap_or_default();
+                    println!("Source:     {}{}", entry.source_server, label);
+                }
                 println!(
                     "Size:       {:.2} MB ({} bytes)",
                     entry.size as f64 / 1_048_576.0,
