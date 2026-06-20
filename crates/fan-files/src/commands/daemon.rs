@@ -30,7 +30,7 @@ pub fn run(config: &Config) {
 
     let interpreter_registry = InterpreterRegistry::new();
 
-    let scanner = Scanner::new(config.scan.include.clone(), config.scan.exclude.clone());
+    let scanner = Scanner::new(config.scan.include.clone(), config.scan.exclude.clone(), "local".to_string());
 
     // Initial full scan
     run_full_scan(&index, &scanner, &plugins, &interpreter_registry);

@@ -83,6 +83,26 @@ impl SqliteStore {
                 PRIMARY KEY (project_a_id, project_b_id, relation_type)
             );",
         )?;
+
+        // v2 migration: source_server tracking
+        {
+            let version: i64 = conn
+                .query_row(
+                    "PRAGMA user_version",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if version < 2 {
+                conn.execute_batch(
+                    "ALTER TABLE files ADD COLUMN source_server TEXT NOT NULL DEFAULT 'local';
+                     ALTER TABLE project ADD COLUMN source_server TEXT DEFAULT 'local';
+                     CREATE INDEX IF NOT EXISTS idx_files_server ON files(source_server);
+                     PRAGMA user_version = 2;",
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -97,20 +117,21 @@ impl SqliteStore {
         Ok(FileEntry {
             id: row.get(0)?,
             path: row.get::<_, String>(1)?.into(),
-            size: row.get::<_, i64>(2)? as u64,
-            mtime_secs: row.get(3)?,
-            hash_sha256: row.get(4)?,
-            magic_bytes: row.get(5)?,
-            mime_type: row.get(6)?,
+            source_server: row.get(2)?,
+            size: row.get::<_, i64>(3)? as u64,
+            mtime_secs: row.get(4)?,
+            hash_sha256: row.get(5)?,
+            magic_bytes: row.get(6)?,
+            mime_type: row.get(7)?,
             format_info: row
-                .get::<_, Option<String>>(7)?
-                .and_then(|s| serde_json::from_str(&s).ok()),
-            bio_metadata: row
                 .get::<_, Option<String>>(8)?
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            indexed_at: row.get(9)?,
-            updated_at: row.get(10)?,
-            deleted: row.get::<_, i32>(11)? != 0,
+            bio_metadata: row
+                .get::<_, Option<String>>(9)?
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            indexed_at: row.get(10)?,
+            updated_at: row.get(11)?,
+            deleted: row.get::<_, i32>(12)? != 0,
         })
     }
 
@@ -123,16 +144,18 @@ impl SqliteStore {
         let now = Self::now();
         let fi_json = format_info.map(|f| serde_json::to_string(f).unwrap());
         conn.execute(
-            "INSERT INTO files (path, size, mtime_secs, hash_sha256, magic_bytes, mime_type, \
+            "INSERT INTO files (path, source_server, size, mtime_secs, hash_sha256, magic_bytes, mime_type, \
              format_info_json, indexed_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(path) DO UPDATE SET
+                source_server=excluded.source_server,
                 size=excluded.size, mtime_secs=excluded.mtime_secs,
                 hash_sha256=excluded.hash_sha256, magic_bytes=excluded.magic_bytes,
                 mime_type=excluded.mime_type, format_info_json=excluded.format_info_json,
                 updated_at=excluded.updated_at, deleted=0",
             params![
                 info.path.to_string_lossy(),
+                info.source_server,
                 info.size as i64,
                 info.mtime_secs,
                 info.hash_sha256,
@@ -185,7 +208,7 @@ impl SqliteStore {
     pub fn get_by_path(&self, path: &Path) -> rusqlite::Result<Option<FileEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, path, size, mtime_secs, hash_sha256, magic_bytes, mime_type, \
+            "SELECT id, path, source_server, size, mtime_secs, hash_sha256, magic_bytes, mime_type, \
              format_info_json, bio_metadata_json, indexed_at, updated_at, deleted
              FROM files WHERE path=?1",
         )?;
@@ -196,7 +219,7 @@ impl SqliteStore {
     pub fn get_by_id(&self, id: i64) -> rusqlite::Result<Option<FileEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, path, size, mtime_secs, hash_sha256, magic_bytes, mime_type, \
+            "SELECT id, path, source_server, size, mtime_secs, hash_sha256, magic_bytes, mime_type, \
              format_info_json, bio_metadata_json, indexed_at, updated_at, deleted
              FROM files WHERE id=?1",
         )?;
@@ -207,7 +230,7 @@ impl SqliteStore {
     pub fn list_by_tag(&self, tag: &str, limit: usize) -> rusqlite::Result<Vec<FileEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT f.id, f.path, f.size, f.mtime_secs, f.hash_sha256, f.magic_bytes, \
+            "SELECT f.id, f.path, f.source_server, f.size, f.mtime_secs, f.hash_sha256, f.magic_bytes, \
              f.mime_type, f.format_info_json, f.bio_metadata_json, f.indexed_at, \
              f.updated_at, f.deleted
              FROM files f JOIN tags t ON f.id = t.file_id
@@ -282,6 +305,21 @@ impl SqliteStore {
         .map(|c| c as u64)
     }
 
+    pub fn search_by_server(
+        &self,
+        server: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, mtime_secs FROM files WHERE source_server=?1 AND deleted=0 LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![server, limit as i64], |row| {
+            Ok((row.get(0)?, row.get::<_, String>(1)?, row.get(2)?))
+        })?;
+        rows.collect()
+    }
+
     pub fn status(&self) -> rusqlite::Result<IndexStatus> {
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
@@ -300,7 +338,25 @@ impl SqliteStore {
             last_full_scan: last_scan,
             last_change: last_change,
             db_size_bytes: 0,
+            servers: vec![],
         })
+    }
+
+    pub fn status_by_server(&self) -> rusqlite::Result<Vec<crate::types::ServerStats>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_server, COUNT(*) as cnt, MAX(indexed_at)
+             FROM files WHERE deleted=0
+             GROUP BY source_server ORDER BY cnt DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::types::ServerStats {
+                server: row.get(0)?,
+                file_count: row.get::<_, i64>(1)? as u64,
+                last_scan: row.get(2)?,
+            })
+        })?;
+        rows.collect()
     }
 
 }
