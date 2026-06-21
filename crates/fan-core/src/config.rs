@@ -123,8 +123,9 @@ pub struct ServersConfig {
 pub struct ServerConfig {
     /// SSH Host 名（~/.ssh/config 中定义），空字符串 = 本地
     pub host: String,
-    /// 扫描根目录
-    pub scan_root: String,
+    /// 扫描根目录（支持多个路径）
+    #[serde(default)]
+    pub scan_roots: Vec<String>,
     /// 人类可读的描述（可选）
     #[serde(default)]
     pub label: Option<String>,
@@ -213,7 +214,21 @@ impl Config {
         let path = dirs_fan().join("config.toml");
         if path.exists() {
             let s = std::fs::read_to_string(&path)?;
-            Ok(toml::from_str(&s)?)
+            let mut cfg: Config = toml::from_str(&s)?;
+            // Migrate old scan_root → scan_roots
+            let raw: toml::Value = toml::from_str(&s)?;
+            if let Some(servers_table) = raw.get("servers") {
+                for (name, server_val) in servers_table.as_table().unwrap_or(&Default::default()) {
+                    if let Some(scan_root) = server_val.get("scan_root").and_then(|v| v.as_str()) {
+                        if let Some(srv) = cfg.servers.servers.get_mut(name) {
+                            if srv.scan_roots.is_empty() {
+                                srv.scan_roots = vec![scan_root.to_string()];
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(cfg)
         } else {
             let cfg = Config::default();
             std::fs::create_dir_all(dirs_fan())?;
@@ -231,7 +246,7 @@ impl Config {
                 "local".to_string(),
                 ServerConfig {
                     host: String::new(),
-                    scan_root: self.scan.include.first().cloned().unwrap_or_default(),
+                    scan_roots: self.scan.include.clone(),
                     label: Some("本地 (自动迁移)".to_string()),
                     enabled: true,
                 },

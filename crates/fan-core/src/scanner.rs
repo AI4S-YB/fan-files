@@ -87,7 +87,7 @@ fn read_magic(path: &Path) -> Vec<u8> {
 pub struct RemoteScanner {
     pub server_name: String,
     pub ssh_host: String,
-    pub scan_root: String,
+    pub scan_roots: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -98,23 +98,24 @@ pub struct RemoteFileEntry {
 }
 
 impl RemoteScanner {
-    pub fn new(server_name: String, ssh_host: String, scan_root: String) -> Self {
-        Self { server_name, ssh_host, scan_root }
+    pub fn new(server_name: String, ssh_host: String, scan_roots: Vec<String>) -> Self {
+        Self { server_name, ssh_host, scan_roots }
     }
 
-    /// Build cache file name from scan_root: `/data/biodata` → `data_biodata_files.txt`
-    fn cache_name(&self) -> String {
-        let sanitized = self.scan_root.trim_matches('/').replace('/', "_");
-        format!("{}_files.txt", sanitized)
-    }
-
-    /// Discover files: use cache file if available, otherwise fall back to find.
-    /// Strategy:
-    ///   1. Read cache file (near-instant, even over SSH)
-    ///   2. Run incremental find for files newer than cache
-    ///   3. If no cache, build it with a full find
+    /// Discover files across all scan roots: use cache if available, otherwise find.
     pub fn discover_files(&self) -> Result<Vec<RemoteFileEntry>, String> {
-        let cache_path = format!("$HOME/.fan-cache/{}", self.cache_name());
+        let mut all_files = Vec::new();
+        for root in &self.scan_roots {
+            let entries = self.discover_one_root(root)?;
+            all_files.extend(entries);
+        }
+        Ok(all_files)
+    }
+
+    /// Discover files for a single root directory.
+    fn discover_one_root(&self, scan_root: &str) -> Result<Vec<RemoteFileEntry>, String> {
+        let cache_name = scan_root.trim_matches('/').replace('/', "_");
+        let cache_path = format!("$HOME/.fan-cache/{}_files.txt", cache_name);
 
         // Step 1: Try to read the cache file
         let mut files = Vec::new();
@@ -147,7 +148,7 @@ impl RemoteScanner {
             // Step 2: Incremental — find files newer than the cache file
             let incr_cmd = format!(
                 "find {} -type f -newer {} -printf '%p\\t%s\\t%T@\\n' 2>/dev/null || true",
-                shell_escape(&self.scan_root),
+                shell_escape(scan_root),
                 cache_path
             );
             if let Ok(incr_output) = ssh_exec(&self.ssh_host, &incr_cmd) {
@@ -172,7 +173,7 @@ impl RemoteScanner {
             // Step 3: Rebuild cache in background (async refresh for next time)
             let rebuild_cmd = format!(
                 "find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null > {}.tmp && mv {}.tmp {}",
-                shell_escape(&self.scan_root),
+                shell_escape(scan_root),
                 cache_path, cache_path, cache_path
             );
             // Fire-and-forget: don't wait for rebuild
@@ -182,7 +183,7 @@ impl RemoteScanner {
             eprintln!("  building file cache (first run)...");
             let build_cmd = format!(
                 "mkdir -p $HOME/.fan-cache && find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null | tee {}.tmp",
-                shell_escape(&self.scan_root),
+                shell_escape(scan_root),
                 cache_path
             );
             let output = ssh_exec(&self.ssh_host, &build_cmd)?;

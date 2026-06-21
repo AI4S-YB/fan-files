@@ -42,19 +42,19 @@ pub fn run(config: &Config) {
     for (name, cfg) in &servers {
         if cfg.host.is_empty() {
             let scanner = Scanner::new(
-                vec![cfg.scan_root.clone()],
+                cfg.scan_roots.clone(),
                 config.scan.exclude.clone(),
                 name.clone(),
             );
-            info!("Starting local scan: {} ({})", name, cfg.scan_root);
+            info!("Starting local scan: {} ({})", name, cfg.scan_roots.join(", "));
             run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
         } else {
             let remote = RemoteScanner::new(
                 name.clone(),
                 cfg.host.clone(),
-                cfg.scan_root.clone(),
+                cfg.scan_roots.clone(),
             );
-            info!("Starting remote scan: {} ({})", name, cfg.scan_root);
+            info!("Starting remote scan: {} ({})", name, cfg.scan_roots.join(", "));
             match remote.scan(false) {
                 Ok(entries) => {
                     let start = Instant::now();
@@ -72,7 +72,7 @@ pub fn run(config: &Config) {
                     index.tantivy.commit().ok();
                     info!(
                         "Remote scan complete: {} ({}) — {} files in {:.1}s",
-                        name, cfg.scan_root, count, start.elapsed().as_secs_f64()
+                        name, cfg.scan_roots.join(", "), count, start.elapsed().as_secs_f64()
                     );
                 }
                 Err(e) => error!("Remote scan failed for {}: {}", name, e),
@@ -85,7 +85,7 @@ pub fn run(config: &Config) {
         let llm_client = LlmClient::new(config.llm.clone());
         if llm_client.is_configured() {
             let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
-            let scan_root = servers.first().map(|(_, c)| c.scan_root.as_str()).unwrap_or("/");
+            let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
             info!("Running LLM inference on indexed files...");
             match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
                 Ok((p, r)) => info!("LLM inference complete: {} projects, {} relations", p, r),
@@ -103,7 +103,7 @@ pub fn run(config: &Config) {
     let watch_dirs: Vec<String> = servers
         .iter()
         .filter(|(_, cfg)| cfg.host.is_empty())
-        .map(|(_, cfg)| cfg.scan_root.clone())
+        .flat_map(|(_, cfg)| cfg.scan_roots.clone())
         .collect();
 
     let watcher = match FileWatcher::new(&watch_dirs) {
@@ -139,7 +139,7 @@ pub fn run(config: &Config) {
             for name in &local_server_names {
                 if let Some((_, cfg)) = servers.iter().find(|(n, _)| n == name) {
                     let scanner = Scanner::new(
-                        vec![cfg.scan_root.clone()],
+                        cfg.scan_roots.clone(),
                         config.scan.exclude.clone(),
                         name.clone(),
                     );
@@ -152,7 +152,7 @@ pub fn run(config: &Config) {
                     let remote = RemoteScanner::new(
                         name.clone(),
                         cfg.host.clone(),
-                        cfg.scan_root.clone(),
+                        cfg.scan_roots.clone(),
                     );
                     match remote.scan(false) {
                         Ok(entries) => {
@@ -179,7 +179,7 @@ pub fn run(config: &Config) {
                 let llm_client = LlmClient::new(config.llm.clone());
                 if llm_client.is_configured() {
                     let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
-                    let scan_root = servers.first().map(|(_, c)| c.scan_root.as_str()).unwrap_or("/");
+                    let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
                     match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
                         Ok((p, r)) => info!("LLM inference: {} projects, {} relations", p, r),
                         Err(e) => warn!("LLM inference failed: {}", e),
@@ -280,7 +280,7 @@ fn auto_infer(index: &IndexEngine, config: &Config, servers: &[(String, fan_core
     let llm_client = LlmClient::new(config.llm.clone());
     if llm_client.is_configured() {
         let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
-        let scan_root = servers.first().map(|(_, c)| c.scan_root.as_str()).unwrap_or("/");
+        let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
         match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
             Ok((p, r)) => info!("Auto-infer: {} projects, {} relations", p, r),
             Err(e) => warn!("Auto-infer failed: {}", e),

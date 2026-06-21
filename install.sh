@@ -40,7 +40,32 @@ cargo build --release
 # 3. Install binary
 echo ""
 echo "▸ 安装..."
-sudo cp target/release/fan-files /usr/local/bin/fan-files
+INSTALL_OK=0
+BIN_SRC="target/release/fan-files"
+
+# Try /usr/local/bin first (standard), fall back to ~/.cargo/bin
+if sudo cp "$BIN_SRC" /usr/local/bin/fan-files 2>/dev/null && [ -x /usr/local/bin/fan-files ]; then
+    echo "  ✅ 已安装到 /usr/local/bin/fan-files"
+    INSTALL_OK=1
+else
+    echo "  ⚠ /usr/local/bin 写入失败，尝试 ~/.cargo/bin..."
+    mkdir -p "$HOME/.cargo/bin"
+    cp "$BIN_SRC" "$HOME/.cargo/bin/fan-files"
+    echo "  ✅ 已安装到 $HOME/.cargo/bin/fan-files"
+    echo "  ⚠ 请将 ~/.cargo/bin 加入 PATH:"
+    echo "     echo 'export PATH=\"\$HOME/.cargo/bin:\$PATH\"' >> ~/.zshrc"
+    INSTALL_OK=1
+fi
+
+# Verify installation
+if [ $INSTALL_OK -eq 1 ]; then
+    INSTALLED=$(which fan-files 2>/dev/null || echo "$HOME/.cargo/bin/fan-files")
+    if "$INSTALLED" --version >/dev/null 2>&1; then
+        echo "  ✅ 验证通过: $("$INSTALLED" --version)"
+    else
+        echo "  ❌ 验证失败，请手动检查"
+    fi
+fi
 
 # Record install source for future updates
 mkdir -p "$HOME/.fan-files"

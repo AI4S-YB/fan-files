@@ -13,7 +13,7 @@ pub fn list(config: &Config) {
     for (name, cfg) in &servers {
         let host = if cfg.host.is_empty() { "localhost" } else { &cfg.host };
         let label = cfg.label.as_deref().unwrap_or("-");
-        println!("{:<15} {:<20} {:<40} {}", name, host, cfg.scan_root, label);
+        println!("{:<15} {:<20} {:<40} {}", name, host, cfg.scan_roots.join(", "), label);
     }
 
     let disabled: Vec<_> = config.servers.servers.iter()
@@ -24,7 +24,7 @@ pub fn list(config: &Config) {
         println!("Disabled servers:");
         for (name, cfg) in &disabled {
             let host = if cfg.host.is_empty() { "localhost" } else { &cfg.host };
-            println!("  {} (host={}, root={})", name, host, cfg.scan_root);
+            println!("  {} (host={}, root={})", name, host, cfg.scan_roots.join(", "));
         }
     }
 }
@@ -36,9 +36,19 @@ pub fn add(name: &str) {
     let host = ask(&format!("SSH Host (from ~/.ssh/config, empty for local) [{}]: ", name));
     let host = if host.is_empty() { name.to_string() } else { host };
 
-    let default_root = "/";
-    let root_prompt = format!("Scan root directory [{}]: ", default_root);
-    let scan_root = ask_with_default(&root_prompt, default_root);
+    println!("Scan root directories (empty line to finish):");
+    let mut roots: Vec<String> = Vec::new();
+    loop {
+        if roots.is_empty() {
+            let root = ask("  Root [/]: ");
+            if root.is_empty() { roots.push("/".to_string()); break; }
+            roots.push(root);
+        } else {
+            let root = ask("  Root (empty line to finish): ");
+            if root.is_empty() { break; }
+            roots.push(root);
+        }
+    }
 
     let label = ask("Label (optional): ");
 
@@ -57,25 +67,27 @@ pub fn add(name: &str) {
             Err(e) => println!("Error: {}", e),
         }
 
-        print!("Counting files remotely (find)... ");
-        io::stdout().flush().ok();
-        let find_cmd = format!("find '{}' -type f 2>/dev/null | wc -l", scan_root.replace('\'', "'\\''"));
-        match std::process::Command::new("ssh")
-            .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", &host, &find_cmd])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let count: String = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                println!("{} files found", count);
+        for scan_root in &roots {
+            print!("Counting files remotely in {}... ", scan_root);
+            io::stdout().flush().ok();
+            let find_cmd = format!("find '{}' -type f 2>/dev/null | wc -l", scan_root.replace('\'', "'\\''"));
+            match std::process::Command::new("ssh")
+                .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", &host, &find_cmd])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let count: String = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    println!("{} files found", count);
+                }
+                _ => println!("could not count (will retry during scan)"),
             }
-            _ => println!("could not count (will retry during scan)"),
         }
     }
 
     let mut config = Config::load().expect("Failed to load config");
     config.servers.servers.insert(name.to_string(), ServerConfig {
         host,
-        scan_root,
+        scan_roots: roots,
         label: if label.is_empty() { None } else { Some(label) },
         enabled: true,
     });
@@ -118,9 +130,9 @@ pub fn scan_one_inner(name: &str, use_agent: bool) {
     };
 
     if server_cfg.host.is_empty() {
-        println!("Scanning local server '{}' in {}...", name, server_cfg.scan_root);
+        println!("Scanning local server '{}' in {}...", name, server_cfg.scan_roots.join(", "));
         let scanner = fan_core::scanner::Scanner::new(
-            vec![server_cfg.scan_root.clone()],
+            server_cfg.scan_roots.clone(),
             vec!["/tmp".into(), "*.tmp".into()],
             name.to_string(),
         );
@@ -145,11 +157,11 @@ pub fn scan_one_inner(name: &str, use_agent: bool) {
 }
 
 fn scan_remote_with_cache(config: &Config, name: &str, server_cfg: &ServerConfig) {
-    println!("Scanning remote server '{}' in {}...", name, server_cfg.scan_root);
+    println!("Scanning remote server '{}' in {}...", name, server_cfg.scan_roots.join(", "));
     let remote = fan_core::scanner::RemoteScanner::new(
         name.to_string(),
         server_cfg.host.clone(),
-        server_cfg.scan_root.clone(),
+        server_cfg.scan_roots.clone(),
     );
     match remote.scan(false) {
         Ok(entries) => {
@@ -228,60 +240,63 @@ fn scan_remote_with_agent(config: &Config, name: &str, server_cfg: &ServerConfig
         }
     }
 
-    // Step 2: Run fan-agent and pipe JSONL
-    println!("  scanning...");
-    let scan_cmd = format!("{} scan --root '{}' 2>/dev/null",
-        agent_path, server_cfg.scan_root.replace('\'', "'\\''"));
-
-    let mut child = match std::process::Command::new("ssh")
-        .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
-               &server_cfg.host, &scan_cmd])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("  SSH spawn failed: {}, falling back to cache mode", e);
-            return scan_remote_with_cache(config, name, server_cfg);
-        }
-    };
-
+    // Step 2: Run fan-agent for each scan root and pipe JSONL
     let index = fan_core::index::open_index(config, fan_core::index::IndexMode::ReadWrite)
         .expect("Failed to open index");
     let mut count = 0u64;
 
-    use std::io::{BufRead, BufReader};
-    let stdout = child.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
+    for root in &server_cfg.scan_roots {
+        println!("  scanning {}...", root);
+        let scan_cmd = format!("{} scan --root '{}' 2>/dev/null",
+            agent_path, root.replace('\'', "'\\''"));
 
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
-                let path = entry["path"].as_str().unwrap_or("");
-                let size = entry["size"].as_u64().unwrap_or(0);
-                let mtime = entry["mtime_secs"].as_i64().unwrap_or(0);
+        let mut child = match std::process::Command::new("ssh")
+            .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+                   &server_cfg.host, &scan_cmd])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  SSH spawn failed for {}: {}, skipping", root, e);
+                continue;
+            }
+        };
 
-                let info = fan_core::types::RawFileInfo {
-                    path: std::path::PathBuf::from(path),
-                    source_server: name.to_string(),
-                    size,
-                    mtime_secs: mtime,
-                    hash_sha256: None,
-                    magic_bytes: Vec::new(),
-                    mime_type: mime_guess::from_path(path)
-                        .first_or_octet_stream()
-                        .to_string(),
-                };
+        use std::io::{BufRead, BufReader};
+        let stdout = child.stdout.take().unwrap();
+        let reader = BufReader::new(stdout);
 
-                match index.index_file(&info, None) {
-                    Ok(_) => count += 1,
-                    Err(e) => eprintln!("Failed to index {}: {}", path, e),
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let path = entry["path"].as_str().unwrap_or("");
+                    let size = entry["size"].as_u64().unwrap_or(0);
+                    let mtime = entry["mtime_secs"].as_i64().unwrap_or(0);
+
+                    let info = fan_core::types::RawFileInfo {
+                        path: std::path::PathBuf::from(path),
+                        source_server: name.to_string(),
+                        size,
+                        mtime_secs: mtime,
+                        hash_sha256: None,
+                        magic_bytes: Vec::new(),
+                        mime_type: mime_guess::from_path(path)
+                            .first_or_octet_stream()
+                            .to_string(),
+                    };
+
+                    match index.index_file(&info, None) {
+                        Ok(_) => count += 1,
+                        Err(e) => eprintln!("Failed to index {}: {}", path, e),
+                    }
                 }
             }
         }
+
+        let _ = child.wait();
     }
 
-    let _ = child.wait();
     index.tantivy.commit().ok();
     println!("Scanned {}: {} files indexed (via fan-agent)", name, count);
 }
@@ -326,14 +341,15 @@ pub fn watch_remote(name: &str) {
         }
     }
 
-    println!("Starting real-time watch on {}:{}...", name, server_cfg.scan_root);
+    let watch_root = server_cfg.scan_roots.first().map(|s| s.as_str()).unwrap_or("/");
+    println!("Starting real-time watch on {}:{}...", name, watch_root);
     println!("(press Ctrl+C to stop)");
     println!();
 
     let watch_cmd = format!(
         "{} watch --root '{}' 2>/dev/null",
         agent_path,
-        server_cfg.scan_root.replace('\'', "'\\''")
+        watch_root.replace('\'', "'\\''")
     );
 
     let mut child = std::process::Command::new("ssh")
@@ -411,9 +427,4 @@ fn ask(prompt: &str) -> String {
     let mut input = String::new();
     io::stdin().read_line(&mut input).ok();
     input.trim().to_string()
-}
-
-fn ask_with_default(prompt: &str, default: &str) -> String {
-    let input = ask(prompt);
-    if input.is_empty() { default.to_string() } else { input }
 }

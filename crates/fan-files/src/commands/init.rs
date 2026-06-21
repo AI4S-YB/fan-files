@@ -75,7 +75,7 @@ fn run_step_1(config: &mut Config) {
     if !dirs.is_empty() {
         config.servers.servers.entry("local".to_string()).or_insert(ServerConfig {
             host: String::new(),
-            scan_root: dirs[0].clone(),
+            scan_roots: dirs.clone(),
             label: Some("Mac mini 本地".to_string()),
             enabled: true,
         });
@@ -103,7 +103,7 @@ fn run_step_servers(config: &mut Config) {
             println!("  当前远程服务器:");
             for (i, name) in existing.iter().enumerate() {
                 if let Some(cfg) = config.servers.servers.get(name) {
-                    println!("    [{}] {} — ssh {} '{}'", i + 1, name, cfg.host, cfg.scan_root);
+                    println!("    [{}] {} — ssh {} '{}'", i + 1, name, cfg.host, cfg.scan_roots.join(", "));
                 }
             }
             println!();
@@ -118,8 +118,17 @@ fn run_step_servers(config: &mut Config) {
                 if name.is_empty() { continue; }
                 let host = ask(&format!("  SSH Host [{}]: ", name));
                 let host = if host.is_empty() { name.clone() } else { host };
-                let root = ask("  扫描根目录 [/]: ");
-                let root = if root.is_empty() { "/".to_string() } else { root };
+
+                let mut roots: Vec<String> = Vec::new();
+                loop {
+                    let root = ask("  扫描根目录 [/] (空行结束): ");
+                    if root.is_empty() {
+                        if roots.is_empty() { roots.push("/".to_string()); }
+                        break;
+                    }
+                    roots.push(root);
+                }
+
                 let label = ask("  描述 (可选): ");
 
                 // Test SSH
@@ -135,7 +144,7 @@ fn run_step_servers(config: &mut Config) {
 
                 config.servers.servers.insert(name, ServerConfig {
                     host,
-                    scan_root: root,
+                    scan_roots: roots,
                     label: if label.is_empty() { None } else { Some(label) },
                     enabled: true,
                 });
