@@ -3,7 +3,9 @@ use crate::project::ProjectStore;
 use std::collections::HashMap;
 use tracing::{info, warn};
 
-/// Run the full LLM inference pipeline
+const BATCH_SIZE: usize = 80; // dirs per LLM call (smaller batches avoid JSON truncation)
+
+/// Run the full LLM inference pipeline (batched, with progress).
 pub fn run_inference(
     sqlite: &crate::index::sqlite::SqliteStore,
     project_store: &ProjectStore,
@@ -15,46 +17,98 @@ pub fn run_inference(
         return Ok((0, 0));
     }
 
-    // 1. Collect directory tree from indexed files
+    // 1. Collect bio-relevant directories only (filter noise)
     let dirs = collect_directory_summary(sqlite);
     if dirs.is_empty() {
-        info!("No directories found for inference");
+        info!("No bio-relevant directories found for inference");
         return Ok((0, 0));
     }
 
-    // 2. Build prompt and call LLM
-    let summary = crate::llm::prompt::build_directory_summary(scan_root, &dirs);
-    info!(
-        "Sending {} directories to LLM for inference...",
-        dirs.len()
+    let total_dirs = dirs.len();
+    let batches = (total_dirs + BATCH_SIZE - 1) / BATCH_SIZE;
+    eprintln!(
+        "  LLM inference: {} bio-relevant dirs → {} batches ({} dirs/batch)",
+        total_dirs, batches, BATCH_SIZE
     );
 
-    let output = match llm_client.infer_projects(&summary) {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("LLM inference failed: {}", e);
-            return Ok((0, 0));
-        }
-    };
-
-    info!(
-        "LLM returned {} projects, {} relations",
-        output.projects.len(),
-        output.relations.len()
-    );
-
-    // 3. Collect all file IDs by path for quick lookup
+    // 2. Collect all file IDs for linking
     let all_files = sqlite.all_paths().unwrap_or_default();
     let mut path_to_id: HashMap<String, i64> = HashMap::new();
     for (id, path, _) in &all_files {
         path_to_id.insert(path.clone(), *id);
     }
 
+    let mut all_projects: Vec<crate::llm::prompt::LlmProject> = Vec::new();
+    let mut all_relations: Vec<crate::llm::prompt::LlmRelation> = Vec::new();
+    let mut seen_project_names: HashMap<String, usize> = HashMap::new();
+
+    // 3. Process each batch
+    for batch_idx in 0..batches {
+        let start = batch_idx * BATCH_SIZE;
+        let end = std::cmp::min(start + BATCH_SIZE, total_dirs);
+        let batch_dirs = &dirs[start..end];
+
+        eprintln!(
+            "  batch {}/{} ({} dirs)...",
+            batch_idx + 1, batches, batch_dirs.len()
+        );
+
+        let summary = crate::llm::prompt::build_directory_summary(
+            &format!("{} (batch {}/{})", scan_root, batch_idx + 1, batches),
+            batch_dirs,
+        );
+
+        match llm_client.infer_projects(&summary) {
+            Ok(output) => {
+                let proj_count = output.projects.len();
+                let rel_count = output.relations.len();
+                // Merge projects (dedup by name: merge dirs on collision)
+                // Restore absolute paths from relative (LLM returns rel paths)
+                let abs_prefix = if scan_root.ends_with('/') {
+                    scan_root.to_string()
+                } else {
+                    format!("{}/", scan_root)
+                };
+                for mut proj in output.projects {
+                    // Restore absolute paths
+                    proj.dirs = proj.dirs.into_iter().map(|d| {
+                        if d.starts_with('/') { d }
+                        else { format!("{}{}", abs_prefix, d.trim_start_matches('/')) }
+                    }).collect();
+                    if let Some(&existing_idx) = seen_project_names.get(&proj.name) {
+                        if existing_idx < all_projects.len() {
+                            all_projects[existing_idx].dirs.extend(proj.dirs);
+                        }
+                    } else {
+                        seen_project_names.insert(proj.name.clone(), all_projects.len());
+                        all_projects.push(proj);
+                    }
+                }
+                all_relations.extend(output.relations);
+                eprintln!(
+                    "    → {} projects, {} relations",
+                    proj_count, rel_count
+                );
+            }
+            Err(e) => {
+                warn!("  batch {} failed: {}", batch_idx + 1, e);
+                eprintln!("  ⚠ batch {} failed, continuing...", batch_idx + 1);
+            }
+        }
+    }
+
+    if all_projects.is_empty() {
+        eprintln!("  No projects inferred.");
+        return Ok((0, 0));
+    }
+
+    eprintln!("  Total: {} unique projects", all_projects.len());
+
     // 4. Write projects and link files
     let mut project_name_to_id: HashMap<String, i64> = HashMap::new();
     let mut projects_created = 0;
 
-    for proj in &output.projects {
+    for proj in &all_projects {
         let root_dirs_json = serde_json::to_string(&proj.dirs).unwrap_or_default();
         let id = project_store.insert(
             &proj.name,
@@ -67,7 +121,7 @@ pub fn run_inference(
         project_name_to_id.insert(proj.name.clone(), id);
         projects_created += 1;
 
-        // Link files under project dirs to this project
+        // Link files under project dirs
         for dir in &proj.dirs {
             for (file_id, file_path, _) in &all_files {
                 if file_path.starts_with(dir) {
@@ -77,24 +131,23 @@ pub fn run_inference(
         }
     }
 
-    // 5. Write project relations
-    for rel in &output.relations {
+    // 5. Write relations
+    for rel in &all_relations {
         if let (Some(&a_id), Some(&b_id)) = (
             project_name_to_id.get(&rel.project_a),
             project_name_to_id.get(&rel.project_b),
         ) {
-            project_store
-                .add_relation(a_id, b_id, &rel.relation, rel.score, None)
-                .ok();
+            project_store.add_relation(a_id, b_id, &rel.relation, rel.score, None).ok();
         }
     }
 
-    // 7. Back-sync LLM metadata to file-level bio_metadata
+    // 6. Back-sync metadata to files
     let mut files_updated = 0;
-    for proj in &output.projects {
+    for proj in &all_projects {
         if let Some(&_proj_id) = project_name_to_id.get(&proj.name) {
             let assay_val = proj.assay_type.clone().unwrap_or_default();
             let species_val = proj.species.clone().unwrap_or_default();
+            let mut batch_updated = 0;
             for dir in &proj.dirs {
                 for (file_id, file_path, _) in &all_files {
                     if file_path.starts_with(dir) {
@@ -111,18 +164,25 @@ pub fn run_inference(
                                 warn!("Failed to back-sync metadata for {}: {}", file_path, e);
                             } else {
                                 files_updated += 1;
+                                batch_updated += 1;
                             }
                         }
                     }
                 }
             }
+            if batch_updated > 0 {
+                info!(
+                    "  {} → {} files ({:?}, {:?})",
+                    proj.name, batch_updated, proj.assay_type, proj.species
+                );
+            }
         }
     }
     info!("Back-synced LLM metadata to {} files", files_updated);
 
-    // 8. Generate pending review items for low/medium confidence projects
+    // 7. Generate pending review items for low/medium confidence
     let mut pending_items: Vec<crate::review::PendingItem> = Vec::new();
-    for proj in &output.projects {
+    for proj in &all_projects {
         let needs_review = proj.species_confidence.as_deref() == Some("low")
             || proj.species_confidence.as_deref() == Some("medium");
         if needs_review {
@@ -143,10 +203,29 @@ pub fn run_inference(
         info!("Saved {} pending review items", pending_items.len());
     }
 
-    Ok((projects_created, output.relations.len()))
+    eprintln!(
+        "  ✅ Done: {} projects, {} files tagged, {} relations",
+        projects_created, files_updated, all_relations.len()
+    );
+
+    Ok((projects_created, all_relations.len()))
 }
 
-/// Collect directory tree summary from indexed files.
+/// Check if a filename indicates a bioinformatics-relevant file.
+fn is_bio_file(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".fastq.gz") || lower.ends_with(".fq.gz") || lower.ends_with(".fastq") ||
+    lower.ends_with(".fasta") || lower.ends_with(".fa.gz") || lower.ends_with(".fa") ||
+    lower.ends_with(".bam") || lower.ends_with(".vcf.gz") || lower.ends_with(".vcf") ||
+    lower.ends_with(".gff3") || lower.ends_with(".gtf") || lower.ends_with(".bed") ||
+    lower.ends_with(".h5") || lower.ends_with(".hdf5") ||
+    lower.ends_with(".gff") || lower.ends_with(".gff.gz") ||
+    lower.ends_with(".sam") || lower.ends_with(".cram") ||
+    lower.ends_with(".bw") || lower.ends_with(".bigwig") ||
+    lower.ends_with(".tsv.gz") || lower.ends_with(".csv.gz")
+}
+
+/// Collect directory tree summary from indexed files (bio-relevant only, by default).
 /// Returns (path, file_count, sample_filenames) sorted by file count desc.
 fn collect_directory_summary(
     sqlite: &crate::index::sqlite::SqliteStore,
@@ -154,26 +233,45 @@ fn collect_directory_summary(
     let all = sqlite.all_paths().unwrap_or_default();
     let mut dir_map: HashMap<String, (usize, Vec<String>)> = HashMap::new();
 
-    for (_, path, _) in &all {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            let dir_path = parent.to_string_lossy().to_string();
-            let entry = dir_map.entry(dir_path).or_insert((0, Vec::new()));
-            entry.0 += 1;
-            if let Some(name) = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-            {
-                if entry.1.len() < 8 {
-                    entry.1.push(name.to_string());
-                }
+    for (_, file_path, _) in &all {
+        let path = std::path::Path::new(file_path);
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let parent = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+
+        // Only count directories that contain bio-relevant files
+        // (but we still include ALL siblings — non-bio files help context)
+        let entry = dir_map.entry(parent.clone()).or_insert((0, Vec::new()));
+        entry.0 += 1;
+        if entry.1.len() < 8 {
+            let display = if fname.chars().count() > 60 {
+                let truncated: String = fname.chars().take(57).collect();
+                format!("{}...", truncated)
+            } else {
+                fname.to_string()
+            };
+            if !entry.1.contains(&display) {
+                entry.1.push(display);
             }
         }
     }
 
-    let mut result: Vec<_> = dir_map.into_iter().collect();
-    result.sort_by(|a, b| b.1 .0.cmp(&a.1 .0)); // Sort by file count desc
-    result
-        .into_iter()
+    // Filter to only directories that have at least 1 bio-relevant file
+    let bio_parents: std::collections::HashSet<String> = all.iter()
+        .filter(|(_, p, _)| is_bio_file(std::path::Path::new(p)
+            .file_name().and_then(|n| n.to_str()).unwrap_or("")))
+        .map(|(_, p, _)| {
+            std::path::Path::new(p).parent()
+                .map(|par| par.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let mut result: Vec<_> = dir_map.into_iter()
+        .filter(|(dir, _)| bio_parents.contains(dir))
+        .collect();
+
+    result.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    result.into_iter()
         .map(|(path, (count, files))| (path, count, files))
         .collect()
 }

@@ -60,16 +60,27 @@ fn is_key_file(name: &str) -> bool {
     lower.ends_with(".h5") || lower.ends_with(".hdf5")
 }
 
-/// Generate a directory summary text from the index for LLM consumption
+/// Generate a directory summary text from the index for LLM consumption.
+/// Paths are made relative to `root` to save tokens.
 pub fn build_directory_summary(
     root: &str,
     dirs: &[(String, usize, Vec<String>)],
 ) -> String {
+    let prefix = if root.ends_with('/') { root.to_string() } else { format!("{}/", root) };
     let mut lines = vec![
-        format!("## 扫描结果\n\n根目录: {}\n", root),
+        format!("## 扫描结果\n\n根目录: {}\n(paths below are relative to this root)\n", root),
     ];
 
     for (path, count, samples) in dirs {
+        // Strip root prefix from path to save output tokens
+        let display_path = if path.starts_with(&prefix) {
+            path[prefix.len()..].to_string()
+        } else if path.starts_with(root) {
+            path[root.len()..].trim_start_matches('/').to_string()
+        } else {
+            path.clone()
+        };
+
         let key_files: Vec<&str> = samples.iter()
             .filter(|n| is_key_file(n))
             .map(|s| s.as_str())
@@ -87,7 +98,7 @@ pub fn build_directory_summary(
             display
         };
 
-        lines.push(format!("{}  ({} files)", path, count));
+        lines.push(format!("{}  ({} files)", display_path, count));
         lines.push(format!(
             "  代表性文件: {}",
             if display.is_empty() { "(无)" } else { &display }
