@@ -98,9 +98,11 @@ enum ServersAction {
     Remove {
         name: String,
     },
-    /// Scan a single server
+    /// Scan a single server (use --agent for fan-agent mode)
     Scan {
         name: String,
+        #[arg(long)]
+        agent: bool,
     },
 }
 
@@ -132,7 +134,7 @@ fn main() {
             ServersAction::List => commands::servers::list(&config),
             ServersAction::Add { name } => commands::servers::add(&name),
             ServersAction::Remove { name } => commands::servers::remove(&name),
-            ServersAction::Scan { name } => commands::servers::scan_one(&name),
+            ServersAction::Scan { name, agent } => commands::servers::scan_one_inner(&name, agent),
         },
     }
 }

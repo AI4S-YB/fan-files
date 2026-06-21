@@ -104,6 +104,10 @@ pub fn remove(name: &str) {
 }
 
 pub fn scan_one(name: &str) {
+    scan_one_inner(name, false);
+}
+
+pub fn scan_one_inner(name: &str, use_agent: bool) {
     let config = Config::load().expect("Failed to load config");
     let server_cfg = match config.servers.servers.get(name) {
         Some(c) if c.enabled => c.clone(),
@@ -136,29 +140,154 @@ pub fn scan_one(name: &str) {
         index.tantivy.commit().ok();
         println!("Scanned {}: {} files indexed", name, count);
     } else {
-        println!("Scanning remote server '{}' in {}...", name, server_cfg.scan_root);
-        let remote = fan_core::scanner::RemoteScanner::new(
-            name.to_string(),
-            server_cfg.host.clone(),
-            server_cfg.scan_root.clone(),
-        );
-        match remote.scan(false) {
-            Ok(entries) => {
-                let index = fan_core::index::open_index(&config, fan_core::index::IndexMode::ReadWrite)
-                    .expect("Failed to open index");
-                let mut count = 0u64;
-                for file_info in &entries {
-                    match index.index_file(file_info, None) {
-                        Ok(_) => count += 1,
-                        Err(e) => eprintln!("Failed to index {}: {}", file_info.path.display(), e),
-                    }
-                }
-                index.tantivy.commit().ok();
-                println!("Scanned {}: {} files indexed", name, count);
-            }
-            Err(e) => eprintln!("Remote scan failed: {}", e),
+        if use_agent {
+            scan_remote_with_agent(&config, name, &server_cfg);
+        } else {
+            scan_remote_with_cache(&config, name, &server_cfg);
         }
     }
+}
+
+fn scan_remote_with_cache(config: &Config, name: &str, server_cfg: &ServerConfig) {
+    println!("Scanning remote server '{}' in {}...", name, server_cfg.scan_root);
+    let remote = fan_core::scanner::RemoteScanner::new(
+        name.to_string(),
+        server_cfg.host.clone(),
+        server_cfg.scan_root.clone(),
+    );
+    match remote.scan(false) {
+        Ok(entries) => {
+            let index = fan_core::index::open_index(config, fan_core::index::IndexMode::ReadWrite)
+                .expect("Failed to open index");
+            let mut count = 0u64;
+            for file_info in &entries {
+                match index.index_file(file_info, None) {
+                    Ok(_) => count += 1,
+                    Err(e) => eprintln!("Failed to index {}: {}", file_info.path.display(), e),
+                }
+            }
+            index.tantivy.commit().ok();
+            println!("Scanned {}: {} files indexed", name, count);
+        }
+        Err(e) => eprintln!("Remote scan failed: {}", e),
+    }
+}
+
+fn scan_remote_with_agent(config: &Config, name: &str, server_cfg: &ServerConfig) {
+    println!("Scanning remote server '{}' with fan-agent...", name);
+
+    let agent_path = "$HOME/.fan-agent/fan-agent";
+
+    // Step 1: Deploy fan-agent if needed
+    let check_cmd = format!("test -x {} && echo ok || echo missing", agent_path);
+    let check_result = std::process::Command::new("ssh")
+        .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+               &server_cfg.host, &check_cmd])
+        .output();
+
+    let needs_deploy = match check_result {
+        Ok(ref out) if String::from_utf8_lossy(&out.stdout).trim() == "missing" => true,
+        Err(_) => {
+            eprintln!("  SSH check failed, falling back to cache mode");
+            return scan_remote_with_cache(config, name, server_cfg);
+        }
+        _ => false,
+    };
+
+    if needs_deploy {
+        println!("  deploying fan-agent...");
+        // Find fan-agent binary alongside fan-files
+        let agent_src = match std::env::current_exe() {
+            Ok(exe) => {
+                let dir = exe.parent().unwrap().to_path_buf();
+                dir.join("fan-agent-x86_64")
+            }
+            Err(_) => {
+                eprintln!("  cannot locate fan-agent binary, falling back to cache mode");
+                return scan_remote_with_cache(config, name, server_cfg);
+            }
+        };
+
+        if agent_src.exists() {
+            let scp_result = std::process::Command::new("scp")
+                .args([agent_src.to_str().unwrap(),
+                       &format!("{}:~/.fan-agent/fan-agent", server_cfg.host)])
+                .output();
+            match scp_result {
+                Ok(ref out) if out.status.success() => {
+                    let _ = std::process::Command::new("ssh")
+                        .args(["-o", "BatchMode=yes", &server_cfg.host,
+                               "chmod +x ~/.fan-agent/fan-agent"])
+                        .output();
+                    println!("  fan-agent deployed");
+                }
+                _ => {
+                    eprintln!("  scp failed, falling back to cache mode");
+                    return scan_remote_with_cache(config, name, server_cfg);
+                }
+            }
+        } else {
+            eprintln!("  fan-agent binary not found, falling back to cache mode");
+            return scan_remote_with_cache(config, name, server_cfg);
+        }
+    }
+
+    // Step 2: Run fan-agent and pipe JSONL
+    println!("  scanning...");
+    let scan_cmd = format!("{} scan --root '{}' 2>/dev/null",
+        agent_path, server_cfg.scan_root.replace('\'', "'\\''"));
+
+    let mut child = match std::process::Command::new("ssh")
+        .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+               &server_cfg.host, &scan_cmd])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  SSH spawn failed: {}, falling back to cache mode", e);
+            return scan_remote_with_cache(config, name, server_cfg);
+        }
+    };
+
+    let index = fan_core::index::open_index(config, fan_core::index::IndexMode::ReadWrite)
+        .expect("Failed to open index");
+    let mut count = 0u64;
+
+    use std::io::{BufRead, BufReader};
+    let stdout = child.stdout.take().unwrap();
+    let reader = BufReader::new(stdout);
+
+    for line in reader.lines() {
+        if let Ok(line) = line {
+            if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
+                let path = entry["path"].as_str().unwrap_or("");
+                let size = entry["size"].as_u64().unwrap_or(0);
+                let mtime = entry["mtime_secs"].as_i64().unwrap_or(0);
+
+                let info = fan_core::types::RawFileInfo {
+                    path: std::path::PathBuf::from(path),
+                    source_server: name.to_string(),
+                    size,
+                    mtime_secs: mtime,
+                    hash_sha256: None,
+                    magic_bytes: Vec::new(),
+                    mime_type: mime_guess::from_path(path)
+                        .first_or_octet_stream()
+                        .to_string(),
+                };
+
+                match index.index_file(&info, None) {
+                    Ok(_) => count += 1,
+                    Err(e) => eprintln!("Failed to index {}: {}", path, e),
+                }
+            }
+        }
+    }
+
+    let _ = child.wait();
+    index.tantivy.commit().ok();
+    println!("Scanned {}: {} files indexed (via fan-agent)", name, count);
 }
 
 fn ask(prompt: &str) -> String {

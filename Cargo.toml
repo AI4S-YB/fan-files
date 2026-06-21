@@ -6,6 +6,7 @@ members = [
     "crates/fan-files",
     "plugins/generic-detector",
     "plugins/fastq-interpreter",
+    "crates/fan-agent",
 ]
 
 [workspace.dependencies]
