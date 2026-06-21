@@ -1,4 +1,4 @@
 target/
 .fan-files/
 *.wasm
-doc
+docs/
