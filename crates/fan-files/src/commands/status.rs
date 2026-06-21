@@ -29,10 +29,7 @@ pub fn run(config: &Config) {
             }
 
             let fmt_ts = |ts: i64| -> String {
-                std::time::UNIX_EPOCH
-                    .checked_add(std::time::Duration::from_secs(ts as u64))
-                    .map(|t| format!("{:?}", t))
-                    .unwrap_or_else(|| ts.to_string())
+                timestamp_to_str(ts)
             };
 
             // Per-server breakdown
@@ -66,4 +63,35 @@ pub fn run(config: &Config) {
         }
         Err(e) => eprintln!("Error querying status: {}", e),
     }
+}
+
+fn timestamp_to_str(ts: i64) -> String {
+    if ts <= 0 { return "never".to_string(); }
+    // Convert unix timestamp to YYYY-MM-DD HH:MM:SS
+    let secs_per_day: i64 = 86400;
+    let days = ts / secs_per_day;
+    let time_of_day = ts % secs_per_day;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Compute year/month/day from days since epoch (1970-01-01)
+    let (y, m, d) = days_to_ymd(days);
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, hours, minutes, seconds)
+}
+
+/// Convert days since 1970-01-01 to (year, month, day).
+fn days_to_ymd(mut days: i64) -> (i64, u32, u32) {
+    days += 719468; // shift to 0000-03-01 epoch (for easier leap year math)
+    let era = if days >= 0 { days } else { days - 146096 } / 146097;
+    let doe = days - era * 146097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { (mp + 3) as u32 } else { (mp - 9) as u32 };
+    let y_final = if m <= 2 { y + 1 } else { y };
+    (y_final, m, d)
 }

@@ -21,11 +21,26 @@ pub struct IndexEngine {
 impl IndexEngine {
     pub fn open(config: &Config, read_only: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let data_dir = crate::config::dirs_fan().join("data");
-        Ok(Self {
-            sqlite: SqliteStore::open(&data_dir)?,
-            tantivy: tantivy::TantivyIndex::open(&data_dir, read_only)?,
-            embedding: embedding::EmbeddingEngine::new(config)?,
-        })
+        let sqlite = SqliteStore::open(&data_dir)?;
+        let tantivy = match tantivy::TantivyIndex::open(&data_dir, read_only) {
+            Ok(t) => t,
+            Err(_e) if !read_only => {
+                // Stale lock from crashed process? Clean and retry once.
+                let lock_files = [
+                    data_dir.join("tantivy/.tantivy-writer.lock"),
+                    data_dir.join("tantivy/.tantivy-meta.lock"),
+                ];
+                for lock in &lock_files {
+                    if lock.exists() {
+                        std::fs::remove_file(lock).ok();
+                    }
+                }
+                tantivy::TantivyIndex::open(&data_dir, read_only)?
+            }
+            Err(e) => return Err(e),
+        };
+        let embedding = embedding::EmbeddingEngine::new(config)?;
+        Ok(Self { sqlite, tantivy, embedding })
     }
 
     pub fn index_file(

@@ -103,10 +103,6 @@ pub fn remove(name: &str) {
     }
 }
 
-pub fn scan_one(name: &str) {
-    scan_one_inner(name, false);
-}
-
 pub fn scan_one_inner(name: &str, use_agent: bool) {
     let config = Config::load().expect("Failed to load config");
     let server_cfg = match config.servers.servers.get(name) {

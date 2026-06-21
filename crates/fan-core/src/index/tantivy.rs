@@ -58,10 +58,10 @@ impl TantivyIndex {
         doc.add_text(metadata_field, metadata_text);
         doc.add_text(tags_field, tags.join(" "));
 
-        let mut writer = writer.lock().unwrap();
+        let w = writer.lock().unwrap();
         let id_term = tantivy::Term::from_field_i64(file_id_field, id);
-        writer.delete_term(id_term);
-        writer.add_document(doc)?;
+        w.delete_term(id_term);
+        w.add_document(doc)?;
         // NOTE: Do NOT commit here — callers batch-commit after bulk indexing
 
         Ok(())
@@ -110,18 +110,18 @@ impl TantivyIndex {
         let writer = self.writer.as_ref()
             .ok_or("index opened in read-only mode")?;
         let file_id_field = self.schema.get_field("file_id").unwrap();
-        let mut writer = writer.lock().unwrap();
+        let mut w = writer.lock().unwrap();
         let id_term = tantivy::Term::from_field_i64(file_id_field, file_id);
-        writer.delete_term(id_term);
-        writer.commit()?;
+        w.delete_term(id_term);
+        w.commit()?;
         Ok(())
     }
 
     /// Flush any pending changes to disk.
     pub fn commit(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(writer) = &self.writer {
-            let mut writer = writer.lock().unwrap();
-            writer.commit()?;
+            let mut w = writer.lock().unwrap();
+            w.commit()?;
         }
         Ok(())
     }
