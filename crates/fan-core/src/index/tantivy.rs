@@ -62,7 +62,7 @@ impl TantivyIndex {
         let id_term = tantivy::Term::from_field_i64(file_id_field, id);
         writer.delete_term(id_term);
         writer.add_document(doc)?;
-        writer.commit()?;
+        // NOTE: Do NOT commit here — callers batch-commit after bulk indexing
 
         Ok(())
     }

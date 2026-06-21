@@ -102,32 +102,109 @@ impl RemoteScanner {
         Self { server_name, ssh_host, scan_root }
     }
 
-    /// Run `find` on the remote server, return list of (path, size, mtime).
+    /// Build cache file name from scan_root: `/data/biodata` → `data_biodata_files.txt`
+    fn cache_name(&self) -> String {
+        let sanitized = self.scan_root.trim_matches('/').replace('/', "_");
+        format!("{}_files.txt", sanitized)
+    }
+
+    /// Discover files: use cache file if available, otherwise fall back to find.
+    /// Strategy:
+    ///   1. Read cache file (near-instant, even over SSH)
+    ///   2. Run incremental find for files newer than cache
+    ///   3. If no cache, build it with a full find
     pub fn discover_files(&self) -> Result<Vec<RemoteFileEntry>, String> {
-        let find_cmd = format!(
-            "find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null || true",
-            shell_escape(&self.scan_root)
-        );
-        let output = ssh_exec(&self.ssh_host, &find_cmd)?;
+        let cache_path = format!("$HOME/.fan-cache/{}", self.cache_name());
+
+        // Step 1: Try to read the cache file
         let mut files = Vec::new();
-        for line in output.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+        let read_cache_cmd = format!(
+            "mkdir -p $HOME/.fan-cache && cat {} 2>/dev/null",
+            cache_path
+        );
+        let cache_output = ssh_exec(&self.ssh_host, &read_cache_cmd)?;
+        let mut cache_count = 0usize;
+
+        if !cache_output.is_empty() {
+            // Parse cache entries
+            for line in cache_output.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                if parts.len() != 3 { continue; }
+                let size: u64 = parts[1].parse().unwrap_or(0);
+                let mtime_float: f64 = parts[2].parse().unwrap_or(0.0);
+                files.push(RemoteFileEntry {
+                    path: parts[0].to_string(),
+                    size,
+                    mtime_secs: mtime_float as i64,
+                });
             }
-            let parts: Vec<&str> = line.splitn(3, '\t').collect();
-            if parts.len() != 3 {
-                continue;
-            }
-            let size: u64 = parts[1].parse().unwrap_or(0);
-            let mtime_float: f64 = parts[2].parse().unwrap_or(0.0);
-            let mtime_secs = mtime_float as i64;
-            files.push(RemoteFileEntry {
-                path: parts[0].to_string(),
-                size,
-                mtime_secs,
-            });
+            cache_count = files.len();
         }
+
+        if cache_count > 0 {
+            // Step 2: Incremental — find files newer than the cache file
+            let incr_cmd = format!(
+                "find {} -type f -newer {} -printf '%p\\t%s\\t%T@\\n' 2>/dev/null || true",
+                shell_escape(&self.scan_root),
+                cache_path
+            );
+            if let Ok(incr_output) = ssh_exec(&self.ssh_host, &incr_cmd) {
+                let mut new_count = 0usize;
+                for line in incr_output.lines() {
+                    let line = line.trim();
+                    if line.is_empty() { continue; }
+                    let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                    if parts.len() != 3 { continue; }
+                    let size: u64 = parts[1].parse().unwrap_or(0);
+                    let mtime_float: f64 = parts[2].parse().unwrap_or(0.0);
+                    files.push(RemoteFileEntry {
+                        path: parts[0].to_string(),
+                        size,
+                        mtime_secs: mtime_float as i64,
+                    });
+                    new_count += 1;
+                }
+                eprintln!("  cache: {} files, incremental: {} new", cache_count, new_count);
+            }
+
+            // Step 3: Rebuild cache in background (async refresh for next time)
+            let rebuild_cmd = format!(
+                "find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null > {}.tmp && mv {}.tmp {}",
+                shell_escape(&self.scan_root),
+                cache_path, cache_path, cache_path
+            );
+            // Fire-and-forget: don't wait for rebuild
+            let _ = ssh_exec_bg(&self.ssh_host, &rebuild_cmd);
+        } else {
+            // Step 4: No cache — build it and return results
+            eprintln!("  building file cache (first run)...");
+            let build_cmd = format!(
+                "mkdir -p $HOME/.fan-cache && find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null | tee {}.tmp",
+                shell_escape(&self.scan_root),
+                cache_path
+            );
+            let output = ssh_exec(&self.ssh_host, &build_cmd)?;
+            let _ = ssh_exec(&self.ssh_host,
+                &format!("mv {}.tmp {}", cache_path, cache_path));
+
+            for line in output.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                if parts.len() != 3 { continue; }
+                let size: u64 = parts[1].parse().unwrap_or(0);
+                let mtime_float: f64 = parts[2].parse().unwrap_or(0.0);
+                files.push(RemoteFileEntry {
+                    path: parts[0].to_string(),
+                    size,
+                    mtime_secs: mtime_float as i64,
+                });
+            }
+            eprintln!("  cache built: {} files", files.len());
+        }
+
         Ok(files)
     }
 
@@ -175,6 +252,15 @@ impl RemoteScanner {
         }
         Ok(results)
     }
+}
+
+/// Execute an SSH command in background (fire-and-forget).
+fn ssh_exec_bg(host: &str, cmd: &str) -> Result<(), String> {
+    std::process::Command::new("ssh")
+        .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host, cmd])
+        .spawn()
+        .map_err(|e| format!("ssh bg failed: {}", e))?;
+    Ok(())
 }
 
 /// Execute a command via SSH, returning stdout on success.
