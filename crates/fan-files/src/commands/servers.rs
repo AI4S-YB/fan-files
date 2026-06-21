@@ -290,6 +290,125 @@ fn scan_remote_with_agent(config: &Config, name: &str, server_cfg: &ServerConfig
     println!("Scanned {}: {} files indexed (via fan-agent)", name, count);
 }
 
+pub fn watch_remote(name: &str) {
+    let config = Config::load().expect("Failed to load config");
+    let server_cfg = match config.servers.servers.get(name) {
+        Some(c) if c.enabled && !c.host.is_empty() => c.clone(),
+        Some(_) => {
+            eprintln!("Server '{}' is local or disabled. Watch mode only for remote servers.", name);
+            return;
+        }
+        None => {
+            eprintln!("Server '{}' not found.", name);
+            return;
+        }
+    };
+
+    let agent_path = "$HOME/.fan-agent/fan-agent";
+
+    // Deploy agent
+    let check_cmd = format!("test -x {} && echo ok || echo missing", agent_path);
+    let check_result = std::process::Command::new("ssh")
+        .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", &server_cfg.host, &check_cmd])
+        .output();
+
+    if let Ok(ref out) = check_result {
+        if String::from_utf8_lossy(&out.stdout).trim() == "missing" {
+            println!("Deploying fan-agent to {}...", name);
+            let agent_src = std::env::current_exe().ok()
+                .and_then(|e| e.parent().map(|p| p.join("fan-agent-x86_64")));
+            if let Some(src) = agent_src {
+                if src.exists() {
+                    let _ = std::process::Command::new("scp")
+                        .args([src.to_str().unwrap(), &format!("{}:~/.fan-agent/fan-agent", server_cfg.host)])
+                        .output();
+                    let _ = std::process::Command::new("ssh")
+                        .args(["-o", "BatchMode=yes", &server_cfg.host, "chmod +x ~/.fan-agent/fan-agent"])
+                        .output();
+                }
+            }
+        }
+    }
+
+    println!("Starting real-time watch on {}:{}...", name, server_cfg.scan_root);
+    println!("(press Ctrl+C to stop)");
+    println!();
+
+    let watch_cmd = format!(
+        "{} watch --root '{}' 2>/dev/null",
+        agent_path,
+        server_cfg.scan_root.replace('\'', "'\\''")
+    );
+
+    let mut child = std::process::Command::new("ssh")
+        .args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes", &server_cfg.host, &watch_cmd])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to start SSH watch");
+
+    let index = fan_core::index::open_index(&config, fan_core::index::IndexMode::ReadWrite)
+        .expect("Failed to open index");
+
+    use std::io::{BufRead, BufReader};
+    let stdout = child.stdout.take().unwrap();
+    let reader = BufReader::new(stdout);
+    let mut add_count = 0u64;
+    let mut del_count = 0u64;
+
+    for line in reader.lines() {
+        if let Ok(line) = line {
+            if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&line) {
+                let event_type = ev["event"].as_str().unwrap_or("");
+                let path_str = ev["path"].as_str().unwrap_or("");
+
+                match event_type {
+                    "add" | "mod" => {
+                        let size = ev["size"].as_u64().unwrap_or(0);
+                        let mtime = ev["mtime_secs"].as_i64().unwrap_or(0);
+                        let info = fan_core::types::RawFileInfo {
+                            path: std::path::PathBuf::from(path_str),
+                            source_server: name.to_string(),
+                            size,
+                            mtime_secs: mtime,
+                            hash_sha256: None,
+                            magic_bytes: Vec::new(),
+                            mime_type: mime_guess::from_path(path_str)
+                                .first_or_octet_stream().to_string(),
+                        };
+                        match index.index_file(&info, None) {
+                            Ok(_) => {
+                                add_count += 1;
+                                println!("  + {}", path_str);
+                            }
+                            Err(e) => eprintln!("  ! {}: {}", path_str, e),
+                        }
+                    }
+                    "del" => {
+                        match index.sqlite.mark_deleted(std::path::Path::new(path_str)) {
+                            Ok(_) => {
+                                del_count += 1;
+                                println!("  - {}", path_str);
+                            }
+                            Err(e) => eprintln!("  ! {}: {}", path_str, e),
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Commit every 100 events
+                if (add_count + del_count) % 100 == 0 {
+                    index.tantivy.commit().ok();
+                    eprintln!("  [{} added, {} deleted]", add_count, del_count);
+                }
+            }
+        }
+    }
+
+    index.tantivy.commit().ok();
+    let _ = child.wait();
+    println!("Watch ended: {} added, {} deleted", add_count, del_count);
+}
+
 fn ask(prompt: &str) -> String {
     print!("{}", prompt);
     io::stdout().flush().ok();

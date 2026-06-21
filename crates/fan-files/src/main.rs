@@ -104,6 +104,10 @@ enum ServersAction {
         #[arg(long)]
         agent: bool,
     },
+    /// Real-time watch a remote server (requires fan-agent)
+    Watch {
+        name: String,
+    },
 }
 
 fn main() {
@@ -135,6 +139,7 @@ fn main() {
             ServersAction::Add { name } => commands::servers::add(&name),
             ServersAction::Remove { name } => commands::servers::remove(&name),
             ServersAction::Scan { name, agent } => commands::servers::scan_one_inner(&name, agent),
+            ServersAction::Watch { name } => commands::servers::watch_remote(&name),
         },
     }
 }
