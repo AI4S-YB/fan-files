@@ -182,7 +182,7 @@ impl RemoteScanner {
             // Step 4: No cache — build it and return results
             eprintln!("  building file cache (first run)...");
             let build_cmd = format!(
-                "mkdir -p $HOME/.fan-cache && find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null | tee {}.tmp",
+                "mkdir -p $HOME/.fan-cache && (find {} -type f -printf '%p\\t%s\\t%T@\\n' 2>/dev/null; exit 0) | tee {}.tmp",
                 shell_escape(scan_root),
                 cache_path
             );
