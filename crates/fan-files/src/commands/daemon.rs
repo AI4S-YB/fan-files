@@ -1,4 +1,4 @@
-use fan_core::config::Config;
+use fan_core::config::{Config, DataLayer};
 use fan_core::detector::BuiltinDetector;
 use fan_core::infer;
 use fan_core::index::IndexEngine;
@@ -15,10 +15,10 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
-pub fn run(config: &Config) {
+pub fn run(config: &Config, layer: &DataLayer) {
     info!("Starting fan-files daemon...");
 
-    let index = match fan_core::index::open_index(config, fan_core::index::IndexMode::ReadWrite) {
+    let index = match fan_core::index::open_index_for_layer(config, layer, fan_core::index::IndexMode::ReadWrite) {
         Ok(i) => i,
         Err(e) => {
             error!("Failed to open index engine: {}", e);

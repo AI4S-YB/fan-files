@@ -1,11 +1,11 @@
-use fan_core::config::Config;
+use fan_core::config::{Config, DataLayer};
 use fan_core::infer;
 use fan_core::index::sqlite::SqliteStore;
 use fan_core::llm::LlmClient;
 use fan_core::project::ProjectStore;
 use std::sync::Arc;
 
-pub fn run(config: &Config) {
+pub fn run(config: &Config, layer: &DataLayer) {
     let llm_client = LlmClient::new(config.llm.clone());
     if !llm_client.is_configured() {
         eprintln!("LLM not configured.");
@@ -18,7 +18,10 @@ pub fn run(config: &Config) {
     }
 
     // Open only SQLite — skip Tantivy (mmap) and ONNX (90MB) to save memory
-    let data_dir = fan_core::config::dirs_fan().join("data");
+    let data_dir = match layer {
+        DataLayer::User => fan_core::config::dirs_fan().join("data"),
+        DataLayer::Global => fan_core::config::dirs_fan_global().join("data"),
+    };
     let sqlite = match SqliteStore::open(&data_dir) {
         Ok(s) => s,
         Err(e) => {

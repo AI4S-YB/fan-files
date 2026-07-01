@@ -1,13 +1,18 @@
-use fan_core::config::LLM_PROVIDERS;
+use fan_core::config::{Config, DataLayer, LLM_PROVIDERS, ServerConfig};
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
-use fan_core::config::{Config, ServerConfig};
 
-pub fn run(config: &Config) {
+pub fn run(config: &Config, layer: &DataLayer) {
     println!();
-    println!("  ╔══════════════════════════════════════╗");
-    println!("  ║   Fan-Files 初始化配置向导          ║");
-    println!("  ╚══════════════════════════════════════╝");
+    if *layer == DataLayer::Global {
+        println!("  ╔══════════════════════════════════════╗");
+        println!("  ║   Fan-Files 管理员全局初始化       ║");
+        println!("  ╚══════════════════════════════════════╝");
+    } else {
+        println!("  ╔══════════════════════════════════════╗");
+        println!("  ║   Fan-Files 用户初始化向导          ║");
+        println!("  ╚══════════════════════════════════════╝");
+    }
     println!();
     let mut new_config = config.clone();
 
@@ -21,7 +26,7 @@ pub fn run(config: &Config) {
     run_step_3(&mut new_config);
 
     // Step 4: Start
-    run_step_4(&new_config);
+    run_step_4(&new_config, layer);
     println!("  配置已保存。");
 }
 
@@ -206,7 +211,7 @@ fn run_step_3(config: &mut Config) {
     println!();
 }
 
-fn run_step_4(config: &Config) {
+fn run_step_4(config: &Config, layer: &DataLayer) {
     println!("  ▸ 步骤 4/4：开始扫描");
     println!();
     println!("  是否现在开始扫描和推断？");
@@ -217,8 +222,12 @@ fn run_step_4(config: &Config) {
     let input = ask("  请输入: ");
 
     // Save config first
-    let config_path = fan_core::config::dirs_fan().join("config.toml");
-    std::fs::create_dir_all(fan_core::config::dirs_fan()).ok();
+    let config_path = if *layer == DataLayer::Global {
+        fan_core::config::config_path_global()
+    } else {
+        fan_core::config::dirs_fan().join("config.toml")
+    };
+    std::fs::create_dir_all(config_path.parent().unwrap_or(&fan_core::config::dirs_fan())).ok();
     if let Ok(toml_str) = toml::to_string_pretty(config) {
         std::fs::write(&config_path, toml_str).ok();
     }
@@ -259,7 +268,7 @@ fn run_step_4(config: &Config) {
         }
         "2" => {
             println!("  启动扫描（Ctrl+C 停止）...");
-            crate::commands::daemon::run(config);
+            crate::commands::daemon::run(config, layer);
         }
         _ => {
             println!("  完成。运行 'fan-files daemon' 开始扫描。");
