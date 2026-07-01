@@ -941,6 +941,7 @@ dependencies = [
  "candle-nn",
  "candle-onnx",
  "fan-plugin-sdk",
+ "libc",
  "mime_guess",
  "notify",
  "rusqlite",
