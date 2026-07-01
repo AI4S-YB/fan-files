@@ -1,7 +1,7 @@
-use fan_core::config::Config;
+use fan_core::config::{Config, DataLayer};
 
-pub fn run(config: &Config, category: Option<&str>, tag: Option<&str>, server: Option<&str>, json: bool) {
-    let index = match fan_core::index::open_index(config, fan_core::index::IndexMode::ReadOnly) {
+pub fn run(config: &Config, layer: &DataLayer, category: Option<&str>, tag: Option<&str>, server: Option<&str>, json: bool) {
+    let index = match fan_core::index::open_index_for_layer(config, layer, fan_core::index::IndexMode::ReadOnly) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);

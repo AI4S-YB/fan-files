@@ -1,10 +1,13 @@
-use fan_core::config::Config;
+use fan_core::config::{Config, DataLayer};
 use fan_core::index::sqlite::SqliteStore;
 use fan_core::project::ProjectStore;
 use std::sync::Arc;
 
-pub fn run(_config: &Config, show_name: Option<&str>) {
-    let data_dir = fan_core::config::dirs_fan().join("data");
+pub fn run(_config: &Config, layer: &DataLayer, show_name: Option<&str>) {
+    let data_dir = match layer {
+        DataLayer::User => fan_core::config::dirs_fan().join("data"),
+        DataLayer::Global => fan_core::config::dirs_fan_global().join("data"),
+    };
     let sqlite = match SqliteStore::open(&data_dir) {
         Ok(s) => s,
         Err(e) => {

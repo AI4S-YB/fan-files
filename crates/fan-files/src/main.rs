@@ -125,19 +125,19 @@ fn main() {
     });
 
     match cli.command {
-        Commands::Daemon => commands::daemon::run(&config),
-        Commands::Search { query, json } => commands::search::run(&config, &query, json),
+        Commands::Daemon => commands::daemon::run(&config, &layer),
+        Commands::Search { query, json } => commands::search::run(&config, &layer, &query, json),
         Commands::Suggest { path, json } => commands::suggest::run(&config, &path, json),
-        Commands::List { category, tag, server, json } => commands::list::run(&config, category.as_deref(), tag.as_deref(), server.as_deref(), json),
-        Commands::Info { path, json } => commands::info::run(&config, &path, json),
-        Commands::Status => commands::status::run(&config),
-        Commands::Infer => commands::infer::run(&config),
+        Commands::List { category, tag, server, json } => commands::list::run(&config, &layer, category.as_deref(), tag.as_deref(), server.as_deref(), json),
+        Commands::Info { path, json } => commands::info::run(&config, &layer, &path, json),
+        Commands::Status => commands::status::run(&config, &layer),
+        Commands::Infer => commands::infer::run(&config, &layer),
         Commands::Projects { action } => match action {
-            Some(ProjectAction::Show { name }) => commands::projects::run(&config, Some(name.as_str())),
+            Some(ProjectAction::Show { name }) => commands::projects::run(&config, &layer, Some(name.as_str())),
             Some(ProjectAction::Update { name, species, confidence, assay_type }) => {
                 commands::projects::run_update(&config, &name, species.as_deref(), confidence.as_deref(), assay_type.as_deref())
             }
-            None => commands::projects::run(&config, None),
+            None => commands::projects::run(&config, &layer, None),
         },
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::Update => commands::update::run(),
