@@ -1,4 +1,6 @@
 mod commands;
+mod version;
+mod version_check;
 
 use clap::{Parser, Subcommand};
 use fan_core::config::Config;
@@ -117,6 +119,10 @@ enum ServersAction {
 fn main() {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+
+    // Async version check (non-blocking)
+    version_check::spawn_check();
+
     let layer = resolve_layer(cli.global);
     let config_path = config_path_for(&layer);
     let config = Config::load_from(&config_path).unwrap_or_else(|_| {
