@@ -6,6 +6,10 @@ use fan_core::config::Config;
 #[derive(Parser)]
 #[command(name = "fan-files", version = "0.1.0", about = "intelligent file metadata search engine")]
 struct Cli {
+    /// Use global (admin-managed) data layer
+    #[arg(long, global = true)]
+    global: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -113,7 +117,12 @@ enum ServersAction {
 fn main() {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let config = Config::load().expect("Failed to load config");
+    let layer = resolve_layer(cli.global);
+    let config_path = config_path_for(&layer);
+    let config = Config::load_from(&config_path).unwrap_or_else(|_| {
+        eprintln!("Warning: no config at {}, using defaults", config_path.display());
+        Config::default()
+    });
 
     match cli.command {
         Commands::Daemon => commands::daemon::run(&config),
@@ -141,5 +150,20 @@ fn main() {
             ServersAction::Scan { name, agent } => commands::servers::scan_one_inner(&name, agent),
             ServersAction::Watch { name } => commands::servers::watch_remote(&name),
         },
+    }
+}
+
+fn resolve_layer(global: bool) -> fan_core::config::DataLayer {
+    if global {
+        fan_core::config::DataLayer::Global
+    } else {
+        fan_core::config::DataLayer::User
+    }
+}
+
+fn config_path_for(layer: &fan_core::config::DataLayer) -> std::path::PathBuf {
+    match layer {
+        fan_core::config::DataLayer::Global => fan_core::config::config_path_global(),
+        fan_core::config::DataLayer::User => fan_core::config::dirs_fan().join("config.toml"),
     }
 }

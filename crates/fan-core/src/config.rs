@@ -212,8 +212,12 @@ impl Default for Config {
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let path = dirs_fan().join("config.toml");
+        Self::load_from(&path)
+    }
+
+    pub fn load_from(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         if path.exists() {
-            let s = std::fs::read_to_string(&path)?;
+            let s = std::fs::read_to_string(path)?;
             let mut cfg: Config = toml::from_str(&s)?;
             // Migrate old scan_root → scan_roots
             let raw: toml::Value = toml::from_str(&s)?;
@@ -231,8 +235,10 @@ impl Config {
             Ok(cfg)
         } else {
             let cfg = Config::default();
-            std::fs::create_dir_all(dirs_fan())?;
-            std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, toml::to_string_pretty(&cfg)?)?;
             Ok(cfg)
         }
     }
@@ -263,6 +269,25 @@ impl Config {
             v
         }
     }
+}
+
+/// Which data layer an index belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataLayer {
+    /// User private index (~/.fan-files/data/)
+    User,
+    /// Global public index (/var/lib/fan-files/data/)
+    Global,
+}
+
+/// Global (admin-managed) data directory: /var/lib/fan-files
+pub fn dirs_fan_global() -> PathBuf {
+    PathBuf::from("/var/lib/fan-files")
+}
+
+/// Global config path: /etc/fan-files/config.toml
+pub fn config_path_global() -> PathBuf {
+    PathBuf::from("/etc/fan-files/config.toml")
 }
 
 pub fn dirs_fan() -> PathBuf {
