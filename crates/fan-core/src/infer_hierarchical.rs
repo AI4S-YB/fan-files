@@ -326,13 +326,26 @@ pub fn run_hierarchical_inference(
         .map(|a| a.clone())
         .unwrap_or(empty_projects.clone());
 
-    // Phase 2: for non-skipped branches with subdirs, do deep-dive at PHASE2_DEPTH
+    // Phase 2: for branches WITH significant hidden depth, deep-dive at PHASE2_DEPTH
+    // Only trigger when a branch has many subdirs at the truncation boundary
+    // (indicating there's more structure below that Phase 1 couldn't see)
     let phase1_count = projects.len();
     let mut phase2_count = 0;
     let mut deep_projects: Vec<serde_json::Value> = Vec::new();
 
+    // Count total Phase 2 candidates for progress
+    let phase2_candidates: Vec<_> = tree.subdirs.iter()
+        .filter(|c| !c.subdirs.is_empty() && !c.is_large_flat)
+        .filter(|c| c.subdirs.len() >= 3) // only if there's significant hidden depth
+        .collect();
+    if !phase2_candidates.is_empty() {
+        eprintln!("  Phase 2: deep-diving {} branches with hidden depth...", phase2_candidates.len());
+    }
+
     for child in &tree.subdirs {
-        // Skip if Phase 1 already marked this as skipped, or if no subdirs to expand
+        // Skip if no subdirs or not enough hidden depth
+        if child.subdirs.len() < 3 || child.is_large_flat { continue; }
+        // Skip if Phase 1 already marked this as skipped
         let already_skipped = projects.iter().any(|p| {
             let dirs = p["dirs"].as_array().map(|a| a.iter().any(|d| {
                 d.as_str().map_or(false, |s| s == &child.name || s.ends_with(&format!("/{}", child.name)))
@@ -352,7 +365,12 @@ pub fn run_hierarchical_inference(
 
         let deep_node = build_dir_tree_inner(&child.path, PHASE2_DEPTH, &subdir_files);
         let deep_prompt = tree_to_prompt(&deep_node, 0);
-        if deep_prompt.len() < 200 { continue; } // nothing meaningful
+        if deep_prompt.len() < 200 { continue; }
+        if deep_prompt.len() > 50_000 {
+            // Too large — the branch is too complex for a single deep-dive
+            eprintln!("  Phase 2: skipping {} (prompt {} chars, too large)", child.name, deep_prompt.len());
+            continue;
+        }
 
         let deep_full = format!(
             "你是生物信息学数据管理助手。下面是一个子目录的深层树状结构。\n\
