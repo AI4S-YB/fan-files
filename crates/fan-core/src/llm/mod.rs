@@ -38,20 +38,7 @@ impl LlmClient {
             "max_tokens": 16384
         });
 
-        info!(
-            "Calling LLM API at {} (model: {})",
-            self.config.endpoint, self.config.model
-        );
-        let response = ureq::post(&self.config.endpoint)
-            .set("Authorization", &format!("Bearer {}", self.config.api_key))
-            .set("Content-Type", "application/json")
-            .send_json(&body)
-            .map_err(|e| format!("LLM API call failed: {}", e))?;
-
-        let json: serde_json::Value = response
-            .into_json()
-            .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
-
+        let json: serde_json::Value = llm_api_call_with_retry(&self.config, &body, 3)?;
         let content = json["choices"][0]["message"]["content"]
             .as_str()
             .ok_or("No content in LLM response")?;
@@ -81,4 +68,47 @@ impl LlmClient {
             .as_str().ok_or("No content")?;
         Ok(content.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
     }
+}
+
+/// Call LLM API with retry on 5xx / timeout errors.
+fn llm_api_call_with_retry(
+    config: &LlmConfig,
+    body: &serde_json::Value,
+    max_retries: u32,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut last_err = String::new();
+    for attempt in 0..max_retries {
+        if attempt > 0 {
+            let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+            std::thread::sleep(delay);
+        }
+        info!(
+            "Calling LLM API at {} (model: {}, attempt {}/{})",
+            config.endpoint, config.model, attempt + 1, max_retries
+        );
+        match ureq::post(&config.endpoint)
+            .set("Authorization", &format!("Bearer {}", config.api_key))
+            .set("Content-Type", "application/json")
+            .send_json(body)
+        {
+            Ok(response) => {
+                let status = response.status();
+                if status == 504 || status == 502 || status == 503 {
+                    last_err = format!("status code {}", status);
+                    continue; // retry on gateway errors
+                }
+                return response.into_json()
+                    .map_err(|e| format!("Failed to parse LLM response: {}", e).into());
+            }
+            Err(ureq::Error::Transport(e)) => {
+                last_err = format!("transport: {}", e);
+                continue; // retry on connection errors
+            }
+            Err(e) => {
+                last_err = format!("{}", e);
+                continue;
+            }
+        }
+    }
+    Err(format!("LLM API call failed after {} retries: {}", max_retries, last_err).into())
 }

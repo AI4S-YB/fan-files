@@ -102,7 +102,13 @@ pub fn run_inference(
         return Ok((0, 0));
     }
 
-    eprintln!("  Total: {} unique projects", all_projects.len());
+    // Post-processing: dedup projects with same species + common name prefix
+    let before_dedup = all_projects.len();
+    all_projects = dedup_projects(all_projects);
+    if before_dedup != all_projects.len() {
+        eprintln!("  Dedup: {} → {} projects", before_dedup, all_projects.len());
+    }
+    eprintln!("  Total: {} projects", all_projects.len());
 
     // 4. Write projects and link files
     let mut project_name_to_id: HashMap<String, i64> = HashMap::new();
@@ -216,13 +222,23 @@ fn is_bio_file(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.ends_with(".fastq.gz") || lower.ends_with(".fq.gz") || lower.ends_with(".fastq") ||
     lower.ends_with(".fasta") || lower.ends_with(".fa.gz") || lower.ends_with(".fa") ||
+    lower.ends_with(".fna") || lower.ends_with(".faa") || lower.ends_with(".ffn") ||
     lower.ends_with(".bam") || lower.ends_with(".vcf.gz") || lower.ends_with(".vcf") ||
     lower.ends_with(".gff3") || lower.ends_with(".gtf") || lower.ends_with(".bed") ||
     lower.ends_with(".h5") || lower.ends_with(".hdf5") ||
     lower.ends_with(".gff") || lower.ends_with(".gff.gz") ||
     lower.ends_with(".sam") || lower.ends_with(".cram") ||
     lower.ends_with(".bw") || lower.ends_with(".bigwig") ||
-    lower.ends_with(".tsv.gz") || lower.ends_with(".csv.gz")
+    lower.ends_with(".tsv.gz") || lower.ends_with(".csv.gz") ||
+    lower.ends_with(".tsv") || lower.ends_with(".csv") ||
+    lower.ends_with(".txt.gz") || lower.ends_with(".tab.gz") ||
+    lower.ends_with(".narrowpeak") || lower.ends_with(".broadpeak") ||
+    lower.ends_with(".maf") || lower.ends_with(".phylip") ||
+    lower.ends_with(".nex") || lower.ends_with(".nexus") ||
+    lower.ends_with(".gfa") || lower.ends_with(".agp") ||
+    lower.ends_with(".chain") || lower.ends_with(".net") ||
+    lower.ends_with(".2bit") || lower.ends_with(".sizes") ||
+    lower.ends_with(".idx") || lower.ends_with(".tbi") || lower.ends_with(".csi")
 }
 
 /// Collect directory tree summary from indexed files (bio-relevant only, by default).
@@ -276,6 +292,45 @@ fn collect_directory_summary(
         .collect()
 }
 
+/// Merge projects that likely represent the same dataset (same species, common name prefix).
+fn dedup_projects(mut projects: Vec<crate::llm::prompt::LlmProject>) -> Vec<crate::llm::prompt::LlmProject> {
+    let mut merged = true;
+    while merged {
+        merged = false;
+        let mut result: Vec<crate::llm::prompt::LlmProject> = Vec::new();
+        let mut skip = vec![false; projects.len()];
+        for i in 0..projects.len() {
+            if skip[i] { continue; }
+            let mut base = projects[i].clone();
+            for j in (i + 1)..projects.len() {
+                if skip[j] { continue; }
+                let same_species = base.species.as_deref() == projects[j].species.as_deref()
+                    && base.species.is_some();
+                let shared_prefix = common_prefix_len(&base.name, &projects[j].name) >= 4;
+                if same_species && shared_prefix {
+                    base.dirs.extend(projects[j].dirs.clone());
+                    // Merge summaries
+                    if let Some(ref s) = projects[j].summary {
+                        base.summary = Some(match base.summary {
+                            Some(ref existing) => format!("{}; {}", existing, s),
+                            None => s.clone(),
+                        });
+                    }
+                    skip[j] = true;
+                    merged = true;
+                }
+            }
+            result.push(base);
+        }
+        projects = result;
+    }
+    projects
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(ac, bc)| ac == bc).count()
+}
+
 fn generate_species_candidates(
     llm_client: &LlmClient,
     proj: &crate::llm::prompt::LlmProject,
@@ -284,16 +339,39 @@ fn generate_species_candidates(
         return vec![];
     }
     let prompt = format!(
-        "数据项目 '{}' 的物种未知。根据项目名和上下文，列出最可能的4个物种名，以逗号分隔，只返回物种名。\n项目名: {}\n描述: {}",
-        proj.name,
+        "List 4 most likely species names for this project, comma-separated, Latin binomial only. No explanation, no Chinese, no prefixes.\nProject: {}\nDescription: {}",
         proj.name,
         proj.summary.as_deref().unwrap_or("")
     );
-    match llm_client.infer_candidates(&prompt) {
-        Ok(candidates) => candidates,
+    let raw = match llm_client.infer_candidates(&prompt) {
+        Ok(c) => c,
         Err(e) => {
             warn!("Failed to generate candidates for {}: {}", proj.name, e);
-            vec![]
+            return vec![];
         }
-    }
+    };
+    // Clean: strip Chinese text, explanations, and non-species prefixes
+    raw.into_iter()
+        .filter_map(|s| {
+            let cleaned = s
+                // Remove Chinese characters and common prefixes
+                .chars()
+                .skip_while(|c| c.is_whitespace() || *c == '-' || *c == ':' || *c == '：')
+                .collect::<String>();
+            let cleaned = cleaned
+                .split('\n')
+                .last()  // Take last line if multi-line
+                .unwrap_or(&cleaned)
+                .trim()
+                .to_string();
+            // Keep only if it looks like a Latin binomial (two words, no Chinese)
+            let has_chinese = cleaned.chars().any(|c| c as u32 > 0x4E00);
+            let word_count = cleaned.split_whitespace().count();
+            if !cleaned.is_empty() && !has_chinese && word_count >= 2 && word_count <= 3 {
+                Some(cleaned)
+            } else {
+                None
+            }
+        })
+        .collect()
 }

@@ -26,7 +26,7 @@ pub struct LlmOutput {
     pub relations: Vec<LlmRelation>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LlmProject {
     #[serde(alias = "id")]
     pub name: String,

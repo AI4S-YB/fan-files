@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use fan_core::config::Config;
 
 #[derive(Parser)]
-#[command(name = "fan-files", version = "0.1.0", about = "intelligent file metadata search engine")]
+#[command(name = "fan-files", version = env!("CARGO_PKG_VERSION"), about = "intelligent file metadata search engine")]
 struct Cli {
     /// Use global (admin-managed) data layer
     #[arg(long, global = true)]

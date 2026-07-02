@@ -76,7 +76,7 @@ pub fn run() {
     }
 
     // Download
-    let asset_name = format!("fan-files-{}.tar.gz", target);
+    let asset_name = format!("fan-files-{}-{}.tar.gz", tag, target);
     let download_url = format!("{}/{}/{}", GITHUB_RELEASES, tag, asset_name);
     println!("  Downloading {}...", download_url);
 
