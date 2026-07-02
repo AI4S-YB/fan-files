@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use tracing::{info, warn};
 
 const MAX_DEPTH: u32 = 4;
-const START_DEPTH: u32 = 2;
+const START_DEPTH: u32 = 3;
 const LARGE_DIR_THRESHOLD: usize = 10_000;
 
 /// A node in the directory tree.
@@ -118,6 +118,7 @@ fn build_dir_tree(root: &str, depth: u32, all_files: &[(i64, String, i64)]) -> D
             }
         }
         root_node.subdirs.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+        root_node.subdirs.truncate(15); // keep top 15 by file count
     }
 
     root_node
@@ -198,22 +199,22 @@ fn tree_to_prompt(root: &DirNode, indent: usize) -> String {
 
     if root.is_large_flat {
         lines.push(format!(
-            "{}📁 {}/  ({} files, LARGE FLAT DIR — {} — skip deep listing)",
+            "{}📁 {}  ({} files, LARGE FLAT DIR — {} — skip deep listing)",
             prefix, root.name, root.file_count, ext_summary.join(", ")
         ));
     } else if root.subdirs.is_empty() {
         let sample_str = if root.samples.is_empty() {
             String::new()
         } else {
-            format!("  samples: {}", root.samples.join(", "))
+            format!("  e.g. {}", root.samples.iter().take(4).cloned().collect::<Vec<_>>().join(", "))
         };
         lines.push(format!(
-            "{}📁 {}/  ({} files: {}){}",
+            "{}📁 {}  ({} files: {}){}",
             prefix, root.name, root.file_count, ext_summary.join(", "), sample_str
         ));
     } else {
         lines.push(format!(
-            "{}📁 {}/  ({} files: {}, {} subdirs)",
+            "{}📁 {}  ({} files: {}, {} subdirs)",
             prefix, root.name, root.file_count, ext_summary.join(", "), root.subdirs.len()
         ));
     }
@@ -222,7 +223,6 @@ fn tree_to_prompt(root: &DirNode, indent: usize) -> String {
         if child.is_large_flat || !child.subdirs.is_empty() {
             lines.push(tree_to_prompt(child, indent + 1));
         } else {
-            // Leaf: show in compact form
             let ext_summary: Vec<String> = child.extensions.iter()
                 .map(|(e, c)| format!("{}×{}", e, c))
                 .collect();
@@ -232,7 +232,7 @@ fn tree_to_prompt(root: &DirNode, indent: usize) -> String {
                 format!("  e.g. {}", child.samples.iter().take(4).cloned().collect::<Vec<_>>().join(", "))
             };
             lines.push(format!(
-                "{}📁 {}/  ({} files: {}){}",
+                "{}📁 {}  ({} files: {}){}",
                 "  ".repeat(indent + 1), child.name, child.file_count,
                 ext_summary.join(", "), sample_str
             ));
@@ -282,17 +282,27 @@ pub fn run_hierarchical_inference(
     // Layer 2: Build prompt from tree and send to LLM
     let prompt_text = tree_to_prompt(&tree, 0);
     let full_prompt = format!(
-        "你是生物信息学数据管理助手。下面是一个数据目录的树状结构。请分析并返回JSON。\n\n\
+        "你是生物信息学数据管理助手。下面是一个数据目录的树状结构。\n\n\
+         任务: 推断每个目录属于什么物种、什么实验类型。\n\n\
          规则:\n\
-         1. 根据目录名和文件扩展名推断项目类型(assay_type)、物种(species)、置信度(high/medium/low)\n\
-         2. 将相关子目录合并为项目\n\
-         3. 标记明显不是生物数据的目录为 skip_reason\n\
-         4. 如果某个分支需要更深层查看,标记 need_deeper=true\n\
-         5. 对于大型扁平目录,根据目录名和少量样本判断即可\n\n\
+         1. 从目录名推断物种(如Oryza_sativa=水稻,Triticum_aestivum=小麦,Zea_mays=玉米,Glycine_max=大豆,Fungi=真菌)\n\
+         2. 从文件扩展名推断实验类型(fastq.gz=RNA-seq或WGS, vcf=variant_calling, fa/fna=genome, gff3/gtf=annotation)\n\
+         3. 同一物种的多个目录合并为一个项目(如Oryza_sativa和Oryza_sativa_multi应合并)\n\
+         4. 明显不是生信数据的目录标记skip_reason(如code/scripts/testdata/.pnpm-store)\n\
+         5. 每个项目输出: name, dirs(数组), assay_type, species, species_confidence, summary\n\n\
          目录树:\n{}", prompt_text
     );
 
-    let system_prompt = crate::llm::prompt::system_prompt();
+    let system_prompt = "你是生物信息学数据管理助手。用户提供一个扫描根目录的树状结构，\
+        包含每个子目录的文件数量、扩展名分布和代表性文件名。\n\n\
+        你的任务:\n\
+        1. 识别每个顶层目录对应的生物学项目(物种+实验类型)\n\
+        2. 将明显不是生信数据的目录标记skip:true(如code, venv, testdata, .pnpm-store, scripts)\n\
+        3. 同一物种/项目的多个目录合并(如Oryza_sativa和Oryza_sativa_multi)\n\
+        4. 对无法确定物种的目录，从目录名+文件名推断\n\n\
+        输出JSON格式:\n\
+        {\"projects\":[{\"name\":\"项目名\",\"dirs\":[\"子目录路径\"],\"assay_type\":\"RNA-seq|WGS|genome_annotation|variant_calling|epigenomics|transcriptomics|phenomics|germplasm\",\
+        \"species\":\"物种拉丁名\",\"species_confidence\":\"high|medium|low\",\"summary\":\"描述\",\"skip\":false}]}";
     let body = serde_json::json!({
         "model": llm_client.config.model,
         "messages": [
@@ -351,15 +361,23 @@ pub fn run_hierarchical_inference(
         ) {
             Ok(proj_id) => {
                 projects_created += 1;
-                // Link files under project dirs
+                // Link files: try dir as-is, also try as sub-path of scan_root
                 for dir in &dirs {
+                    let candidates = vec![
+                        dir.clone(),
+                        format!("{}/{}", scan_root.trim_end_matches('/'), dir.trim_start_matches('/')),
+                    ];
                     for (file_id, file_path, _) in &all_files {
-                        if file_path.starts_with(dir) {
-                            project_store.link_file(proj_id, *file_id).ok();
-                            files_updated += 1;
+                        for candidate in &candidates {
+                            if file_path.starts_with(candidate) {
+                                project_store.link_file(proj_id, *file_id).ok();
+                                files_updated += 1;
+                                break;
+                            }
                         }
                     }
                 }
+                eprintln!("  📦 {} ({} dirs)", name, dirs.len());
             }
             Err(e) => warn!("Failed to insert project {}: {}", name, e),
         }
