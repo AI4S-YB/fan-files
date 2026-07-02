@@ -12,8 +12,8 @@ use crate::project::ProjectStore;
 use std::collections::HashMap;
 use tracing::{info, warn};
 
-const MAX_DEPTH: u32 = 4;
-const START_DEPTH: u32 = 3;
+const PHASE1_DEPTH: u32 = 3;
+const PHASE2_DEPTH: u32 = 5;
 const LARGE_DIR_THRESHOLD: usize = 10_000;
 
 /// A node in the directory tree.
@@ -272,12 +272,9 @@ pub fn run_hierarchical_inference(
 
     let all_files = sqlite.all_paths().unwrap_or_default();
 
-    // Layer 1: Build tree at adaptive depth
-    let current_depth = START_DEPTH;
-    let tree = build_dir_tree(scan_root, current_depth, &all_files);
-
-    eprintln!("  Hierarchical inference: tree depth {}", current_depth);
-    eprintln!("  {} ({} files, {} subdirs)", tree.name, tree.file_count, tree.subdirs.len());
+    // Phase 1: build tree at depth 3, let LLM classify
+    let tree = build_dir_tree(scan_root, PHASE1_DEPTH, &all_files);
+    eprintln!("  Phase 1: depth {} tree ({} subdirs)", PHASE1_DEPTH, tree.subdirs.len());
 
     // Layer 2: Build prompt from tree and send to LLM
     let prompt_text = tree_to_prompt(&tree, 0);
@@ -314,20 +311,93 @@ pub fn run_hierarchical_inference(
         "max_tokens": 16384
     });
 
-    eprintln!("  Sending tree to LLM ({} chars)...", full_prompt.len());
+    eprintln!("  Phase 1: sending depth-{} tree to LLM ({} chars)...", PHASE1_DEPTH, full_prompt.len());
 
-    // Use the retry-capable API call from llm module
+    // Phase 1: get top-level classification
     let response: serde_json::Value = crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 3)?;
     let content = response["choices"][0]["message"]["content"]
         .as_str().ok_or("No content in LLM response")?;
 
-    // Parse the response
     let output: serde_json::Value = serde_json::from_str(content)
         .map_err(|e| format!("Failed to parse LLM JSON: {}", e))?;
 
     let empty_projects = vec![];
-    let projects = output["projects"].as_array()
-        .unwrap_or(&empty_projects);
+    let mut projects = output["projects"].as_array()
+        .map(|a| a.clone())
+        .unwrap_or(empty_projects.clone());
+
+    // Phase 2: for non-skipped branches with subdirs, do deep-dive at PHASE2_DEPTH
+    let phase1_count = projects.len();
+    let mut phase2_count = 0;
+    let mut deep_projects: Vec<serde_json::Value> = Vec::new();
+
+    for child in &tree.subdirs {
+        // Skip if Phase 1 already marked this as skipped, or if no subdirs to expand
+        let already_skipped = projects.iter().any(|p| {
+            let dirs = p["dirs"].as_array().map(|a| a.iter().any(|d| {
+                d.as_str().map_or(false, |s| s == &child.name || s.ends_with(&format!("/{}", child.name)))
+            })).unwrap_or(false);
+            p["skip"].as_bool().unwrap_or(false) && dirs
+        });
+        if already_skipped || child.subdirs.is_empty() || child.is_large_flat {
+            continue;
+        }
+
+        // Build deep tree for this branch
+        let subdir_files: Vec<_> = all_files.iter()
+            .filter(|(_, p, _)| p.starts_with(&format!("{}/", child.path)))
+            .cloned()
+            .collect();
+        if subdir_files.len() < 50 { continue; } // too small to matter
+
+        let deep_node = build_dir_tree_inner(&child.path, PHASE2_DEPTH, &subdir_files);
+        let deep_prompt = tree_to_prompt(&deep_node, 0);
+        if deep_prompt.len() < 200 { continue; } // nothing meaningful
+
+        let deep_full = format!(
+            "你是生物信息学数据管理助手。下面是一个子目录的深层树状结构。\n\
+             请推断其中包含的数据项目(物种+实验类型)，同一基因组的不同分析版本应合并。\n\
+             明显不是生物数据的标记skip:true。输出JSON projects数组。\n\n{}",
+            deep_prompt
+        );
+
+        eprintln!("  Phase 2: deep-dive {} ({} chars)...", child.name, deep_full.len());
+        match crate::llm::llm_api_call_with_retry(&llm_client.config, &serde_json::json!({
+            "model": llm_client.config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": deep_full}
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+            "max_tokens": 16384
+        }), 3) {
+            Ok(deep_resp) => {
+                let deep_content = deep_resp["choices"][0]["message"]["content"].as_str().unwrap_or("");
+                if let Ok(deep_output) = serde_json::from_str::<serde_json::Value>(deep_content) {
+                    if let Some(deep_arr) = deep_output["projects"].as_array() {
+                        deep_projects.extend(deep_arr.clone());
+                        phase2_count += deep_arr.len();
+                    }
+                }
+            }
+            Err(e) => warn!("  Phase 2 failed for {}: {}", child.name, e),
+        }
+    }
+
+    // Merge: Phase 1 projects + Phase 2 deep projects
+    if !deep_projects.is_empty() {
+        // Filter Phase 1: remove shallow projects whose branches got deep-dived
+        let deep_names: Vec<&str> = deep_projects.iter()
+            .filter_map(|p| p["name"].as_str()).collect();
+        projects.retain(|p| {
+            let name = p["name"].as_str().unwrap_or("");
+            let skip = p["skip"].as_bool().unwrap_or(false);
+            skip || !deep_names.iter().any(|dn| name.contains(dn) || dn.contains(name))
+        });
+        projects.extend(deep_projects);
+        eprintln!("  Merged: {} phase-1 + {} phase-2 projects", phase1_count, phase2_count);
+    }
 
     let mut projects_created = 0;
     let mut files_updated = 0;
