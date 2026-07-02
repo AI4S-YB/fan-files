@@ -55,8 +55,12 @@ enum Commands {
     },
     /// Show index status
     Status,
-    /// Run LLM inference on indexed files
-    Infer,
+    /// Run LLM inference on indexed files (default: hierarchical tree mode)
+    Infer {
+        /// Use flat file-by-file mode (legacy)
+        #[arg(long)]
+        flat: bool,
+    },
     /// List projects, or show details if a project name is given
     Projects {
         #[command(subcommand)]
@@ -147,7 +151,13 @@ fn main() {
         Commands::List { category, tag, server, json } => commands::list::run(&config, &layer, category.as_deref(), tag.as_deref(), server.as_deref(), json),
         Commands::Info { path, json } => commands::info::run(&config, &layer, &path, json),
         Commands::Status => commands::status::run(&config, &layer),
-        Commands::Infer => commands::infer::run(&config, &layer),
+        Commands::Infer { flat } => {
+            if flat {
+                commands::infer::run_flat(&config, &layer);
+            } else {
+                commands::infer::run(&config, &layer);
+            }
+        },
         Commands::Projects { action } => match action {
             Some(ProjectAction::Show { name }) => commands::projects::run(&config, &layer, Some(name.as_str())),
             Some(ProjectAction::Update { name, species, confidence, assay_type }) => {

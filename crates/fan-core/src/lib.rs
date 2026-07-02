@@ -3,6 +3,7 @@ pub mod detector;
 pub mod index;
 pub use index::IndexMode;
 pub mod infer;
+pub mod infer_hierarchical;
 pub mod interpreter;
 pub mod llm;
 pub mod plugin;

@@ -1,11 +1,20 @@
 use fan_core::config::{Config, DataLayer};
 use fan_core::infer;
+use fan_core::infer_hierarchical;
 use fan_core::index::sqlite::SqliteStore;
 use fan_core::llm::LlmClient;
 use fan_core::project::ProjectStore;
 use std::sync::Arc;
 
 pub fn run(config: &Config, layer: &DataLayer) {
+    run_inner(config, layer, true); // hierarchical by default
+}
+
+pub fn run_flat(config: &Config, layer: &DataLayer) {
+    run_inner(config, layer, false);
+}
+
+fn run_inner(config: &Config, layer: &DataLayer, hierarchical: bool) {
     let llm_client = LlmClient::new(config.llm.clone());
     if !llm_client.is_configured() {
         eprintln!("LLM not configured.");
@@ -17,7 +26,6 @@ pub fn run(config: &Config, layer: &DataLayer) {
         return;
     }
 
-    // Open only SQLite — skip Tantivy (mmap) and ONNX (90MB) to save memory
     let data_dir = match layer {
         DataLayer::User => fan_core::config::dirs_fan().join("data"),
         DataLayer::Global => fan_core::config::dirs_fan_global().join("data"),
@@ -31,10 +39,22 @@ pub fn run(config: &Config, layer: &DataLayer) {
     };
 
     let project_store = ProjectStore::new(Arc::clone(&sqlite.conn));
-    let scan_root = config.scan.include.first().map(|s| s.as_str()).unwrap_or("/");
+    // Resolve scan root: prefer servers config, then scan.include, then "/"
+    let servers = config.enabled_servers();
+    let scan_root = servers.first()
+        .and_then(|(_, cfg)| cfg.scan_roots.first().map(|s| s.as_str()))
+        .or_else(|| config.scan.include.first().map(|s| s.as_str()))
+        .unwrap_or("/");
 
     println!("Running LLM inference on indexed files...");
-    match infer::run_inference(&sqlite, &project_store, &llm_client, scan_root) {
+
+    let result = if hierarchical {
+        infer_hierarchical::run_hierarchical_inference(&sqlite, &project_store, &llm_client, scan_root)
+    } else {
+        infer::run_inference(&sqlite, &project_store, &llm_client, scan_root)
+    };
+
+    match result {
         Ok((projects, relations)) => {
             println!("Inference complete: {} projects, {} relations", projects, relations);
             if let Ok(all_projects) = project_store.all() {

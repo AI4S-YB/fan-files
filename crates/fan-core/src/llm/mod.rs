@@ -5,7 +5,7 @@ use prompt::{LlmOutput, system_prompt};
 use tracing::info;
 
 pub struct LlmClient {
-    config: LlmConfig,
+    pub config: LlmConfig,
 }
 
 impl LlmClient {
@@ -71,7 +71,7 @@ impl LlmClient {
 }
 
 /// Call LLM API with retry on 5xx / timeout errors.
-fn llm_api_call_with_retry(
+pub(crate) fn llm_api_call_with_retry(
     config: &LlmConfig,
     body: &serde_json::Value,
     max_retries: u32,
