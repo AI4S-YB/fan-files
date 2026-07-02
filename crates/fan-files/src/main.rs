@@ -19,7 +19,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start daemon (scan + watch + serve)
-    Daemon,
+    Daemon {
+        /// Skip per-file interpretation and embedding (fast index-only scan)
+        #[arg(long)]
+        scan_only: bool,
+    },
     /// Search files by natural language query
     Search {
         query: String,
@@ -131,7 +135,13 @@ fn main() {
     });
 
     match cli.command {
-        Commands::Daemon => commands::daemon::run(&config, &layer),
+        Commands::Daemon { scan_only } => {
+            if scan_only {
+                commands::daemon::run_scan_only(&config, &layer);
+            } else {
+                commands::daemon::run(&config, &layer);
+            }
+        },
         Commands::Search { query, json } => commands::search::run(&config, &layer, &query, json),
         Commands::Suggest { path, json } => commands::suggest::run(&config, &path, json),
         Commands::List { category, tag, server, json } => commands::list::run(&config, &layer, category.as_deref(), tag.as_deref(), server.as_deref(), json),

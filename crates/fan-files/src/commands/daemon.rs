@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use fan_core::config::{Config, DataLayer};
 use fan_core::detector::BuiltinDetector;
 use fan_core::infer;
@@ -16,6 +19,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 pub fn run(config: &Config, layer: &DataLayer) {
+    run_inner(config, layer, false);
+}
+
+pub fn run_scan_only(config: &Config, layer: &DataLayer) {
+    run_inner(config, layer, true);
+}
+
+fn run_inner(config: &Config, layer: &DataLayer, scan_only: bool) {
     info!("Starting fan-files daemon...");
 
     let index = match fan_core::index::open_index_for_layer(config, layer, fan_core::index::IndexMode::ReadWrite) {
@@ -47,7 +58,7 @@ pub fn run(config: &Config, layer: &DataLayer) {
                 name.clone(),
             );
             info!("Starting local scan: {} ({})", name, cfg.scan_roots.join(", "));
-            run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
+            run_full_scan(&index, &scanner, &plugins, &interpreter_registry, scan_only);
         } else {
             let remote = RemoteScanner::new(
                 name.clone(),
@@ -143,7 +154,7 @@ pub fn run(config: &Config, layer: &DataLayer) {
                         config.scan.exclude.clone(),
                         name.clone(),
                     );
-                    run_full_scan(&index, &scanner, &plugins, &interpreter_registry);
+                    run_full_scan(&index, &scanner, &plugins, &interpreter_registry, scan_only);
                 }
             }
             // Rescan remote
@@ -293,8 +304,10 @@ fn run_full_scan(
     scanner: &Scanner,
     plugins: &PluginRegistry,
     interpreter_registry: &InterpreterRegistry,
+    scan_only: bool,
 ) {
-    info!("Starting full scan...");
+    let mode = if scan_only { "scan-only" } else { "full" };
+    info!("Starting {} scan...", mode);
     let start = Instant::now();
     let mut count = 0u64;
     for file_info in scanner.scan() {
@@ -305,29 +318,27 @@ fn run_full_scan(
         match index.index_file(&file_info, format_info.as_ref()) {
             Ok(file_id) => {
                 count += 1;
-                // Run context interpretation after indexing
-                run_interpretation(
-                    index,
-                    file_id,
-                    file_info.path.as_ref(),
-                    format_info.as_ref(),
-                    interpreter_registry,
-                );
-                // Generate and store embedding
-                run_embedding(index, file_id, file_info.path.as_ref());
+                if !scan_only {
+                    run_interpretation(
+                        index, file_id, file_info.path.as_ref(),
+                        format_info.as_ref(), interpreter_registry,
+                    );
+                    run_embedding(index, file_id, file_info.path.as_ref());
+                }
             }
             Err(e) => error!("Failed to index {}: {}", file_info.path.display(), e),
         }
     }
     index.tantivy.commit().ok();
     info!(
-        "Full scan complete: {} files indexed in {:.1}s",
-        count,
-        start.elapsed().as_secs_f64()
+        "{} scan complete: {} files indexed in {:.1}s",
+        mode, count, start.elapsed().as_secs_f64()
     );
 }
 
-/// Build a FileContext from a file path, its format info, and its surrounding directory
+/// Build a FileContext from a file path, its format info, and its surrounding directory.
+/// NOTE: siblings is always empty — list_siblings() is O(N) per directory and was
+/// never consumed by any interpreter. Kept as empty for backward compat.
 fn build_file_context(
     file_path: &Path,
     format_info: Option<&FormatInfo>,
@@ -336,14 +347,29 @@ fn build_file_context(
 
     FileContext {
         file_path: file_path.to_string_lossy().to_string(),
-        siblings: interpreter::list_siblings(file_path),
+        siblings: Vec::new(), // Dead code — no interpreter reads this; removing O(N) list_siblings call
         directory_tree: interpreter::directory_tree(file_path, 3),
-        metadata_files: interpreter::find_metadata_files(file_path),
-        file_header_b64: String::new(), // Skip for MVP
+        metadata_files: find_metadata_files_cached(file_path),
+        file_header_b64: String::new(),
         format_tags: format_info
             .map(|f| vec![f.file_type.clone()])
             .unwrap_or_default(),
     }
+}
+
+/// Cached wrapper around interpreter::find_metadata_files.
+/// Same directory's metadata files are identical — cache per parent dir.
+fn find_metadata_files_cached(file_path: &Path) -> Vec<String> {
+    use std::sync::LazyLock;
+    static CACHE: LazyLock<Mutex<HashMap<std::path::PathBuf, Vec<String>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let parent = file_path.parent().unwrap_or(Path::new("/"));
+    let mut cache = CACHE.lock().unwrap();
+    cache
+        .entry(parent.to_path_buf())
+        .or_insert_with(|| fan_core::interpreter::find_metadata_files(file_path))
+        .clone()
 }
 
 /// Run context interpretation on an indexed file and store bio metadata
