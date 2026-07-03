@@ -15,6 +15,8 @@ use tracing::{info, warn};
 const PHASE1_DEPTH: u32 = 3;
 const PHASE2_DEPTH: u32 = 5;
 const LARGE_DIR_THRESHOLD: usize = 10_000;
+const COMPRESS_THRESHOLD: usize = 200;
+const SMART_SAMPLE_COUNT: usize = 5;
 
 /// A node in the directory tree.
 #[derive(Debug, Clone)]
@@ -33,6 +35,62 @@ struct DirNode {
     subdirs: Vec<DirNode>,
     /// True if this is a large flat dir (no further recursion needed)
     is_large_flat: bool,
+}
+
+/// Compress a large directory node by reducing sample count and using pattern descriptions.
+/// For dirs with >COMPRESS_THRESHOLD files, samples are reduced to representative entries
+/// grouped by extension, with filename patterns detected.
+fn compress_node(node: &mut DirNode) {
+    if node.file_count <= COMPRESS_THRESHOLD { return; }
+
+    // Group samples by extension, pick up to SMART_SAMPLE_COUNT per group
+    let mut by_ext: HashMap<String, Vec<String>> = HashMap::new();
+    for sample in &node.samples {
+        let ext = file_extension(sample);
+        by_ext.entry(ext).or_default().push(sample.clone());
+    }
+
+    let mut compressed = Vec::new();
+    for (ext, names) in &by_ext {
+        let count = node.extensions.iter()
+            .find(|(e, _)| e == ext)
+            .map(|(_, c)| *c)
+            .unwrap_or(names.len());
+
+        // Pick diverse samples (prefer different filename prefixes)
+        let samples = smart_sample(names, SMART_SAMPLE_COUNT);
+
+        compressed.push(format!("{}×{} [{}]", ext, count, samples.join(", ")));
+    }
+
+    // Replace samples with compressed pattern description
+    node.samples = vec![compressed.join("; ")];
+    node.file_count = 1; // Signal to LLM: this is a compressed summary
+}
+
+/// Pick up to N diverse samples, preferring different filename prefixes.
+fn smart_sample(names: &[String], n: usize) -> Vec<String> {
+    if names.len() <= n { return names.to_vec(); }
+    let mut result: Vec<String> = Vec::new();
+    let mut seen_prefixes: Vec<String> = Vec::new();
+
+    for name in names {
+        if result.len() >= n { break; }
+        // Extract prefix: everything before the first digit or underscore-number
+        let prefix = name.chars()
+            .take_while(|c| !c.is_ascii_digit())
+            .collect::<String>();
+        let short_prefix = prefix.trim_end_matches('_').to_string();
+
+        // Prioritize names with different prefixes (catches paired-end patterns)
+        if !seen_prefixes.contains(&short_prefix) || result.len() < n {
+            result.push(name.clone());
+            if !seen_prefixes.contains(&short_prefix) {
+                seen_prefixes.push(short_prefix);
+            }
+        }
+    }
+    result
 }
 
 /// Build a directory tree from the SQLite index, to a given depth.
@@ -97,10 +155,14 @@ fn build_dir_tree(root: &str, depth: u32, all_files: &[(i64, String, i64)]) -> D
     ext_vec.truncate(5);
     root_node.extensions = ext_vec;
 
-    // Mark large flat dirs
+    // Mark large flat dirs and compress
     if root_node.file_count > LARGE_DIR_THRESHOLD {
         root_node.is_large_flat = true;
-        return root_node; // Don't recurse into subdirs for large dirs
+        compress_node(&mut root_node);
+        return root_node;
+    }
+    if root_node.file_count > COMPRESS_THRESHOLD {
+        compress_node(&mut root_node);
     }
 
     // Build subdirectory nodes (if depth > 1)
@@ -197,30 +259,50 @@ fn tree_to_prompt(root: &DirNode, indent: usize) -> String {
         .map(|(e, c)| format!("{}×{}", e, c))
         .collect();
 
+    // Check if compressed (samples are pattern strings, not filenames)
+    let is_compressed = root.samples.len() == 1 && root.file_count == 1
+        && root.samples[0].contains('×');
+
     if root.is_large_flat {
+        let compressed_info = if is_compressed {
+            format!(" — {}", root.samples[0])
+        } else { String::new() };
         lines.push(format!(
-            "{}📁 {}  ({} files, LARGE FLAT DIR — {} — skip deep listing)",
-            prefix, root.name, root.file_count, ext_summary.join(", ")
+            "{}📁 {}  (LARGE FLAT DIR{} — skip deep listing)",
+            prefix, root.name, compressed_info
         ));
     } else if root.subdirs.is_empty() {
-        let sample_str = if root.samples.is_empty() {
-            String::new()
+        if is_compressed {
+            lines.push(format!(
+                "{}📁 {}  ({})",
+                prefix, root.name, root.samples[0]
+            ));
         } else {
-            format!("  e.g. {}", root.samples.iter().take(4).cloned().collect::<Vec<_>>().join(", "))
-        };
-        lines.push(format!(
-            "{}📁 {}  ({} files: {}){}",
-            prefix, root.name, root.file_count, ext_summary.join(", "), sample_str
-        ));
+            let sample_str = if root.samples.is_empty() {
+                String::new()
+            } else {
+                format!("  e.g. {}", root.samples.join(", "))
+            };
+            lines.push(format!(
+                "{}📁 {}  ({} files: {}){}",
+                prefix, root.name, root.file_count, ext_summary.join(", "), sample_str
+            ));
+        }
     } else {
+        let compressed_info = if is_compressed {
+            format!(" [{}]", root.samples[0])
+        } else { String::new() };
         lines.push(format!(
-            "{}📁 {}  ({} files: {}, {} subdirs)",
-            prefix, root.name, root.file_count, ext_summary.join(", "), root.subdirs.len()
+            "{}📁 {}/  ({} files: {}, {} subdirs){}",
+            prefix, root.name, root.file_count, ext_summary.join(", "), root.subdirs.len(), compressed_info
         ));
     }
 
     for child in &root.subdirs {
-        if child.is_large_flat || !child.subdirs.is_empty() {
+        let child_is_compressed = child.samples.len() == 1 && child.file_count == 1
+            && child.samples[0].contains('×');
+
+        if child.is_large_flat || !child.subdirs.is_empty() || child_is_compressed {
             lines.push(tree_to_prompt(child, indent + 1));
         } else {
             let ext_summary: Vec<String> = child.extensions.iter()
@@ -229,7 +311,7 @@ fn tree_to_prompt(root: &DirNode, indent: usize) -> String {
             let sample_str = if child.samples.is_empty() {
                 String::new()
             } else {
-                format!("  e.g. {}", child.samples.iter().take(4).cloned().collect::<Vec<_>>().join(", "))
+                format!("  e.g. {}", child.samples.join(", "))
             };
             lines.push(format!(
                 "{}📁 {}  ({} files: {}){}",
@@ -254,6 +336,16 @@ fn file_extension(path: &str) -> String {
         name[pos+1..].to_lowercase()
     } else {
         "(noext)".to_string()
+    }
+}
+
+/// Recursively compress large subdirectories in a tree.
+fn compress_large_subdirs(node: &mut DirNode) {
+    if node.file_count > COMPRESS_THRESHOLD {
+        compress_node(node);
+    }
+    for child in &mut node.subdirs {
+        compress_large_subdirs(child);
     }
 }
 
@@ -326,86 +418,95 @@ pub fn run_hierarchical_inference(
         .map(|a| a.clone())
         .unwrap_or(empty_projects.clone());
 
-    // Phase 2: for branches WITH significant hidden depth, deep-dive at PHASE2_DEPTH
-    // Only trigger when a branch has many subdirs at the truncation boundary
-    // (indicating there's more structure below that Phase 1 couldn't see)
+    // Phase 2: adaptive recursion — for branches with hidden depth, expand
     let phase1_count = projects.len();
     let mut phase2_count = 0;
     let mut deep_projects: Vec<serde_json::Value> = Vec::new();
 
-    // Count total Phase 2 candidates for progress
     let phase2_candidates: Vec<_> = tree.subdirs.iter()
         .filter(|c| !c.subdirs.is_empty() && !c.is_large_flat)
-        .filter(|c| c.subdirs.len() >= 3) // only if there's significant hidden depth
+        .filter(|c| c.subdirs.len() >= 2) // branch has meaningful hidden depth
         .collect();
+
     if !phase2_candidates.is_empty() {
-        eprintln!("  Phase 2: deep-diving {} branches with hidden depth...", phase2_candidates.len());
+        eprintln!("  Phase 2: deep-diving {} branches (with compression)...", phase2_candidates.len());
     }
 
     for child in &tree.subdirs {
-        // Skip if no subdirs or not enough hidden depth
-        if child.subdirs.len() < 3 || child.is_large_flat { continue; }
-        // Skip if Phase 1 already marked this as skipped
+        if child.subdirs.len() < 2 || child.is_large_flat { continue; }
         let already_skipped = projects.iter().any(|p| {
             let dirs = p["dirs"].as_array().map(|a| a.iter().any(|d| {
                 d.as_str().map_or(false, |s| s == &child.name || s.ends_with(&format!("/{}", child.name)))
             })).unwrap_or(false);
             p["skip"].as_bool().unwrap_or(false) && dirs
         });
-        if already_skipped || child.subdirs.is_empty() || child.is_large_flat {
-            continue;
-        }
+        if already_skipped { continue; }
 
-        // Build deep tree for this branch
         let subdir_files: Vec<_> = all_files.iter()
             .filter(|(_, p, _)| p.starts_with(&format!("{}/", child.path)))
             .cloned()
             .collect();
-        if subdir_files.len() < 50 { continue; } // too small to matter
+        if subdir_files.len() < 50 { continue; }
 
-        let deep_node = build_dir_tree_inner(&child.path, PHASE2_DEPTH, &subdir_files);
+        // Adaptive depth: build at depth 5, compress large dirs
+        let mut deep_node = build_dir_tree_inner(&child.path, PHASE2_DEPTH, &subdir_files);
+        compress_large_subdirs(&mut deep_node);
         let deep_prompt = tree_to_prompt(&deep_node, 0);
         if deep_prompt.len() < 200 { continue; }
-        if deep_prompt.len() > 50_000 {
-            // Too large — the branch is too complex for a single deep-dive
-            eprintln!("  Phase 2: skipping {} (prompt {} chars, too large)", child.name, deep_prompt.len());
-            continue;
-        }
 
-        let deep_full = format!(
-            "你是生物信息学数据管理助手。下面是一个子目录的深层树状结构。\n\
-             请推断其中包含的数据项目(物种+实验类型)，同一基因组的不同分析版本应合并。\n\
-             明显不是生物数据的标记skip:true。输出JSON projects数组。\n\n{}",
-            deep_prompt
-        );
+        // If still too large after compression, split into top-level sub-branches
+        let final_prompts: Vec<(String, String)> = if deep_prompt.len() > 100_000 {
+            // Split: each major subdir becomes its own mini-prompt
+            deep_node.subdirs.iter()
+                .filter(|s| s.file_count > 0)
+                .map(|s| {
+                    let mut mini = deep_node.clone();
+                    mini.subdirs = vec![s.clone()];
+                    mini.name = format!("{}/{}", child.name, s.name);
+                    (mini.name.clone(), tree_to_prompt(&mini, 0))
+                })
+                .filter(|(_, p)| p.len() >= 200 && p.len() < 100_000)
+                .collect()
+        } else {
+            vec![(child.name.clone(), deep_prompt)]
+        };
 
-        eprintln!("  Phase 2: deep-dive {} ({} chars)...", child.name, deep_full.len());
-        match crate::llm::llm_api_call_with_retry(&llm_client.config, &serde_json::json!({
-            "model": llm_client.config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": deep_full}
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-            "max_tokens": 16384
-        }), 3) {
-            Ok(deep_resp) => {
-                let deep_content = deep_resp["choices"][0]["message"]["content"].as_str().unwrap_or("");
-                if let Ok(deep_output) = serde_json::from_str::<serde_json::Value>(deep_content) {
-                    if let Some(deep_arr) = deep_output["projects"].as_array() {
-                        deep_projects.extend(deep_arr.clone());
-                        phase2_count += deep_arr.len();
+        for (sub_name, prompt) in &final_prompts {
+            let deep_full = format!(
+                "你是生物信息学数据管理助手。下面是一个子目录的深层树状结构(深度5)。\n\
+                 大目录已被压缩为'扩展名×数量 [样本1, 样本2...]'格式。\n\
+                 请推断其中包含的数据项目(物种+实验类型)，同一基因组的不同分析版本应合并。\n\
+                 明显不是生物数据的标记skip:true。输出JSON projects数组。\n\n{}",
+                prompt
+            );
+
+            eprintln!("  Phase 2: {} ({} chars)...", sub_name, deep_full.len());
+            match crate::llm::llm_api_call_with_retry(&llm_client.config, &serde_json::json!({
+                "model": llm_client.config.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": deep_full}
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.1,
+                "max_tokens": 16384
+            }), 3) {
+                Ok(deep_resp) => {
+                    let deep_content = deep_resp["choices"][0]["message"]["content"].as_str().unwrap_or("");
+                    if let Ok(deep_output) = serde_json::from_str::<serde_json::Value>(deep_content) {
+                        if let Some(deep_arr) = deep_output["projects"].as_array() {
+                            deep_projects.extend(deep_arr.clone());
+                            phase2_count += deep_arr.len();
+                        }
                     }
                 }
+                Err(e) => warn!("  Phase 2 failed for {}: {}", sub_name, e),
             }
-            Err(e) => warn!("  Phase 2 failed for {}: {}", child.name, e),
         }
     }
 
-    // Merge: Phase 1 projects + Phase 2 deep projects
+    // Merge: remove shallow Phase 1 projects that were deep-dived in Phase 2
     if !deep_projects.is_empty() {
-        // Filter Phase 1: remove shallow projects whose branches got deep-dived
         let deep_names: Vec<&str> = deep_projects.iter()
             .filter_map(|p| p["name"].as_str()).collect();
         projects.retain(|p| {
