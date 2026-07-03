@@ -600,7 +600,7 @@ pub fn run_hierarchical_inference(
         path_to_id.insert(path.clone(), *id);
     }
 
-    for proj_val in projects {
+    for proj_val in &projects {
         let name = proj_val["name"].as_str().unwrap_or("unnamed");
         let dirs: Vec<String> = proj_val["dirs"].as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -647,6 +647,95 @@ pub fn run_hierarchical_inference(
         }
     }
 
-    eprintln!("  ✅ Hierarchical: {} projects, {} files tagged", projects_created, files_updated);
+    // Step: back-sync project-level metadata to individual files (batched)
+    let back_sync_count = back_sync_metadata(sqlite, &all_files, &projects, scan_root);
+    files_updated += back_sync_count;
+    eprintln!("  ✅ Hierarchical: {} projects, {} files tagged, {} back-synced",
+        projects_created, files_updated, back_sync_count);
     Ok((projects_created, 0))
+}
+
+/// Batch back-sync project metadata (species, assay_type, project name) to files.
+/// Uses a single pre-built HashMap lookup instead of O(projects × files) loops.
+fn back_sync_metadata(
+    sqlite: &SqliteStore,
+    all_files: &[(i64, String, i64)],
+    projects: &[serde_json::Value],
+    scan_root: &str,
+) -> usize {
+    // Build dir → (species, assay_type, project_name) map
+    let mut dir_meta: HashMap<String, (String, String, String)> = HashMap::new();
+    for proj in projects {
+        if proj["skip"].as_bool().unwrap_or(false) { continue; }
+        let name = proj["name"].as_str().unwrap_or("");
+        let species = proj["species"].as_str().unwrap_or("");
+        let assay = proj["assay_type"].as_str().unwrap_or("");
+        if species.is_empty() && assay.is_empty() { continue; }
+        if let Some(dirs) = proj["dirs"].as_array() {
+            for dir_val in dirs {
+                if let Some(dir) = dir_val.as_str() {
+                    let candidates = vec![
+                        dir.to_string(),
+                        format!("{}/{}", scan_root.trim_end_matches('/'), dir.trim_start_matches('/')),
+                    ];
+                    for d in candidates {
+                        dir_meta.entry(d).or_insert_with(||
+                            (species.to_string(), assay.to_string(), name.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    if dir_meta.is_empty() { return 0; }
+
+    // Build reverse index: dir → Vec<file_id>
+    let mut dir_files: HashMap<String, Vec<i64>> = HashMap::new();
+    for (dir, _) in &dir_meta {
+        dir_files.insert(dir.clone(), Vec::new());
+    }
+    for (file_id, file_path, _) in all_files {
+        for (dir, files) in &mut dir_files {
+            if file_path.starts_with(dir.as_str()) {
+                files.push(*file_id);
+                break; // assign to first matching dir
+            }
+        }
+    }
+
+    // Batch update: within a single transaction, UPDATE each file
+    let conn = sqlite.conn.lock().unwrap();
+    conn.execute_batch("BEGIN TRANSACTION;").ok();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+    let mut stmt = conn.prepare(
+        "UPDATE files SET bio_metadata_json=?1, updated_at=?2 WHERE id=?3"
+    ).ok();
+
+    let mut count = 0;
+    for (dir, file_ids) in &dir_files {
+        if file_ids.is_empty() { continue; }
+        if let Some((species, assay, proj_name)) = dir_meta.get(dir) {
+            let meta = serde_json::json!({
+                "assay_type": assay,
+                "species": species,
+                "project": proj_name,
+                "tags": []
+            });
+            let meta_str = serde_json::to_string(&meta).unwrap_or_default();
+            if let Some(ref mut stmt) = stmt {
+                for file_id in file_ids {
+                    if stmt.execute(rusqlite::params![meta_str, now, file_id]).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    conn.execute_batch("COMMIT;").ok();
+    if count > 0 {
+        eprintln!("  Back-synced metadata to {} files across {} dirs (batched)", count, dir_files.len());
+    }
+    count
 }
