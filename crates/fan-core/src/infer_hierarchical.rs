@@ -384,7 +384,7 @@ fn build_recursive_deep(path: &str, files: &[(i64, String, i64)]) -> DirNode {
 fn expand_hidden_branches(node: &mut DirNode, all_files: &[(i64, String, i64)], current_depth: u32) {
     if current_depth >= MAX_RECURSE_DEPTH { return; }
     for child in &mut node.subdirs {
-        if child.subdirs.len() >= 2 && !child.is_large_flat {
+        if child.subdirs.len() >= 1 && !child.is_large_flat {
             // Has hidden depth — rebuild this branch 2 levels deeper
             let sub_files: Vec<_> = all_files.iter()
                 .filter(|(_, p, _)| p.starts_with(&format!("{}/", child.path)))
