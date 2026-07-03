@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use tracing::{info, warn};
 
 const PHASE1_DEPTH: u32 = 3;
-const PHASE2_DEPTH: u32 = 5;
+const PHASE2_START_DEPTH: u32 = 4;
+const MAX_RECURSE_DEPTH: u32 = 8;
 const LARGE_DIR_THRESHOLD: usize = 10_000;
 const COMPRESS_THRESHOLD: usize = 200;
 const SMART_SAMPLE_COUNT: usize = 5;
@@ -372,6 +373,31 @@ fn file_extension(path: &str) -> String {
     }
 }
 
+/// Build a tree recursively until no more hidden subdirs, up to MAX_RECURSE_DEPTH.
+/// Each pass builds 2 levels at a time, then checks if any branch still has subdirs.
+fn build_recursive_deep(path: &str, files: &[(i64, String, i64)]) -> DirNode {
+    let mut node = build_dir_tree_inner(path, PHASE2_START_DEPTH, files);
+    expand_hidden_branches(&mut node, files, PHASE2_START_DEPTH);
+    node
+}
+
+fn expand_hidden_branches(node: &mut DirNode, all_files: &[(i64, String, i64)], current_depth: u32) {
+    if current_depth >= MAX_RECURSE_DEPTH { return; }
+    for child in &mut node.subdirs {
+        if child.subdirs.len() >= 2 && !child.is_large_flat {
+            // Has hidden depth — rebuild this branch 2 levels deeper
+            let sub_files: Vec<_> = all_files.iter()
+                .filter(|(_, p, _)| p.starts_with(&format!("{}/", child.path)))
+                .cloned()
+                .collect();
+            if sub_files.len() < 50 { continue; }
+            let mut deep = build_dir_tree_inner(&child.path, current_depth + 2, &sub_files);
+            expand_hidden_branches(&mut deep, all_files, current_depth + 2);
+            *child = deep;
+        }
+    }
+}
+
 /// Recursively compress large subdirectories in a tree.
 fn compress_large_subdirs(node: &mut DirNode) {
     if node.file_count > COMPRESS_THRESHOLD {
@@ -460,7 +486,6 @@ pub fn run_hierarchical_inference(
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
 
-    let phase1_count = projects.len();
     let mut phase2_count = 0;
     let mut deep_projects: Vec<serde_json::Value> = Vec::new();
 
@@ -486,8 +511,8 @@ pub fn run_hierarchical_inference(
             .collect();
         if subdir_files.len() < 50 { continue; }
 
-        // Adaptive depth: build at depth 5, compress large dirs
-        let mut deep_node = build_dir_tree_inner(&child.path, PHASE2_DEPTH, &subdir_files);
+        // Adaptive depth: build recursively until flat, compress large dirs
+        let mut deep_node = build_recursive_deep(&child.path, &subdir_files);
         compress_large_subdirs(&mut deep_node);
         let deep_prompt = tree_to_prompt(&deep_node, 0);
         if deep_prompt.len() < 200 { continue; }
@@ -543,17 +568,29 @@ pub fn run_hierarchical_inference(
         }
     }
 
-    // Merge: remove shallow Phase 1 projects that were deep-dived in Phase 2
+    // Merge: remove Phase 1 projects covered by Phase 2 (dedup by dirs, not names)
     if !deep_projects.is_empty() {
-        let deep_names: Vec<&str> = deep_projects.iter()
-            .filter_map(|p| p["name"].as_str()).collect();
+        // Collect all dirs from Phase 2 projects
+        let phase2_dirs: std::collections::HashSet<String> = deep_projects.iter()
+            .filter(|p| !p["skip"].as_bool().unwrap_or(false))
+            .filter_map(|p| p["dirs"].as_array())
+            .flat_map(|a| a.iter())
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        // Remove Phase 1 projects whose dirs are all covered by Phase 2
         projects.retain(|p| {
-            let name = p["name"].as_str().unwrap_or("");
             let skip = p["skip"].as_bool().unwrap_or(false);
-            skip || !deep_names.iter().any(|dn| name.contains(dn) || dn.contains(name))
+            if skip { return true; } // keep skipped entries
+            let dirs: Vec<&str> = p["dirs"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            // Keep only if at least one dir is NOT in Phase 2 (not fully covered)
+            dirs.iter().any(|d| !phase2_dirs.contains(*d))
         });
         projects.extend(deep_projects);
-        eprintln!("  Merged: {} phase-1 + {} phase-2 projects", phase1_count, phase2_count);
+        eprintln!("  Merged: {} phase-1 + {} phase-2 projects (deduped)",
+            projects.len() - phase2_count, phase2_count);
     }
 
     let mut projects_created = 0;
