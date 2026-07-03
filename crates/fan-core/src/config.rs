@@ -184,7 +184,13 @@ impl Default for Config {
             },
             scan: ScanConfig {
                 include: vec![],
-                exclude: vec!["/tmp".into(), "*.tmp".into()],
+                exclude: vec![
+                    "/tmp".into(), "*.tmp".into(),
+                    "/proc".into(), "/sys".into(), "/dev".into(), "/run".into(),
+                    "/etc".into(), "/bin".into(), "/sbin".into(), "/lib".into(), "/lib64".into(),
+                    "/boot".into(), "/snap".into(), "/var/cache".into(), "/var/log".into(),
+                    "/lost+found".into(), "/root".into(), "/cdrom".into(), "/media".into(),
+                ],
             },
             watch: WatchConfig {
                 include: vec![],

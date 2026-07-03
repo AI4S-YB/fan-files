@@ -451,29 +451,34 @@ pub fn run_hierarchical_inference(
         .map(|a| a.clone())
         .unwrap_or(empty_projects.clone());
 
-    // Phase 2: adaptive recursion — for branches with hidden depth, expand
+    // Phase 2: adaptive recursion — only for branches LLM did NOT skip
+    // Collect skipped dirs from Phase 1 LLM response
+    let skipped_dirs: std::collections::HashSet<String> = projects.iter()
+        .filter(|p| p["skip"].as_bool().unwrap_or(false))
+        .filter_map(|p| p["dirs"].as_array())
+        .flat_map(|a| a.iter())
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+
     let phase1_count = projects.len();
     let mut phase2_count = 0;
     let mut deep_projects: Vec<serde_json::Value> = Vec::new();
 
+    // Phase 2 candidates: subdirs with hidden depth AND not skipped by LLM
     let phase2_candidates: Vec<_> = tree.subdirs.iter()
         .filter(|c| !c.subdirs.is_empty() && !c.is_large_flat)
-        .filter(|c| c.subdirs.len() >= 2) // branch has meaningful hidden depth
+        .filter(|c| c.subdirs.len() >= 2)
+        .filter(|c| !skipped_dirs.contains(&c.name)
+                  && !skipped_dirs.iter().any(|d| d.ends_with(&format!("/{}", c.name))))
         .collect();
 
     if !phase2_candidates.is_empty() {
-        eprintln!("  Phase 2: deep-diving {} branches (with compression)...", phase2_candidates.len());
+        eprintln!("  Phase 2: deep-diving {} branches (skipped {} by LLM)...",
+            phase2_candidates.len(), skipped_dirs.len());
     }
 
-    for child in &tree.subdirs {
-        if child.subdirs.len() < 2 || child.is_large_flat { continue; }
-        let already_skipped = projects.iter().any(|p| {
-            let dirs = p["dirs"].as_array().map(|a| a.iter().any(|d| {
-                d.as_str().map_or(false, |s| s == &child.name || s.ends_with(&format!("/{}", child.name)))
-            })).unwrap_or(false);
-            p["skip"].as_bool().unwrap_or(false) && dirs
-        });
-        if already_skipped { continue; }
+    for child in &phase2_candidates {
+        let child = *child; // deref from &&DirNode
 
         let subdir_files: Vec<_> = all_files.iter()
             .filter(|(_, p, _)| p.starts_with(&format!("{}/", child.path)))
