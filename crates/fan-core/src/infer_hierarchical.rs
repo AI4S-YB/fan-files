@@ -68,7 +68,8 @@ fn compress_node(node: &mut DirNode) {
     node.file_count = 1; // Signal to LLM: this is a compressed summary
 }
 
-/// Pick up to N diverse samples, preferring different filename prefixes.
+/// Pick up to N diverse samples, preferring different semantic filename prefixes.
+/// Normalizes common bioinformatics accession prefixes (SRR/ERR/DRR → "SRA_run" etc.)
 fn smart_sample(names: &[String], n: usize) -> Vec<String> {
     if names.len() <= n { return names.to_vec(); }
     let mut result: Vec<String> = Vec::new();
@@ -76,21 +77,53 @@ fn smart_sample(names: &[String], n: usize) -> Vec<String> {
 
     for name in names {
         if result.len() >= n { break; }
-        // Extract prefix: everything before the first digit or underscore-number
-        let prefix = name.chars()
-            .take_while(|c| !c.is_ascii_digit())
-            .collect::<String>();
-        let short_prefix = prefix.trim_end_matches('_').to_string();
+        let cat = normalize_prefix(name);
 
-        // Prioritize names with different prefixes (catches paired-end patterns)
-        if !seen_prefixes.contains(&short_prefix) || result.len() < n {
+        // Prioritize names with different semantic categories
+        if !seen_prefixes.contains(&cat) || result.len() < n {
             result.push(name.clone());
-            if !seen_prefixes.contains(&short_prefix) {
-                seen_prefixes.push(short_prefix);
+            if !seen_prefixes.contains(&cat) {
+                seen_prefixes.push(cat);
             }
         }
     }
     result
+}
+
+/// Normalize filename prefix into a semantic category.
+/// Merges SRA accession numbers (SRR/ERR/DRR → "SRA_run"),
+/// GEO identifiers (GSM/E → category), BioProject codes, etc.
+fn normalize_prefix(name: &str) -> String {
+    // Strip extension(s) for prefix matching:
+    // "SRR6246475_1.fastq.gz" → split('.') → ["SRR6246475_1", "fastq", "gz"] → take first
+    let base = name.split('.').next().unwrap_or(name).to_uppercase();
+
+    // SRA run accessions (NCBI / EBI / DDBJ)
+    if base.starts_with("SRR") || base.starts_with("ERR") || base.starts_with("DRR") {
+        return "SRA_run".to_string();
+    }
+    // SRA experiment
+    if base.starts_with("SRX") || base.starts_with("ERX") || base.starts_with("DRX") {
+        return "SRA_experiment".to_string();
+    }
+    // GEO
+    if base.starts_with("GSM") { return "GEO_sample".to_string(); }
+    if base.starts_with("GSE") { return "GEO_series".to_string(); }
+    if base.starts_with("GPL") { return "GEO_platform".to_string(); }
+    // BioProject (NCBI/EBI/DDBJ)
+    if base.starts_with("PRJNA") || base.starts_with("PRJEB") || base.starts_with("PRJDB") {
+        return "BioProject".to_string();
+    }
+    // ENA sample/study
+    if base.starts_with("ERS") || base.starts_with("SAME") || base.starts_with("SAMN") || base.starts_with("SAMEA") {
+        return "BioSample".to_string();
+    }
+    // Generic: characters before first digit
+    let prefix: String = base.chars()
+        .take_while(|c| !c.is_ascii_digit())
+        .collect();
+    let trimmed = prefix.trim_end_matches('_').to_string();
+    if trimmed.is_empty() { "unknown".to_string() } else { trimmed }
 }
 
 /// Build a directory tree from the SQLite index, to a given depth.
