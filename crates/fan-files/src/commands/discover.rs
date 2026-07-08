@@ -7,7 +7,7 @@
 use fan_core::config::{Config, DataLayer};
 use fan_core::discovery;
 use fan_core::infer_hierarchical;
-use fan_core::index::sqlite::SqliteStore;
+use fan_core::index::IndexEngine;
 use fan_core::llm::LlmClient;
 use fan_core::project::ProjectStore;
 use std::sync::Arc;
@@ -107,9 +107,9 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
         DataLayer::Global => fan_core::config::dirs_fan_global().join("data"),
     };
 
-    // Open index
-    let sqlite = match SqliteStore::open(&data_dir) {
-        Ok(s) => s,
+    // Open index engine (SQLite + Tantivy)
+    let index = match IndexEngine::open_at(&data_dir, config, false) {
+        Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);
             return;
@@ -119,7 +119,7 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
     // Scan each target directory with batch transactions
     let mut total_files = 0u64;
     let mut batch_count = 0usize;
-    sqlite.begin_batch().ok();
+    index.sqlite.begin_batch().ok();
 
     for target in &all_targets {
         let scanner = fan_core::scanner::Scanner::new(
@@ -130,7 +130,7 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
 
         eprintln!("  Scanning: {}", target);
         for file_info in scanner.scan() {
-            match sqlite.upsert(&file_info, None) {
+            match index.index_file(&file_info, None) {
                 Ok(_) => {
                     total_files += 1;
                     batch_count += 1;
@@ -138,25 +138,27 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
                 Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
             }
             if batch_count >= 1000 {
-                sqlite.commit_batch().ok();
+                index.sqlite.commit_batch().ok();
+                index.tantivy.commit().ok();
                 batch_count = 0;
-                sqlite.begin_batch().ok();
+                index.sqlite.begin_batch().ok();
             }
         }
     }
     if batch_count > 0 {
-        sqlite.commit_batch().ok();
+        index.sqlite.commit_batch().ok();
+        index.tantivy.commit().ok();
     }
     eprintln!("  Phase B complete: {} files indexed", total_files);
     println!();
 
     // ═══ Phase C: Hierarchical inference ═══
     println!("═══ Phase C: LLM Inference ═══");
-    let project_store = ProjectStore::new(Arc::clone(&sqlite.conn));
+    let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
 
     for root in &scan_roots {
         eprintln!("  Inferring: {}", root);
-        match infer_hierarchical::run_hierarchical_inference(&sqlite, &project_store, &llm_client, root) {
+        match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, root) {
             Ok((projects, _)) => eprintln!("  → {} projects", projects),
             Err(e) => eprintln!("  Inference failed for {}: {}", root, e),
         }
