@@ -306,10 +306,17 @@ fn run_full_scan(
     interpreter_registry: &InterpreterRegistry,
     scan_only: bool,
 ) {
+    const BATCH_SIZE: usize = 1000;
+
     let mode = if scan_only { "scan-only" } else { "full" };
     info!("Starting {} scan...", mode);
     let start = Instant::now();
     let mut count = 0u64;
+    let mut batch_count = 0usize;
+
+    // Begin first batch transaction
+    index.sqlite.begin_batch().ok();
+
     for file_info in scanner.scan() {
         let path_str = file_info.path.to_string_lossy();
         let format_info = plugins
@@ -318,6 +325,7 @@ fn run_full_scan(
         match index.index_file(&file_info, format_info.as_ref()) {
             Ok(file_id) => {
                 count += 1;
+                batch_count += 1;
                 if !scan_only {
                     run_interpretation(
                         index, file_id, file_info.path.as_ref(),
@@ -328,6 +336,19 @@ fn run_full_scan(
             }
             Err(e) => error!("Failed to index {}: {}", file_info.path.display(), e),
         }
+
+        // Commit batch every N files to flush to disk
+        if batch_count >= BATCH_SIZE {
+            index.sqlite.commit_batch().ok();
+            index.tantivy.commit().ok();
+            batch_count = 0;
+            index.sqlite.begin_batch().ok();
+        }
+    }
+
+    // Final flush
+    if batch_count > 0 {
+        index.sqlite.commit_batch().ok();
     }
     index.tantivy.commit().ok();
     info!(

@@ -12,12 +12,30 @@ impl SqliteStore {
     pub fn open(data_dir: &Path) -> rusqlite::Result<Self> {
         std::fs::create_dir_all(data_dir).ok();
         let conn = Connection::open(data_dir.join("index.db"))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA cache_size=-64000;
+             PRAGMA mmap_size=268435456;
+             PRAGMA temp_store=MEMORY;"
+        )?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Begin an explicit transaction for batch writes.
+    pub fn begin_batch(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE;")
+    }
+
+    /// Commit the current batch transaction.
+    pub fn commit_batch(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("COMMIT;")
     }
 
     fn migrate(&self) -> rusqlite::Result<()> {
