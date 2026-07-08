@@ -13,6 +13,14 @@ use fan_core::project::ProjectStore;
 use std::sync::Arc;
 
 pub fn run(config: &Config, layer: &DataLayer) {
+    run_inner(config, layer, false);
+}
+
+pub fn run_deep(config: &Config, layer: &DataLayer) {
+    run_inner(config, layer, true);
+}
+
+fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
     let llm_client = LlmClient::new(config.llm.clone());
     if !llm_client.is_configured() {
         eprintln!("LLM not configured. Set [llm] in config.toml.");
@@ -35,17 +43,23 @@ pub fn run(config: &Config, layer: &DataLayer) {
     println!();
 
     // ═══ Phase A: Lightweight walk + LLM pre-filter ═══
-    println!("═══ Phase A: Directory Analysis ═══");
+    let mode_label = if deep { "Recursive (3→5→7)" } else { "Shallow (depth 3)" };
+    println!("═══ Phase A: Directory Analysis ({}) ═══", mode_label);
     let mut all_targets: Vec<String> = Vec::new();
     let mut total_skipped = 0;
 
     for root in &scan_roots {
-        eprintln!("  Scanning directory structure: {}", root);
-        match discovery::run_phase_a(root, &llm_client) {
+        eprintln!("  Analyzing directory structure: {}", root);
+        let result = if deep {
+            discovery::run_recursive_phase_a(root, &llm_client, 9)
+        } else {
+            discovery::run_phase_a(root, &llm_client)
+        };
+
+        match result {
             Ok((targets, skips)) => {
                 eprintln!("  → {} dirs to scan, {} skipped", targets.len(), skips.len());
                 total_skipped += skips.len();
-                // Expand relative targets to absolute paths
                 for t in targets {
                     if t.starts_with('/') {
                         all_targets.push(t);

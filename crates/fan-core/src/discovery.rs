@@ -169,3 +169,108 @@ pub fn run_phase_a(
     eprintln!("  Phase A: {} targets to scan, {} dirs to skip", targets.len(), skips.len());
     Ok((targets, skips))
 }
+
+/// Recursive Phase A: progressively expand depth 3→5→7 based on LLM "need_deeper" signals.
+/// Each round walks from the previous round's truncation point, not from the root.
+pub fn run_recursive_phase_a(
+    scan_root: &str,
+    llm_client: &LlmClient,
+    max_depth: u32,
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+    if !llm_client.is_configured() {
+        return Err("LLM not configured".into());
+    }
+
+    let mut all_targets: Vec<String> = Vec::new();
+    let mut all_skips: Vec<String> = Vec::new();
+    let mut current_roots: Vec<String> = vec![scan_root.to_string()];
+    let mut round = 1;
+
+    while !current_roots.is_empty() && round <= 3 {
+        let walk_depth: u32 = 3; // relative depth from each truncation point
+
+        eprintln!("  Phase A Round {}: {} root(s), depth {}...", round, current_roots.len(), walk_depth);
+
+        let mut next_roots: Vec<String> = Vec::new();
+
+        for root in &current_roots {
+            let tree = lightweight_walk(root, walk_depth);
+            let prompt = light_tree_to_prompt(&tree, 0);
+            if prompt.len() < 50 { continue; }
+
+            let full_prompt = format!(
+                "你是数据管理助手。下面是一个目录的轻量扫描结果(只读目录名和扩展名分布)。\n\n\
+                 任务:\n\
+                 1. 对每个子目录, 判断: scan(值得深度扫描), skip(跳过), 或 deeper(需要再往下看几层才能判断)\n\
+                 2. 标记deeper的目录通常是: 目录名不明确, 子目录很多, 或扩展名分布不典型\n\
+                 3. 明显噪音: 直接skip (.pnpm-store, node_modules, __pycache__, scripts, venv, .git, dist, cache, working_dir, temp)\n\
+                 输出JSON: {{\"targets\":[{{\"path\":\"路径\"}}], \"skips\":[{{\"path\":\"路径\",\"reason\":\"原因\"}}], \"deeper\":[{{\"path\":\"路径\"}}]}}\n\n{}",
+                prompt
+            );
+
+            let body = serde_json::json!({
+                "model": llm_client.config.model,
+                "messages": [
+                    {"role": "system", "content": "你是数据管理助手。你的任务是递归地扫描目录树，逐层判断哪些值得深入、哪些跳过、哪些需要再展开一层。"},
+                    {"role": "user", "content": full_prompt}
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.1,
+                "max_tokens": 4096
+            });
+
+            match crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 2) {
+                Ok(response) => {
+                    let content = response["choices"][0]["message"]["content"].as_str().unwrap_or("");
+                    if let Ok(output) = serde_json::from_str::<serde_json::Value>(content) {
+                        // Collect targets
+                        if let Some(arr) = output["targets"].as_array() {
+                            for v in arr {
+                                if let Some(p) = v["path"].as_str() {
+                                    let abs = if p.starts_with('/') { p.to_string() }
+                                        else { format!("{}/{}", root.trim_end_matches('/'), p.trim_start_matches('/')) };
+                                    all_targets.push(abs);
+                                }
+                            }
+                        }
+                        // Collect skips
+                        if let Some(arr) = output["skips"].as_array() {
+                            for v in arr {
+                                if let Some(p) = v["path"].as_str() {
+                                    all_skips.push(p.to_string());
+                                }
+                            }
+                        }
+                        // Collect deeper — these become roots for next round
+                        if let Some(arr) = output["deeper"].as_array() {
+                            for v in arr {
+                                if let Some(p) = v["path"].as_str() {
+                                    let abs = if p.starts_with('/') { p.to_string() }
+                                        else { format!("{}/{}", root.trim_end_matches('/'), p.trim_start_matches('/')) };
+                                    next_roots.push(abs);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("  Round {} LLM failed: {}", round, e),
+            }
+        }
+
+        eprintln!("  Round {}: {} targets, {} deeper", round, all_targets.len(), next_roots.len());
+        current_roots = next_roots;
+        round += 1;
+
+        // Cap total depth
+        if round as u32 * 3 > max_depth { break; }
+    }
+
+    // Dedup
+    all_targets.sort();
+    all_targets.dedup();
+    all_skips.sort();
+    all_skips.dedup();
+
+    eprintln!("  Recursive Phase A complete: {} targets, {} skipped", all_targets.len(), all_skips.len());
+    Ok((all_targets, all_skips))
+}
