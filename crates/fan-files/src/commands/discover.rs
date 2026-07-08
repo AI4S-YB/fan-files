@@ -47,6 +47,8 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
     println!("═══ Phase A: Directory Analysis ({}) ═══", mode_label);
     let mut all_targets: Vec<String> = Vec::new();
     let mut total_skipped = 0;
+    // TODO: collect Phase A LLM species/assay hints and pass to Phase C
+    let _phase_a_hints: Vec<(String, String, String)> = Vec::new();
 
     for root in &scan_roots {
         eprintln!("  Analyzing directory structure: {}", root);
@@ -56,21 +58,32 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
             discovery::run_phase_a(root, &llm_client)
         };
 
+        // If Phase A fails, retry once with shallow mode before falling back
+        let result = match result {
+            Err(e) => {
+                eprintln!("  Phase A failed: {}. Retrying with shallow mode...", e);
+                discovery::run_phase_a(root, &llm_client)
+            }
+            ok => ok,
+        };
+
         match result {
             Ok((targets, skips)) => {
                 eprintln!("  → {} dirs to scan, {} skipped", targets.len(), skips.len());
                 total_skipped += skips.len();
                 for t in targets {
-                    if t.starts_with('/') {
-                        all_targets.push(t);
+                    let abs = if t.starts_with('/') {
+                        t.clone()
                     } else {
-                        all_targets.push(format!("{}/{}", root.trim_end_matches('/'), t.trim_start_matches('/')));
-                    }
+                        format!("{}/{}", root.trim_end_matches('/'), t.trim_start_matches('/'))
+                    };
+                    all_targets.push(abs);
+                    // Collect hints from Phase A for Phase C
+                    // (Phase A LLM may return species/assay alongside targets)
                 }
             }
             Err(e) => {
-                eprintln!("  Phase A failed for {}: {}", root, e);
-                eprintln!("  Falling back to full scan for this root.");
+                eprintln!("  Phase A failed after retry: {}. Scanning root as-is.", e);
                 all_targets.push(root.to_string());
             }
         }
@@ -96,18 +109,18 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
 
     // Open index
     let sqlite = match SqliteStore::open(&data_dir) {
-        Ok(s) => {
-            s.begin_batch().ok();
-            s
-        }
+        Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);
             return;
         }
     };
 
-    // Scan each target directory (using existing Scanner)
+    // Scan each target directory with batch transactions
     let mut total_files = 0u64;
+    let mut batch_count = 0usize;
+    sqlite.begin_batch().ok();
+
     for target in &all_targets {
         let scanner = fan_core::scanner::Scanner::new(
             vec![target.clone()],
@@ -118,12 +131,22 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
         eprintln!("  Scanning: {}", target);
         for file_info in scanner.scan() {
             match sqlite.upsert(&file_info, None) {
-                Ok(_) => total_files += 1,
+                Ok(_) => {
+                    total_files += 1;
+                    batch_count += 1;
+                }
                 Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
+            }
+            if batch_count >= 1000 {
+                sqlite.commit_batch().ok();
+                batch_count = 0;
+                sqlite.begin_batch().ok();
             }
         }
     }
-    sqlite.commit_batch().ok();
+    if batch_count > 0 {
+        sqlite.commit_batch().ok();
+    }
     eprintln!("  Phase B complete: {} files indexed", total_files);
     println!();
 
