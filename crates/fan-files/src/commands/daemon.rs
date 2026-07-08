@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use fan_core::config::{Config, DataLayer};
 use fan_core::detector::BuiltinDetector;
-use fan_core::infer;
+use fan_core::infer_hierarchical;
 use fan_core::index::IndexEngine;
 use fan_core::interpreter::InterpreterRegistry;
 use fan_core::llm::LlmClient;
@@ -98,7 +98,7 @@ fn run_inner(config: &Config, layer: &DataLayer, scan_only: bool) {
             let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
             let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
             info!("Running LLM inference on indexed files...");
-            match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+            match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
                 Ok((p, r)) => info!("LLM inference complete: {} projects, {} relations", p, r),
                 Err(e) => warn!("LLM inference failed: {}", e),
             }
@@ -191,7 +191,7 @@ fn run_inner(config: &Config, layer: &DataLayer, scan_only: bool) {
                 if llm_client.is_configured() {
                     let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
                     let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
-                    match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+                    match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
                         Ok((p, r)) => info!("LLM inference: {} projects, {} relations", p, r),
                         Err(e) => warn!("LLM inference failed: {}", e),
                     }
@@ -292,7 +292,7 @@ fn auto_infer(index: &IndexEngine, config: &Config, servers: &[(String, fan_core
     if llm_client.is_configured() {
         let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
         let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
-        match infer::run_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
+        match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, scan_root) {
             Ok((p, r)) => info!("Auto-infer: {} projects, {} relations", p, r),
             Err(e) => warn!("Auto-infer failed: {}", e),
         }
