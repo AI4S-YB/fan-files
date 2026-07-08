@@ -1,4 +1,5 @@
 pub mod config;
+pub mod discovery;
 pub mod detector;
 pub mod index;
 pub use index::IndexMode;

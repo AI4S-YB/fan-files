@@ -1,4 +1,5 @@
 pub mod daemon;
+pub mod discover;
 pub mod infer;
 pub mod info;
 pub mod init;

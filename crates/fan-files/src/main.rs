@@ -75,6 +75,8 @@ enum Commands {
     Update,
     /// Uninstall fan-files
     Uninstall,
+    /// Progressive discovery: light walk → targeted scan → infer
+    Discover,
     /// Interactive setup wizard
     Init,
     /// Manage registered servers
@@ -168,6 +170,7 @@ fn main() {
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::Update => commands::update::run(),
         Commands::Uninstall => commands::uninstall::run(),
+        Commands::Discover => commands::discover::run(&config, &layer),
         Commands::Init => commands::init::run(&config, &layer),
         Commands::Servers(action) => match action {
             ServersAction::List => commands::servers::list(&config),
