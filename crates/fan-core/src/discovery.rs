@@ -18,6 +18,21 @@ pub struct LightDirNode {
     pub subdir_count: usize,
     pub extensions: Vec<(String, usize)>,
     pub subdirs: Vec<LightDirNode>,
+    /// True if this directory or any descendant has bio-significant files.
+    pub bio_signal: bool,
+}
+
+impl LightDirNode {
+    /// Check if own extensions include bio-significant formats.
+    fn has_bio_extensions(extensions: &[(String, usize)]) -> bool {
+        let bio_exts = [
+            "fastq", "fastq.gz", "fq", "fq.gz", "fasta", "fa", "fna", "faa",
+            "bam", "sam", "cram", "vcf", "vcf.gz", "gff", "gff3", "gtf",
+            "bed", "bw", "bigwig", "narrowpeak", "broadpeak",
+            "h5", "hdf5", "gfa", "chain", "maf", "nex", "phylip",
+        ];
+        extensions.iter().any(|(ext, _)| bio_exts.contains(&ext.as_str()))
+    }
 }
 
 /// Walk a directory tree to the given depth, collecting only directory-level
@@ -29,12 +44,13 @@ pub fn lightweight_walk(root: &str, depth: u32) -> LightDirNode {
         .unwrap_or_else(|| root.to_string());
 
     let mut node = LightDirNode {
-        name,
+        name: name.clone(),
         path: root.to_string(),
         file_count: 0,
         subdir_count: 0,
         extensions: Vec::new(),
         subdirs: Vec::new(),
+        bio_signal: false,
     };
 
     if depth == 0 { return node; }
@@ -67,6 +83,11 @@ pub fn lightweight_walk(root: &str, depth: u32) -> LightDirNode {
     ext_vec.truncate(5);
     node.extensions = ext_vec;
 
+    // Bottom-up signal: own bio signal + any child has bio signal
+    let own_bio = LightDirNode::has_bio_extensions(&node.extensions);
+    let child_bio = node.subdirs.iter().any(|c| c.bio_signal);
+    node.bio_signal = own_bio || child_bio;
+
     node.subdirs.sort_by(|a, b| b.file_count.cmp(&a.file_count));
     // Limit to top 20 subdirs to keep prompt size manageable
     node.subdirs.truncate(20);
@@ -95,15 +116,18 @@ pub fn light_tree_to_prompt(root: &LightDirNode, indent: usize) -> String {
         .map(|(e, c)| format!("{}×{}", e, c))
         .collect();
 
+    let bio_tag = if root.bio_signal { " 🧬" } else { "" };
     if root.subdirs.is_empty() {
         lines.push(format!(
-            "{}📁 {}/  ({} files: {})",
-            prefix, root.name, root.file_count, ext_summary.join(", ")
+            "{}📁 {}/{}  ({} files: {})",
+            prefix, root.name, bio_tag, root.file_count, ext_summary.join(", ")
         ));
     } else {
+        let bio_count = root.subdirs.iter().filter(|c| c.bio_signal).count();
+        let child_info = format!("{} subdirs ({} bio)", root.subdirs.len(), bio_count);
         lines.push(format!(
-            "{}📁 {}/  ({} files: {}, {} subdirs)",
-            prefix, root.name, root.file_count, ext_summary.join(", "), root.subdirs.len()
+            "{}📁 {}/{}  ({} files: {}, {})",
+            prefix, root.name, bio_tag, root.file_count, ext_summary.join(", "), child_info
         ));
         for child in &root.subdirs {
             lines.push(light_tree_to_prompt(child, indent + 1));
@@ -129,17 +153,17 @@ pub fn run_phase_a(
     eprintln!("  Phase A: tree built ({} chars prompt)", prompt.len());
 
     let full_prompt = format!(
-        "你是数据管理助手。下面是一个目录的轻量扫描结果(只读了目录名和文件扩展名分布,没有读文件内容)。\n\n\
-         任务:\n\
-         1. 判断哪些子目录值得深入扫描(scan=true)\n\
-         2. 判断哪些子目录应该跳过(skip=true, 如 .pnpm-store, node_modules, __pycache__, scripts, venv, .git, dist, cache)\n\
-         3. 对 scan 的目录, 推断可能的物种/实验类型(可选)\n\
-         输出JSON: {{\"targets\":[{{\"path\":\"子目录路径\",\"species\":\"推测物种\",\"assay\":\"推测实验\"}}], \
-         \"skips\":[{{\"path\":\"路径\",\"reason\":\"原因\"}}]}}\n\n{}",
+        "你是生物信息数据管理助手。下面是一个目录树，每个目录标注了文件扩展名分布和🧬标记(有生信文件或子目录有生信文件)。\n\n\
+         对每个子目录，判断它的身份和扫描决策:\n\
+         - 如果它是独立的研究项目目录(project_root) → scan(扫描它和他下面的所有子目录,程序安装目录如Bioconductor/conda/envs除外)\n\
+         - 如果它是项目内的分析步骤目录(analysis_step) → scan(即使自己没有生信文件,也要跟着项目一起扫)\n\
+         - 如果它是更大的分类目录(classification) → deeper(需要往下看才能判断)\n\
+         - 如果它是噪音/工具/缓存目录 → skip\n\n\
+         输出JSON: {{\"targets\":[{{\"path\":\"子目录路径\"}}], \"skips\":[{{\"path\":\"路径\"}}], \"deeper\":[{{\"path\":\"路径\"}}]}}\n\n{}",
         prompt
     );
 
-    let system_prompt = "你是数据管理助手。你看到的目录树来自轻量扫描(只看目录名+扩展名分布)。请判断哪些目录值得深度扫描。";
+    let system_prompt = "你是生物信息数据管理助手。根据目录名、扩展名分布、🧬信号判断每个目录的身份和扫描决策。";
 
     let body = serde_json::json!({
         "model": llm_client.config.model,
@@ -199,19 +223,17 @@ pub fn run_recursive_phase_a(
             if prompt.len() < 50 { continue; }
 
             let full_prompt = format!(
-                "你是数据管理助手。下面是一个目录的轻量扫描结果(只读目录名和扩展名分布)。\n\n\
-                 任务:\n\
-                 1. 对每个子目录, 判断: scan(值得深度扫描), skip(跳过), 或 deeper(需要再往下看几层才能判断)\n\
-                 2. 标记deeper的目录通常是: 目录名不明确, 子目录很多, 或扩展名分布不典型\n\
-                 3. 明显噪音: 直接skip (.pnpm-store, node_modules, __pycache__, scripts, venv, .git, dist, cache, working_dir, temp)\n\
-                 输出JSON: {{\"targets\":[{{\"path\":\"路径\"}}], \"skips\":[{{\"path\":\"路径\",\"reason\":\"原因\"}}], \"deeper\":[{{\"path\":\"路径\"}}]}}\n\n{}",
+                "你是生物信息数据管理助手。下面是一个子目录树(深层展开结果)。\n\
+                 🧬=有生信信号。对每个子目录判断:\n\
+                 project_root → scan | analysis_step → scan | classification → deeper | noise → skip\n\
+                 输出JSON: {{\"targets\":[{{\"path\":\"路径\"}}], \"skips\":[{{\"path\":\"路径\"}}], \"deeper\":[{{\"path\":\"路径\"}}]}}\n\n{}",
                 prompt
             );
 
             let body = serde_json::json!({
                 "model": llm_client.config.model,
                 "messages": [
-                    {"role": "system", "content": "你是数据管理助手。你的任务是递归地扫描目录树，逐层判断哪些值得深入、哪些跳过、哪些需要再展开一层。"},
+                    {"role": "system", "content": "你是生物信息数据管理助手。根据目录名、扩展名分布、🧬信号判断身份: project_root/analysis_step/classification/noise。"},
                     {"role": "user", "content": full_prompt}
                 ],
                 "response_format": {"type": "json_object"},
