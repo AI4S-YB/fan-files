@@ -132,7 +132,7 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
             vec![root.to_string()],
             config.scan.exclude.clone(),
             "discovery".to_string(),
-        );
+        ).with_skip_magic(uniform_parents.clone());
 
         eprintln!("  Scanning root: {}", root);
         for file_info in scanner.scan() {
