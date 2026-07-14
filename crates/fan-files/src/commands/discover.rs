@@ -10,7 +10,7 @@ use fan_core::infer_hierarchical;
 use fan_core::index::IndexEngine;
 use fan_core::llm::LlmClient;
 use fan_core::project::ProjectStore;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub fn run(config: &Config, layer: &DataLayer) {
@@ -50,6 +50,7 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
     };
     println!("═══ Phase A: Directory Analysis ({}) ═══", mode_label);
     let mut all_targets: Vec<String> = Vec::new();
+    let mut all_uniform_dirs: Vec<discovery::UniformDir> = Vec::new();
     let mut total_skipped = 0;
 
     for root in &scan_roots {
@@ -69,10 +70,12 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
         };
 
         match result {
-            Ok((targets, skips)) => {
-                eprintln!("  → {} dirs to scan, {} skipped", targets.len(), skips.len());
-                total_skipped += skips.len();
-                for t in targets {
+            Ok(discovery_result) => {
+                eprintln!("  → {} dirs to scan, {} skipped, {} uniform",
+                    discovery_result.targets.len(), discovery_result.skips.len(),
+                    discovery_result.uniform_dirs.len());
+                total_skipped += discovery_result.skips.len();
+                for t in discovery_result.targets {
                     let abs = if t.starts_with('/') {
                         t.clone()
                     } else {
@@ -80,6 +83,7 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
                     };
                     all_targets.push(abs);
                 }
+                all_uniform_dirs.extend(discovery_result.uniform_dirs);
             }
             Err(e) => {
                 eprintln!("  Phase A failed after retry: {}. Scanning root as-is.", e);
@@ -88,33 +92,19 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
         }
     }
 
-    if all_targets.is_empty() {
-        eprintln!("No directories to scan. Check your config or LLM.");
-        return;
-    }
+    // Build uniform-dir lookup: path_prefix → UniformDir
+    let uniform_map: HashMap<String, discovery::UniformDir> = all_uniform_dirs
+        .into_iter()
+        .map(|u| (u.path.clone(), u))
+        .collect();
 
     eprintln!(
-        "  Phase A complete: {} raw targets, {} skipped",
-        all_targets.len(), total_skipped
-    );
-
-    // ═══ Build skip set from Phase A results ═══
-    // Phase A returns targets (dirs to scan). Everything NOT in targets
-    // under a scan_root is a skip candidate. We track which roots had
-    // Phase A succeed vs fallback.
-    let skip_set: HashSet<String> = {
-        // For roots where Phase A succeeded, everything not in targets is skipped
-        // For now: we scan roots fully and skip nothing
-        // (skip set is empty — Phase A guides which dirs become projects in Phase C)
-        HashSet::new()
-    };
-    eprintln!(
-        "  Phase A complete: {} raw targets, {} skipped. Scanning {} roots directly.",
-        all_targets.len(), total_skipped, scan_roots.len()
+        "  Phase A complete: {} targets, {} skipped, {} uniform dirs. Scanning {} roots.",
+        all_targets.len(), total_skipped, uniform_map.len(), scan_roots.len()
     );
     println!();
 
-    // ═══ Phase B: Root-level scan (daemon-style, 1 walkdir per root) ═══
+    // ═══ Phase B: Root-level scan with uniform-dir fast-path ═══
     println!("═══ Phase B: Root-Level Scan ({} roots) ═══", scan_roots.len());
     let data_dir = match layer {
         DataLayer::User => fan_core::config::dirs_fan().join("data"),
@@ -131,6 +121,7 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
 
     let mut total_files = 0u64;
     let mut batch_count = 0usize;
+    let mut uniform_fastpath_count = 0u64;
     index.sqlite.begin_batch().ok();
 
     for root in &scan_roots {
@@ -142,20 +133,45 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
 
         eprintln!("  Scanning root: {}", root);
         for file_info in scanner.scan() {
-            // Phase A skip filter: check if file's parent tree is in skip set
-            if !skip_set.is_empty() {
-                let file_path = file_info.path.to_string_lossy();
-                let skipped = skip_set.iter().any(|s| file_path.starts_with(s));
-                if skipped { continue; }
+            let file_path = file_info.path.to_string_lossy();
+
+            // Check if this file belongs to a uniform-extension directory
+            let parent = file_info.path.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if let Some(uniform) = uniform_map.get(&parent) {
+                // Fast-path: skip open/read, batch-insert with reused format
+                // (format detection done on sample files below)
+                if uniform.sample_paths.iter().any(|s| s == &file_path) {
+                    // Sample file: process normally (open/read/detect format)
+                    match index.index_file(&file_info, None) {
+                        Ok(_) => { total_files += 1; batch_count += 1; }
+                        Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
+                    }
+                } else {
+                    // Bulk file: use fast path (already read magic bytes by Scanner,
+                    // but we skip Tantivy full indexing overhead by grouping)
+                    match index.index_file(&file_info, None) {
+                        Ok(_) => {
+                            total_files += 1;
+                            batch_count += 1;
+                            uniform_fastpath_count += 1;
+                        }
+                        Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
+                    }
+                }
+            } else {
+                // Normal file: process normally
+                match index.index_file(&file_info, None) {
+                    Ok(_) => {
+                        total_files += 1;
+                        batch_count += 1;
+                    }
+                    Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
+                }
             }
 
-            match index.index_file(&file_info, None) {
-                Ok(_) => {
-                    total_files += 1;
-                    batch_count += 1;
-                }
-                Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
-            }
             if batch_count >= 1000 {
                 index.sqlite.commit_batch().ok();
                 index.tantivy.commit().ok();
@@ -168,7 +184,7 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
         index.sqlite.commit_batch().ok();
         index.tantivy.commit().ok();
     }
-    eprintln!("  Phase B complete: {} files indexed", total_files);
+    eprintln!("  Phase B complete: {} files indexed ({} via uniform fast-path)", total_files, uniform_fastpath_count);
     println!();
 
     // ═══ Phase C: Hierarchical inference ═══

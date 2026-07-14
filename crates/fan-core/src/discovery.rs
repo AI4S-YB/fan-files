@@ -7,7 +7,7 @@
 //! both its own files AND aggregated child signals.
 
 use crate::llm::LlmClient;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 
 // ═══════════════════════════════════════════════════════════
@@ -48,6 +48,26 @@ pub enum DirSignal {
 
 impl Default for DirSignal {
     fn default() -> Self { DirSignal::Unknown }
+}
+
+/// Uniform-extension directory: Phase A detected directory with
+/// >100 files all sharing the same extension. Phase B can skip
+/// per-file open/read and batch-insert with shared format info.
+#[derive(Debug, Clone)]
+pub struct UniformDir {
+    pub path: String,
+    pub extension: String,
+    pub file_count: usize,
+    /// Sample absolute file paths for format detection (up to 5)
+    pub sample_paths: Vec<String>,
+}
+
+/// Result of bottom-up discovery: targets to scan, dirs to skip,
+/// and uniform-extension dirs for fast batch indexing.
+pub struct DiscoveryResult {
+    pub targets: Vec<String>,
+    pub skips: Vec<String>,
+    pub uniform_dirs: Vec<UniformDir>,
 }
 
 /// Bio-relevant file extensions (not exhaustive — LLM handles the rest).
@@ -249,7 +269,7 @@ pub fn fingerprint_dir(path: &str) -> DirFingerprint {
 pub fn run_bottom_up_discovery(
     scan_root: &str,
     llm_client: &LlmClient,
-) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+) -> Result<DiscoveryResult, Box<dyn std::error::Error>> {
     if !llm_client.is_configured() {
         return Err("LLM not configured".into());
     }
@@ -341,12 +361,40 @@ pub fn run_bottom_up_discovery(
         .filter(|p| !targets.iter().any(|t| p.starts_with(t)))
         .collect();
 
+    // Detect uniform-extension dirs for Phase B fast-path
+    const UNIFORM_MIN_FILES: usize = 100;
+    let mut uniform_dirs: Vec<UniformDir> = Vec::new();
+    for (path, fp) in &fingerprints {
+        if fp.file_count >= UNIFORM_MIN_FILES
+            && fp.extensions.len() == 1
+            && !fp.subdir_names.is_empty() == false  // leaf dir (no subdirs)
+        {
+            // Collect up to 5 sample absolute paths
+            let sample_paths: Vec<String> = fp.sample_files.iter()
+                .take(5)
+                .map(|f| format!("{}/{}", path.trim_end_matches('/'), f))
+                .collect();
+            if !sample_paths.is_empty() {
+                let ext = fp.extensions[0].0.clone();
+                uniform_dirs.push(UniformDir {
+                    path: path.clone(),
+                    extension: ext,
+                    file_count: fp.file_count,
+                    sample_paths,
+                });
+            }
+        }
+    }
+    if !uniform_dirs.is_empty() {
+        eprintln!("  Bottom-Up: {} uniform-extension dirs (Phase B fast-path)", uniform_dirs.len());
+    }
+
     eprintln!(
         "  Bottom-Up complete: {} targets, {} skipped",
         targets.len(),
         skips.len()
     );
-    Ok((targets, skips))
+    Ok(DiscoveryResult { targets, skips, uniform_dirs })
 }
 
 /// Build a condensed annotated tree prompt from bottom-up fingerprints.
@@ -568,7 +616,7 @@ pub fn light_tree_to_prompt(root: &LightDirNode, indent: usize) -> String {
 pub fn run_phase_a(
     scan_root: &str,
     llm_client: &LlmClient,
-) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+) -> Result<DiscoveryResult, Box<dyn std::error::Error>> {
     if !llm_client.is_configured() {
         return Err("LLM not configured".into());
     }
@@ -617,7 +665,7 @@ pub fn run_phase_a(
         .unwrap_or_default();
 
     eprintln!("  Phase A: {} targets to scan, {} dirs to skip", targets.len(), skips.len());
-    Ok((targets, skips))
+    Ok(DiscoveryResult { targets, skips, uniform_dirs: Vec::new() })
 }
 
 /// Recursive Phase A (original, kept for backward compat).
@@ -625,7 +673,7 @@ pub fn run_recursive_phase_a(
     scan_root: &str,
     llm_client: &LlmClient,
     max_depth: u32,
-) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+) -> Result<DiscoveryResult, Box<dyn std::error::Error>> {
     if !llm_client.is_configured() {
         return Err("LLM not configured".into());
     }
@@ -714,5 +762,5 @@ pub fn run_recursive_phase_a(
     all_skips.dedup();
 
     eprintln!("  Recursive Phase A complete: {} targets, {} skipped", all_targets.len(), all_skips.len());
-    Ok((all_targets, all_skips))
+    Ok(DiscoveryResult { targets: all_targets, skips: all_skips, uniform_dirs: Vec::new() })
 }
