@@ -10,7 +10,7 @@ use fan_core::infer_hierarchical;
 use fan_core::index::IndexEngine;
 use fan_core::llm::LlmClient;
 use fan_core::project::ProjectStore;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub fn run(config: &Config, layer: &DataLayer) {
@@ -124,6 +124,9 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
     let mut uniform_fastpath_count = 0u64;
     index.sqlite.begin_batch().ok();
 
+    // Collect uniform dir paths for fast O(1) lookup during scan
+    let uniform_parents: std::collections::HashSet<String> = uniform_map.keys().cloned().collect();
+
     for root in &scan_roots {
         let scanner = fan_core::scanner::Scanner::new(
             vec![root.to_string()],
@@ -134,42 +137,22 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
         eprintln!("  Scanning root: {}", root);
         for file_info in scanner.scan() {
             let file_path = file_info.path.to_string_lossy();
-
-            // Check if this file belongs to a uniform-extension directory
             let parent = file_info.path.parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            if let Some(uniform) = uniform_map.get(&parent) {
-                // Fast-path: skip open/read, batch-insert with reused format
-                // (format detection done on sample files below)
-                if uniform.sample_paths.iter().any(|s| s == &file_path) {
-                    // Sample file: process normally (open/read/detect format)
-                    match index.index_file(&file_info, None) {
-                        Ok(_) => { total_files += 1; batch_count += 1; }
-                        Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
-                    }
-                } else {
-                    // Bulk file: use fast path (already read magic bytes by Scanner,
-                    // but we skip Tantivy full indexing overhead by grouping)
-                    match index.index_file(&file_info, None) {
-                        Ok(_) => {
-                            total_files += 1;
-                            batch_count += 1;
-                            uniform_fastpath_count += 1;
-                        }
-                        Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
-                    }
+            // Uniform dir bulk file: Scanner already did open+read.
+            // For now, count them but the real skip happens when we
+            // bypass Scanner entirely (next iteration).
+            let is_uniform_bulk = uniform_parents.contains(&parent);
+
+            match index.index_file(&file_info, None) {
+                Ok(_) => {
+                    total_files += 1;
+                    batch_count += 1;
+                    if is_uniform_bulk { uniform_fastpath_count += 1; }
                 }
-            } else {
-                // Normal file: process normally
-                match index.index_file(&file_info, None) {
-                    Ok(_) => {
-                        total_files += 1;
-                        batch_count += 1;
-                    }
-                    Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
-                }
+                Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
             }
 
             if batch_count >= 1000 {
