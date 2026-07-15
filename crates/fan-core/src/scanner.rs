@@ -11,6 +11,8 @@ pub struct Scanner {
     source_server: String,
     /// Directories whose files skip magic-byte reading (uniform-extension fast-path)
     skip_magic_parents: HashSet<String>,
+    /// Skip open/read entirely — use extension-only format detection
+    fast_mode: bool,
 }
 
 impl Scanner {
@@ -20,12 +22,19 @@ impl Scanner {
             exclude_patterns: exclude,
             source_server,
             skip_magic_parents: HashSet::new(),
+            fast_mode: false,
         }
     }
 
     /// Set directories whose files should skip open/read (fast-path for uniform-extension dirs)
     pub fn with_skip_magic(mut self, parents: HashSet<String>) -> Self {
         self.skip_magic_parents = parents;
+        self
+    }
+
+    /// Enable fast mode: skip open+read magic bytes, use extension-only detection
+    pub fn with_fast_mode(mut self, fast: bool) -> Self {
+        self.fast_mode = fast;
         self
     }
 
@@ -51,9 +60,9 @@ impl Scanner {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        // Fast-path: skip open/read for uniform-extension dir files
+        // Fast-path: skip open/read for uniform dirs or when in fast_mode
         let parent = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        let magic = if self.skip_magic_parents.contains(&parent) {
+        let magic = if self.fast_mode || self.skip_magic_parents.contains(&parent) {
             Vec::new()
         } else {
             read_magic(path)

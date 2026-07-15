@@ -14,14 +14,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub fn run(config: &Config, layer: &DataLayer) {
-    run_inner(config, layer, false);
+    run_inner(config, layer, false, false);
 }
 
 pub fn run_deep(config: &Config, layer: &DataLayer) {
-    run_inner(config, layer, true);
+    run_inner(config, layer, true, false);
 }
 
-fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
+pub fn run_deep_fast(config: &Config, layer: &DataLayer) {
+    run_inner(config, layer, true, true);
+}
+
+fn run_inner(config: &Config, layer: &DataLayer, deep: bool, fast: bool) {
     let llm_client = LlmClient::new(config.llm.clone());
     if !llm_client.is_configured() {
         eprintln!("LLM not configured. Set [llm] in config.toml.");
@@ -132,7 +136,9 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool) {
             vec![root.to_string()],
             config.scan.exclude.clone(),
             "discovery".to_string(),
-        ).with_skip_magic(uniform_parents.clone());
+        )
+        .with_skip_magic(uniform_parents.clone())
+        .with_fast_mode(fast);
 
         eprintln!("  Scanning root: {}", root);
         for file_info in scanner.scan() {
