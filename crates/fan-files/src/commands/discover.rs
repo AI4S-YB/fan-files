@@ -112,6 +112,9 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
     let mut uniform_fastpath_count = 0u64;
     index.sqlite.begin_batch().ok();
 
+    // Collect Phase A BIO dirs for Phase C hints
+    let phase_a_bio_dirs: std::collections::HashSet<String> = all_targets.iter().cloned().collect();
+
     // Collect uniform dir paths for fast O(1) lookup during scan
     let uniform_parents: std::collections::HashSet<String> = uniform_map.keys().cloned().collect();
 
@@ -166,7 +169,7 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
 
     for root in &scan_roots {
         eprintln!("  Inferring: {}", root);
-        match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, root) {
+        match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, root, &phase_a_bio_dirs) {
             Ok((projects, _)) => eprintln!("  → {} projects", projects),
             Err(e) => eprintln!("  Inference failed for {}: {}", root, e),
         }

@@ -49,7 +49,7 @@ fn run_inner(config: &Config, layer: &DataLayer, hierarchical: bool) {
     println!("Running LLM inference on indexed files...");
 
     let result = if hierarchical {
-        infer_hierarchical::run_hierarchical_inference(&sqlite, &project_store, &llm_client, scan_root)
+        infer_hierarchical::run_hierarchical_inference(&sqlite, &project_store, &llm_client, scan_root, &std::collections::HashSet::new())
     } else {
         infer::run_inference(&sqlite, &project_store, &llm_client, scan_root)
     };

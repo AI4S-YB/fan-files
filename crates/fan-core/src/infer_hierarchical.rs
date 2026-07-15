@@ -415,6 +415,7 @@ pub fn run_hierarchical_inference(
     project_store: &ProjectStore,
     llm_client: &LlmClient,
     scan_root: &str,
+    _phase_a_bio_dirs: &std::collections::HashSet<String>,
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     if !llm_client.is_configured() {
         info!("LLM not configured, skipping inference");
@@ -489,12 +490,13 @@ pub fn run_hierarchical_inference(
     let mut phase2_count = 0;
     let mut deep_projects: Vec<serde_json::Value> = Vec::new();
 
-    // Phase 2 candidates: subdirs with hidden depth AND not skipped by LLM
+    // Phase 2 candidates: subdirs with hidden depth, not skipped, not already BIO
     let phase2_candidates: Vec<_> = tree.subdirs.iter()
         .filter(|c| !c.subdirs.is_empty() && !c.is_large_flat)
         .filter(|c| c.subdirs.len() >= 2)
         .filter(|c| !skipped_dirs.contains(&c.name)
                   && !skipped_dirs.iter().any(|d| d.ends_with(&format!("/{}", c.name))))
+        .filter(|c| !_phase_a_bio_dirs.iter().any(|bio| c.path.starts_with(bio.as_str())))
         .collect();
 
     if !phase2_candidates.is_empty() {
