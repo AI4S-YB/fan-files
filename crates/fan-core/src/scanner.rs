@@ -11,8 +11,8 @@ pub struct Scanner {
     source_server: String,
     /// Directories whose files skip magic-byte reading (uniform-extension fast-path)
     skip_magic_parents: HashSet<String>,
-    /// Skip open/read entirely — use extension-only format detection
-    fast_mode: bool,
+    /// When true, read magic bytes for precise format detection (default: extension-only)
+    precise_mode: bool,
 }
 
 impl Scanner {
@@ -22,7 +22,7 @@ impl Scanner {
             exclude_patterns: exclude,
             source_server,
             skip_magic_parents: HashSet::new(),
-            fast_mode: false,
+            precise_mode: false,
         }
     }
 
@@ -32,9 +32,9 @@ impl Scanner {
         self
     }
 
-    /// Enable fast mode: skip open+read magic bytes, use extension-only detection
-    pub fn with_fast_mode(mut self, fast: bool) -> Self {
-        self.fast_mode = fast;
+    /// Enable precise mode: read magic bytes for format detection (default: extension-only)
+    pub fn with_precise_mode(mut self, precise: bool) -> Self {
+        self.precise_mode = precise;
         self
     }
 
@@ -62,10 +62,10 @@ impl Scanner {
 
         // Fast-path: skip open/read for uniform dirs or when in fast_mode
         let parent = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        let magic = if self.fast_mode || self.skip_magic_parents.contains(&parent) {
-            Vec::new()
-        } else {
+        let magic = if self.precise_mode && !self.skip_magic_parents.contains(&parent) {
             read_magic(path)
+        } else {
+            Vec::new()
         };
         let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
         RawFileInfo {
