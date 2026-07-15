@@ -80,6 +80,9 @@ enum Commands {
         /// Recursive deep mode (depth 3→5→7, not just depth 3)
         #[arg(long)]
         deep: bool,
+        /// Fast mode: skip open+read magic bytes, use extension-only format detection
+        #[arg(long)]
+        fast: bool,
     },
     /// Interactive setup wizard
     Init,
@@ -174,8 +177,10 @@ fn main() {
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::Update => commands::update::run(),
         Commands::Uninstall => commands::uninstall::run(),
-        Commands::Discover { deep } => {
-            if deep {
+        Commands::Discover { deep, fast } => {
+            if deep && fast {
+                commands::discover::run_deep_fast(&config, &layer);
+            } else if deep {
                 commands::discover::run_deep(&config, &layer);
             } else {
                 commands::discover::run(&config, &layer);

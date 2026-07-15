@@ -1,4 +1,5 @@
 use crate::types::RawFileInfo;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -8,11 +9,33 @@ pub struct Scanner {
     include_dirs: Vec<String>,
     exclude_patterns: Vec<String>,
     source_server: String,
+    /// Directories whose files skip magic-byte reading (uniform-extension fast-path)
+    skip_magic_parents: HashSet<String>,
+    /// Skip open/read entirely — use extension-only format detection
+    fast_mode: bool,
 }
 
 impl Scanner {
     pub fn new(include: Vec<String>, exclude: Vec<String>, source_server: String) -> Self {
-        Self { include_dirs: include, exclude_patterns: exclude, source_server }
+        Self {
+            include_dirs: include,
+            exclude_patterns: exclude,
+            source_server,
+            skip_magic_parents: HashSet::new(),
+            fast_mode: false,
+        }
+    }
+
+    /// Set directories whose files should skip open/read (fast-path for uniform-extension dirs)
+    pub fn with_skip_magic(mut self, parents: HashSet<String>) -> Self {
+        self.skip_magic_parents = parents;
+        self
+    }
+
+    /// Enable fast mode: skip open+read magic bytes, use extension-only detection
+    pub fn with_fast_mode(mut self, fast: bool) -> Self {
+        self.fast_mode = fast;
+        self
     }
 
     pub fn scan(&self) -> impl Iterator<Item = RawFileInfo> + '_ {
@@ -36,7 +59,14 @@ impl Scanner {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let magic = read_magic(path);
+
+        // Fast-path: skip open/read for uniform dirs or when in fast_mode
+        let parent = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let magic = if self.fast_mode || self.skip_magic_parents.contains(&parent) {
+            Vec::new()
+        } else {
+            read_magic(path)
+        };
         let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
         RawFileInfo {
             path: path.to_path_buf(),
