@@ -75,14 +75,11 @@ enum Commands {
     Update,
     /// Uninstall fan-files
     Uninstall,
-    /// Progressive discovery: light walk → targeted scan → infer
+    /// Progressive discovery: bottom-up walk → scan → infer
     Discover {
-        /// Recursive deep mode (depth 3→5→7, not just depth 3)
+        /// Precise mode: read magic bytes for format detection (default: extension-only)
         #[arg(long)]
-        deep: bool,
-        /// Fast mode: skip open+read magic bytes, use extension-only format detection
-        #[arg(long)]
-        fast: bool,
+        precise: bool,
     },
     /// Interactive setup wizard
     Init,
@@ -177,14 +174,8 @@ fn main() {
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::Update => commands::update::run(),
         Commands::Uninstall => commands::uninstall::run(),
-        Commands::Discover { deep, fast } => {
-            if deep && fast {
-                commands::discover::run_deep_fast(&config, &layer);
-            } else if deep {
-                commands::discover::run_deep(&config, &layer);
-            } else {
-                commands::discover::run(&config, &layer);
-            }
+        Commands::Discover { precise } => {
+            commands::discover::run(&config, &layer, precise);
         },
         Commands::Init => commands::init::run(&config, &layer),
         Commands::Servers(action) => match action {

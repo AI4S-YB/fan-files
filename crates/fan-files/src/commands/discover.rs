@@ -13,19 +13,11 @@ use fan_core::project::ProjectStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub fn run(config: &Config, layer: &DataLayer) {
-    run_inner(config, layer, false, false);
+pub fn run(config: &Config, layer: &DataLayer, precise: bool) {
+    run_inner(config, layer, precise);
 }
 
-pub fn run_deep(config: &Config, layer: &DataLayer) {
-    run_inner(config, layer, true, false);
-}
-
-pub fn run_deep_fast(config: &Config, layer: &DataLayer) {
-    run_inner(config, layer, true, true);
-}
-
-fn run_inner(config: &Config, layer: &DataLayer, deep: bool, fast: bool) {
+fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
     let llm_client = LlmClient::new(config.llm.clone());
     if !llm_client.is_configured() {
         eprintln!("LLM not configured. Set [llm] in config.toml.");
@@ -46,29 +38,21 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool, fast: bool) {
     println!("╚══════════════════════════════════════════╝");
     println!();
 
-    // ═══ Phase A ═══
-    let mode_label = if deep {
-        "Bottom-Up (full depth + propagate up)"
-    } else {
-        "Shallow (depth 3)"
-    };
-    println!("═══ Phase A: Directory Analysis ({}) ═══", mode_label);
+    // ═══ Phase A: Bottom-Up Discovery ═══
+    println!("═══ Phase A: Bottom-Up Discovery ═══");
     let mut all_targets: Vec<String> = Vec::new();
     let mut all_uniform_dirs: Vec<discovery::UniformDir> = Vec::new();
     let mut total_skipped = 0;
 
     for root in &scan_roots {
         eprintln!("  Analyzing directory structure: {}", root);
-        let result = if deep {
-            discovery::run_bottom_up_discovery(root, &llm_client)
-        } else {
-            discovery::run_phase_a(root, &llm_client)
-        };
+        let result = discovery::run_bottom_up_discovery(root, &llm_client);
 
         let result = match result {
             Err(e) => {
-                eprintln!("  Phase A failed: {}. Retrying with shallow mode...", e);
-                discovery::run_phase_a(root, &llm_client)
+                eprintln!("  Phase A failed: {}. Falling back to full scan.", e);
+                all_targets.push(root.to_string());
+                continue;
             }
             ok => ok,
         };
@@ -138,7 +122,7 @@ fn run_inner(config: &Config, layer: &DataLayer, deep: bool, fast: bool) {
             "discovery".to_string(),
         )
         .with_skip_magic(uniform_parents.clone())
-        .with_fast_mode(fast);
+        .with_precise_mode(precise);
 
         eprintln!("  Scanning root: {}", root);
         for file_info in scanner.scan() {
