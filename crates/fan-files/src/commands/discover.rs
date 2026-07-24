@@ -112,6 +112,7 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
     let mut total_files = 0u64;
     let mut batch_count = 0usize;
     let mut uniform_fastpath_count = 0u64;
+    let mut filtered_skip_count = 0u64;
     index.sqlite.begin_batch().ok();
 
     // Collect Phase A BIO dirs for Phase C hints
@@ -162,7 +163,7 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
         index.sqlite.commit_batch().ok();
         index.tantivy.commit().ok();
     }
-    eprintln!("  Phase B complete: {} files indexed ({} via uniform fast-path)", total_files, uniform_fastpath_count);
+    eprintln!("  Phase B complete: {} files indexed ({} via uniform fast-path, {} filtered by targets)", total_files, uniform_fastpath_count, filtered_skip_count);
     println!();
 
     // ═══ Phase C: Hierarchical inference ═══

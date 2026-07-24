@@ -765,16 +765,19 @@ pub fn run_dataset_asset_inference(
     let candidate_paths: std::collections::HashSet<&str> = candidates.iter()
         .map(|c| c.path.as_str()).collect();
 
-    for candidate in candidates {
-        // Dedup: if parent dir is also a candidate, skip this child.
-        // The parent dataset will cover this subtree in Phase C.
-        let parent = std::path::Path::new(&candidate.path).parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if candidate_paths.contains(parent.as_str()) {
-            continue;  // Sub-directory of another candidate, not a standalone dataset
-        }
+    // Pre-filter candidates: skip subdirectories of other candidates
+    let filtered_candidates: Vec<&DatasetCandidate> = candidates.iter()
+        .filter(|c| {
+            let parent = std::path::Path::new(&c.path).parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            !candidate_paths.contains(parent.as_str())
+        })
+        .collect();
 
+    eprintln!("  Phase C: {} candidates → {} after dedup", candidates.len(), filtered_candidates.len());
+
+    for candidate in filtered_candidates {
         // Get files under this candidate path
         let dataset_files: Vec<_> = all_files.iter()
             .filter(|(_, p, _)| p.starts_with(&candidate.path))
