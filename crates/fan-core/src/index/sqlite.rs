@@ -120,6 +120,45 @@ impl SqliteStore {
                 )?;
             }
         }
+        // v3: dataset/asset/asset_file tables
+        {
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap_or(0);
+            if version < 3 {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS dataset (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        path TEXT NOT NULL UNIQUE,
+                        dataset_type TEXT,
+                        species TEXT,
+                        species_confidence TEXT,
+                        species_source TEXT,
+                        summary TEXT,
+                        indexed_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS asset (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        dataset_id INTEGER NOT NULL REFERENCES dataset(id),
+                        name TEXT,
+                        asset_type TEXT,
+                        path TEXT,
+                        indexed_at INTEGER NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_asset_dataset ON asset(dataset_id);
+                    CREATE TABLE IF NOT EXISTS asset_file (
+                        asset_id INTEGER NOT NULL REFERENCES asset(id),
+                        file_id INTEGER NOT NULL REFERENCES files(id),
+                        role TEXT,
+                        PRIMARY KEY (asset_id, file_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_asset_file_file ON asset_file(file_id);
+                    PRAGMA user_version = 3;",
+                )?;
+            }
+        }
 
         Ok(())
     }
@@ -377,4 +416,76 @@ impl SqliteStore {
         rows.collect()
     }
 
+
+    // ═══ v2: Dataset/Asset CRUD ═══
+
+    pub fn insert_dataset(&self, name: &str, path: &str,
+        dataset_type: Option<&str>, species: Option<&str>,
+        confidence: Option<&str>, summary: Option<&str>) -> rusqlite::Result<i64>
+    {
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO dataset (name, path, dataset_type, species, species_confidence, summary, indexed_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![name, path, dataset_type, species, confidence, summary, now, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn insert_asset(&self, dataset_id: i64, name: Option<&str>,
+        asset_type: Option<&str>, path: Option<&str>) -> rusqlite::Result<i64>
+    {
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO asset (dataset_id, name, asset_type, path, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![dataset_id, name, asset_type, path, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn link_asset_file(&self, asset_id: i64, file_id: i64, role: Option<&str>) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO asset_file (asset_id, file_id, role) VALUES (?1, ?2, ?3)",
+            rusqlite::params![asset_id, file_id, role],
+        )?;
+        Ok(())
+    }
+
+    pub fn all_datasets(&self) -> rusqlite::Result<Vec<crate::types::DatasetEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, path, dataset_type, species, species_confidence, species_source, summary, indexed_at, updated_at FROM dataset ORDER BY id"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::types::DatasetEntry {
+                id: row.get(0)?, name: row.get(1)?, path: row.get(2)?,
+                dataset_type: row.get(3)?, species: row.get(4)?,
+                species_confidence: row.get(5)?, species_source: row.get(6)?,
+                summary: row.get(7)?, indexed_at: row.get(8)?, updated_at: row.get(9)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn count_assets(&self, dataset_id: i64) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM asset WHERE dataset_id = ?1",
+            rusqlite::params![dataset_id],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn count_dataset_files(&self, dataset_id: i64) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM asset_file af JOIN asset a ON af.asset_id = a.id WHERE a.dataset_id = ?1",
+            rusqlite::params![dataset_id],
+            |r| r.get(0),
+        )
+    }
 }

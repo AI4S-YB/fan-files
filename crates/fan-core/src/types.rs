@@ -51,3 +51,36 @@ pub struct IndexStatus {
     pub db_size_bytes: u64,
     pub servers: Vec<ServerStats>,
 }
+
+// ═══ v2: Dataset → Asset → File 三层模型 ═══
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetEntry {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+    pub dataset_type: Option<String>,
+    pub species: Option<String>,
+    pub species_confidence: Option<String>,
+    pub species_source: Option<String>,
+    pub summary: Option<String>,
+    pub indexed_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetEntry {
+    pub id: i64,
+    pub dataset_id: i64,
+    pub name: Option<String>,
+    pub asset_type: Option<String>,
+    pub path: Option<String>,
+    pub indexed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetFileEntry {
+    pub asset_id: i64,
+    pub file_id: i64,
+    pub role: Option<String>,
+}
