@@ -777,48 +777,70 @@ pub fn run_dataset_asset_inference(
 
     eprintln!("  Phase C: {} candidates → {} after dedup", candidates.len(), filtered_candidates.len());
 
-    for candidate in filtered_candidates {
-        // Get files under this candidate path
-        let dataset_files: Vec<_> = all_files.iter()
-            .filter(|(_, p, _)| p.starts_with(&candidate.path))
-            .cloned()
-            .collect();
-        if dataset_files.len() < 2 { continue; }
+        // Process candidates in multiple small batches
+    let mut remaining: Vec<&&DatasetCandidate> = filtered_candidates.iter().collect();
+    let batch_size_limit: usize = 12000;
 
-        // Build file list prompt
-        let file_list = build_file_list_prompt(&candidate.path, &dataset_files);
-        
-        let prompt = format!(
-            "你是生物信息学家。下面是一个数据集的完整文件列表(候选类型: {})。\n\
-             请完成以下任务:\n\
-             1. 确认或修正数据集类型\n\
-             2. 推断物种(如果可能, 从目录名判断)\n\
-             3. 将文件分组为资产(Asset)。每组文件形成一个Asset\n\
-             4. 为每个文件标注角色: primary(主文件), index(索引), auxiliary(辅助)\n\n\
-             Asset分组参考(不是硬规则，用你的专业知识推理):\n\
-             - assembly: .fa/.fasta 主文件 + .fai 索引\n\
-             - annotation: .gtf/.gff3 基因注释\n\
-             - functional_annotation: func_anno/, itak/ 功能注释\n\
-             - raw_reads: 原始测序数据 .fastq.gz\n\
-             - clean_reads: 质控后的测序数据\n\
-             - alignments: .bam + .bai 比对文件\n\
-             - expression: counts, FPKM, TPM 表达矩阵\n\
-             - variants: .vcf + .tbi 变异文件\n\
-             - peaks: .bed/.narrowPeak peak calling\n\
-             - signals: .bw/.bigwig 信号文件\n\
-             - other: 无法归类\n\n\
-             输出JSON:\n\
-             {{\"dataset_type\":\"genome|transcriptome|...\",\"species\":\"物种名或null\",\n\
-               \"assets\":[{{\"name\":\"资产名\",\"type\":\"assembly|annotation|...\",\n\
-               \"files\":[{{\"path\":\"文件名\",\"role\":\"primary|index|auxiliary\"}}]}}]}}\n\n{}",
-            candidate.dataset_type, file_list
-        );
+    while !remaining.is_empty() {
+        let mut batch_prompt = String::from("你是生物信息学家。下面是一组数据集的完整文件列表。请对每个数据集完成:\n\
+            1. 确认数据集类型 (genome|transcriptome|variant|epigenome|metagenome|germplasm|proteome|other)\n\
+            2. 推断物种 (从目录名判断)\n\
+            3. 将文件分组为资产(Asset)\n\
+            4. 标注文件角色: primary|index|auxiliary\n\n\
+            Asset分组参考: assembly(.fa+.fai), annotation(.gtf/.gff3), functional_annotation(func_anno/itak),\n\
+            raw_reads(.fastq.gz), clean_reads, alignments(.bam+.bai), expression(counts/FPKM),\n\
+            variants(.vcf+.tbi), peaks(.bed/.narrowPeak), signals(.bw/.bigwig), other\n\n");
+
+        let mut batch_ds: Vec<(String, Vec<(i64, String, i64)>, String)> = Vec::new();
+        let mut next_remaining: Vec<&&DatasetCandidate> = Vec::new();
+        let mut batch_full = false;
+
+        for candidate in &remaining {
+            if batch_full {
+                next_remaining.push(candidate);
+                continue;
+            }
+            
+            let dataset_files: Vec<_> = all_files.iter()
+                .filter(|(_, p, _)| p.starts_with(&candidate.path))
+                .cloned()
+                .collect();
+            if dataset_files.len() < 2 {
+                next_remaining.push(candidate);
+                continue;
+            }
+            
+            let ds_name = candidate.path
+                .trim_start_matches(scan_root)
+                .trim_start_matches('/')
+                .replace('/', "_");
+            
+            let section = format!("\n--- Dataset: {} (path: {}) ---\n{}\n",
+                ds_name, candidate.path,
+                build_file_list_prompt(&candidate.path, &dataset_files));
+            
+            if batch_prompt.len() + section.len() > batch_size_limit {
+                batch_full = true;
+                next_remaining.push(candidate);
+                continue;
+            }
+            
+            batch_prompt.push_str(&section);
+            batch_ds.push((ds_name, dataset_files, candidate.path.clone()));
+        }
+
+        if batch_ds.is_empty() { break; }
+
+        batch_prompt.push_str("\n输出JSON: {\"datasets\":[{\"name\":\"数据集名\",\"type\":\"genome|...\",\"species\":\"物种名\",\"assets\":[{\"name\":\"资产名\",\"type\":\"assembly|...\",\"files\":[{\"path\":\"文件名\",\"role\":\"primary|index|auxiliary\"}]}]}]}");
+
+        eprintln!("  Phase C batch: {} candidates, {} chars prompt ({} remaining)",
+            batch_ds.len(), batch_prompt.len(), next_remaining.len());
 
         let body = serde_json::json!({
             "model": llm_client.config.model,
             "messages": [
-                {"role": "system", "content": "你是生物信息学家。根据文件列表将数据集中的文件分组为资产(Asset)，推断角色。"},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": "你是生物信息学家。根据文件列表将数据集中的文件分组为资产(Asset)，推断类型和物种。"},
+                {"role": "user", "content": batch_prompt}
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0.1,
@@ -827,68 +849,52 @@ pub fn run_dataset_asset_inference(
 
         match crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 3) {
             Ok(response) => {
-                let content = response["choices"][0]["message"]["content"]
-                    .as_str().unwrap_or("");
-                match serde_json::from_str::<serde_json::Value>(content) {
-                    Ok(output) => {
-                        let ds_type = output["dataset_type"].as_str()
-                            .unwrap_or(&candidate.dataset_type);
-                        let species = output["species"].as_str()
-                            .filter(|s| *s != "null");
-                        
-                        // Insert dataset
-                        let ds_name = candidate.path
-                            .trim_start_matches(scan_root)
-                            .trim_start_matches('/')
-                            .replace('/', "_");
-                        
-                        match sqlite.insert_dataset(
-                            &ds_name, &candidate.path,
-                            Some(ds_type), species,
-                            Some(&candidate.confidence), None,
-                        ) {
-                            Ok(ds_id) => {
-                                datasets_created += 1;
-                                
-                                // Insert assets and link files
-                                if let Some(assets) = output["assets"].as_array() {
-                                    for asset in assets {
-                                        let a_name = asset["name"].as_str();
-                                        let a_type = asset["type"].as_str();
-                                        let a_path = asset.get("dir").and_then(|v| v.as_str());
-                                        
-                                        if let Ok(a_id) = sqlite.insert_asset(
-                                            ds_id, a_name, a_type, a_path
-                                        ) {
-                                            if let Some(files) = asset["files"].as_array() {
-                                                for fe in files {
-                                                    let fname = fe["path"].as_str().unwrap_or("");
-                                                    let role = fe["role"].as_str();
-                                                    // Find file_id by matching path suffix
-                                                    for (fid, fpath, _) in &dataset_files {
-                                                        if fpath.ends_with(fname) {
-                                                            sqlite.link_asset_file(
-                                                                a_id, *fid, role
-                                                            ).ok();
-                                                            break;
+                let resp_content = response["choices"][0]["message"]["content"].as_str().unwrap_or("");
+                if let Ok(output) = serde_json::from_str::<serde_json::Value>(resp_content) {
+                    if let Some(datasets) = output["datasets"].as_array() {
+                        for ds_val in datasets {
+                            let ds_type = ds_val["type"].as_str().unwrap_or("other");
+                            let species = ds_val["species"].as_str().filter(|s| *s != "null");
+                            let ds_name = ds_val["name"].as_str().unwrap_or("unnamed");
+                            
+                            if let Some((_, dataset_files, ds_path)) = 
+                                batch_ds.iter().find(|(n, _, _)| n == ds_name) {
+                                match sqlite.insert_dataset(ds_name, ds_path, Some(ds_type), species, Some("high"), None) {
+                                    Ok(ds_id) => {
+                                        datasets_created += 1;
+                                        if let Some(assets) = ds_val["assets"].as_array() {
+                                            for asset in assets {
+                                                let a_name = asset["name"].as_str();
+                                                let a_type = asset["type"].as_str();
+                                                if let Ok(a_id) = sqlite.insert_asset(ds_id, a_name, a_type, None) {
+                                                    if let Some(files) = asset["files"].as_array() {
+                                                        for fe in files {
+                                                            let fname = fe["path"].as_str().unwrap_or("");
+                                                            let role = fe["role"].as_str();
+                                                            for (fid, fpath, _) in dataset_files {
+                                                                if fpath.ends_with(fname) {
+                                                                    sqlite.link_asset_file(a_id, *fid, role).ok();
+                                                                    break;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
+                                        eprintln!("  Dataset: {} ({} assets)", ds_name, ds_val["assets"].as_array().map_or(0, |a| a.len()));
                                     }
+                                    Err(e) => warn!("Failed to insert dataset {}: {}", ds_name, e),
                                 }
-                                eprintln!("  Dataset: {} ({} assets)", ds_name, 
-                                    output["assets"].as_array().map_or(0, |a| a.len()));
                             }
-                            Err(e) => warn!("Failed to insert dataset {}: {}", ds_name, e),
                         }
                     }
-                    Err(e) => warn!("Failed to parse LLM response for {}: {}", candidate.path, e),
                 }
             }
-            Err(e) => warn!("Asset inference failed for {}: {}", candidate.path, e),
+            Err(e) => warn!("Batch {} failed: {}", datasets_created / batch_ds.len().max(1) + 1, e),
         }
+        
+        remaining = next_remaining;
     }
 
     Ok(datasets_created)
