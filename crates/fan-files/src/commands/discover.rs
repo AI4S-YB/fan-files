@@ -42,6 +42,7 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
     println!("═══ Phase A: Bottom-Up Discovery ═══");
     let mut all_targets: Vec<String> = Vec::new();
     let mut all_uniform_dirs: Vec<discovery::UniformDir> = Vec::new();
+    let mut all_dataset_candidates: Vec<discovery::DatasetCandidate> = Vec::new();
     let mut total_skipped = 0;
 
     for root in &scan_roots {
@@ -72,6 +73,7 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
                     all_targets.push(abs);
                 }
                 all_uniform_dirs.extend(discovery_result.uniform_dirs);
+                all_dataset_candidates.extend(discovery_result.dataset_candidates);
             }
             Err(e) => {
                 eprintln!("  Phase A failed after retry: {}. Scanning root as-is.", e);
@@ -87,8 +89,8 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
         .collect();
 
     eprintln!(
-        "  Phase A complete: {} targets, {} skipped, {} uniform dirs. Scanning {} roots.",
-        all_targets.len(), total_skipped, uniform_map.len(), scan_roots.len()
+        "  Phase A complete: {} targets, {} skipped, {} uniform, {} dataset candidates. {} roots.",
+        all_targets.len(), total_skipped, uniform_map.len(), all_dataset_candidates.len(), scan_roots.len()
     );
     println!();
 

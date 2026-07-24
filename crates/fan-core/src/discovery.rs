@@ -64,10 +64,18 @@ pub struct UniformDir {
 
 /// Result of bottom-up discovery: targets to scan, dirs to skip,
 /// and uniform-extension dirs for fast batch indexing.
+pub struct DatasetCandidate {
+    pub path: String,
+    pub dataset_type: String,
+    pub species: Option<String>,
+    pub confidence: String,
+}
+
 pub struct DiscoveryResult {
     pub targets: Vec<String>,
     pub skips: Vec<String>,
     pub uniform_dirs: Vec<UniformDir>,
+    pub dataset_candidates: Vec<DatasetCandidate>,
 }
 
 /// Bio-relevant file extensions (not exhaustive — LLM handles the rest).
@@ -338,6 +346,7 @@ pub fn run_bottom_up_discovery(
         .count();
 
     let mut llm_targets: Vec<String> = Vec::new();
+    let mut llm_dataset_candidates: Vec<DatasetCandidate> = Vec::new();
     if unknown_count > 0 {
         // Build compressed annotated tree for LLM
         eprintln!("  Bottom-Up: building compressed tree for LLM ({} ? dirs)...", unknown_count);
@@ -345,7 +354,9 @@ pub fn run_bottom_up_discovery(
         eprintln!("  Bottom-Up: prompt size = {} chars", prompt.len());
 
         if prompt.len() > 500 {
-            llm_targets = llm_classify_bottom_up(llm_client, &prompt, scan_root)?;
+            let (targets_from_llm, dataset_hints) = llm_classify_bottom_up(llm_client, &prompt, scan_root)?;
+            llm_targets = targets_from_llm;
+            llm_dataset_candidates = dataset_hints;
         }
     }
 
@@ -394,7 +405,7 @@ pub fn run_bottom_up_discovery(
         targets.len(),
         skips.len()
     );
-    Ok(DiscoveryResult { targets, skips, uniform_dirs })
+    Ok(DiscoveryResult { targets, skips, uniform_dirs, dataset_candidates: llm_dataset_candidates })
 }
 
 /// Build a condensed annotated tree prompt from bottom-up fingerprints.
@@ -482,26 +493,31 @@ fn llm_classify_bottom_up(
     llm_client: &LlmClient,
     tree_prompt: &str,
     _scan_root: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<String>, Vec<DatasetCandidate>), Box<dyn std::error::Error>> {
     let full_prompt = format!(
-        "你是生物信息数据管理助手。下面是压缩后的目录树:\n\
-         - BIO = 有生信文件/传播信号 → 已自动纳入扫描，子目录省略\n\
-         - ?   = 不确定 → 需要你根据目录名+文件后缀+上下文判断\n\
-         - EMPTY = 无文件无子目录 → 已自动跳过\n\
-         - NOISE = 已知噪音(.git等) → 已自动跳过\n\n\
-         你的任务:\n\
-         1. 判断 ? 目录是否为生信项目/分析步骤/分类框架/噪音\n\
-         2. 识别项目边界(分析步骤型/物种分类型/子项目型/泛基因组型)\n\
-         3. 每个 ? 目录只有一行(子目录已省略)，你需要根据目录名和文件后缀判断\n\
-         输出JSON: {{\"targets\":[{{\"path\":\"完整路径\"}}], \"project_roots\":[{{\"path\":\"路径\"}}]}}\n\
-         (BIO目录不需列出，已自动全部纳入)\n\n{}",
+        "你是生物信息学家。下面是压缩后的目录树，每个目录标注了文件组成。\n\
+         用你的专业知识判断：哪些目录是\"数据集\"以及它是什么类型。\n\n\
+         数据集 = 一组相关生物信息文件的集合，通常对应某类组学数据。\n\
+         数据集类型参考（推理起点，不是硬规则）：\n\
+         - genome: 大 .fa/.fasta + .fai/.gtf/.gff3 或 func_anno/ 子目录\n\
+         - transcriptome: .fastq.gz 大量出现，子目录 raw/clean/mapping/expression\n\
+         - variant: .vcf/.vcf.gz 出现，常与genome数据集共存\n\
+         - epigenome: .bed + .bw + .narrowPeak/.broadPeak 组合\n\
+         - metagenome: 大量 .fastq.gz + 无参考基因组特征\n\
+         - germplasm: .final_table，种质编号模式\n\
+         - proteome: .mzML/.mzXML 或蛋白 .fasta\n\
+         - other: 无法归类时使用\n\n\
+         判断时考虑：该目录自身文件 + 子目录结构。纯分类框架(0 files)不是数据集。\n\
+         物种信息能从目录名推断的，一并输出。\n\
+         输出JSON: {{\"datasets\":[{{\"path\":\"路径\",\"dataset_type\":\"类型\",\"species\":\"物种\",\"confidence\":\"high\"}}],\n\
+         \"scan_targets\":[{{\"path\":\"路径\"}}]}}\n\n{}",
         tree_prompt
     );
 
     let body = serde_json::json!({
         "model": llm_client.config.model,
         "messages": [
-            {"role": "system", "content": "你是生物信息数据管理助手。根据带信号标注的目录树判断哪些目录需要纳入扫描。🟢=有生信信号，直接纳入。🟡=需根据上下文判断。"},
+            {"role": "system", "content": "你是生物信息学家。根据目录树和文件组成判断哪些目录是数据集及其类型。用专业知识推理，不被预设规则限制。"},
             {"role": "user", "content": full_prompt}
         ],
         "response_format": {"type": "json_object"},
@@ -515,11 +531,11 @@ fn llm_classify_bottom_up(
         .as_str().ok_or("No content")?;
 
     let output: serde_json::Value = serde_json::from_str(content)?;
-    let targets: Vec<String> = output["targets"].as_array()
+    let targets: Vec<String> = output["scan_targets"].as_array()
         .map(|a| a.iter().filter_map(|v| v["path"].as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    Ok(targets)
+    Ok((targets, Vec::new()))
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -657,7 +673,7 @@ pub fn run_phase_a(
 
     let output: serde_json::Value = serde_json::from_str(content)?;
 
-    let targets: Vec<String> = output["targets"].as_array()
+    let targets: Vec<String> = output["scan_targets"].as_array()
         .map(|a| a.iter().filter_map(|v| v["path"].as_str().map(String::from)).collect())
         .unwrap_or_default();
     let skips: Vec<String> = output["skips"].as_array()
@@ -665,7 +681,7 @@ pub fn run_phase_a(
         .unwrap_or_default();
 
     eprintln!("  Phase A: {} targets to scan, {} dirs to skip", targets.len(), skips.len());
-    Ok(DiscoveryResult { targets, skips, uniform_dirs: Vec::new() })
+    Ok(DiscoveryResult { targets, skips, uniform_dirs: Vec::new(), dataset_candidates: Vec::new() })
 }
 
 /// Recursive Phase A (original, kept for backward compat).
@@ -718,7 +734,7 @@ pub fn run_recursive_phase_a(
                 Ok(response) => {
                     let content = response["choices"][0]["message"]["content"].as_str().unwrap_or("");
                     if let Ok(output) = serde_json::from_str::<serde_json::Value>(content) {
-                        if let Some(arr) = output["targets"].as_array() {
+                        if let Some(arr) = output["scan_targets"].as_array() {
                             for v in arr {
                                 if let Some(p) = v["path"].as_str() {
                                     let abs = if p.starts_with('/') { p.to_string() }
@@ -762,5 +778,5 @@ pub fn run_recursive_phase_a(
     all_skips.dedup();
 
     eprintln!("  Recursive Phase A complete: {} targets, {} skipped", all_targets.len(), all_skips.len());
-    Ok(DiscoveryResult { targets: all_targets, skips: all_skips, uniform_dirs: Vec::new() })
+    Ok(DiscoveryResult { targets: all_targets, skips: all_skips, uniform_dirs: Vec::new(), dataset_candidates: Vec::new() })
 }
