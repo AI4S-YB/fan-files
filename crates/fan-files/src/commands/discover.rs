@@ -169,11 +169,16 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
     println!("═══ Phase C: LLM Inference ═══");
     let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
 
-    for root in &scan_roots {
-        eprintln!("  Inferring: {}", root);
-        match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, root, &phase_a_bio_dirs) {
-            Ok((projects, _)) => eprintln!("  → {} projects", projects),
-            Err(e) => eprintln!("  Inference failed for {}: {}", root, e),
+    // Phase C: Dataset + Asset inference
+    if !all_dataset_candidates.is_empty() {
+        eprintln!("  Inferring datasets from {} candidates...", all_dataset_candidates.len());
+        match infer_hierarchical::run_dataset_asset_inference(
+            &index.sqlite, &llm_client, 
+            scan_roots.first().unwrap_or(&""),
+            &all_dataset_candidates
+        ) {
+            Ok(n) => eprintln!("  → {} datasets created", n),
+            Err(e) => eprintln!("  Dataset inference failed: {}", e),
         }
     }
 

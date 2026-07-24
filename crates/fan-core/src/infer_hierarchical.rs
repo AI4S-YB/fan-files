@@ -8,6 +8,7 @@
 
 use crate::index::sqlite::SqliteStore;
 use crate::llm::LlmClient;
+use crate::discovery::DatasetCandidate;
 use crate::project::ProjectStore;
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -741,3 +742,165 @@ fn back_sync_metadata(
     }
     count
 }
+
+
+/// v2 Phase C: Dataset + Asset inference.
+/// Takes Phase A candidates, scans their files from SQLite,
+/// sends to LLM for Asset grouping, writes results to dataset/asset/asset_file tables.
+pub fn run_dataset_asset_inference(
+    sqlite: &SqliteStore,
+    llm_client: &LlmClient,
+    scan_root: &str,
+    candidates: &[crate::discovery::DatasetCandidate],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    if !llm_client.is_configured() {
+        info!("LLM not configured, skipping inference");
+        return Ok(0);
+    }
+
+    let all_files = sqlite.all_paths().unwrap_or_default();
+    let mut datasets_created = 0usize;
+
+    for candidate in candidates {
+        // Get files under this candidate path
+        let dataset_files: Vec<_> = all_files.iter()
+            .filter(|(_, p, _)| p.starts_with(&candidate.path))
+            .cloned()
+            .collect();
+        if dataset_files.len() < 2 { continue; }
+
+        // Build file list prompt
+        let file_list = build_file_list_prompt(&candidate.path, &dataset_files);
+        
+        let prompt = format!(
+            "你是生物信息学家。下面是一个数据集的完整文件列表(候选类型: {})。\n\
+             请完成以下任务:\n\
+             1. 确认或修正数据集类型\n\
+             2. 推断物种(如果可能, 从目录名判断)\n\
+             3. 将文件分组为资产(Asset)。每组文件形成一个Asset\n\
+             4. 为每个文件标注角色: primary(主文件), index(索引), auxiliary(辅助)\n\n\
+             Asset分组参考(不是硬规则，用你的专业知识推理):\n\
+             - assembly: .fa/.fasta 主文件 + .fai 索引\n\
+             - annotation: .gtf/.gff3 基因注释\n\
+             - functional_annotation: func_anno/, itak/ 功能注释\n\
+             - raw_reads: 原始测序数据 .fastq.gz\n\
+             - clean_reads: 质控后的测序数据\n\
+             - alignments: .bam + .bai 比对文件\n\
+             - expression: counts, FPKM, TPM 表达矩阵\n\
+             - variants: .vcf + .tbi 变异文件\n\
+             - peaks: .bed/.narrowPeak peak calling\n\
+             - signals: .bw/.bigwig 信号文件\n\
+             - other: 无法归类\n\n\
+             输出JSON:\n\
+             {{\"dataset_type\":\"genome|transcriptome|...\",\"species\":\"物种名或null\",\n\
+               \"assets\":[{{\"name\":\"资产名\",\"type\":\"assembly|annotation|...\",\n\
+               \"files\":[{{\"path\":\"文件名\",\"role\":\"primary|index|auxiliary\"}}]}}]}}\n\n{}",
+            candidate.dataset_type, file_list
+        );
+
+        let body = serde_json::json!({
+            "model": llm_client.config.model,
+            "messages": [
+                {"role": "system", "content": "你是生物信息学家。根据文件列表将数据集中的文件分组为资产(Asset)，推断角色。"},
+                {"role": "user", "content": prompt}
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+            "max_tokens": 16384
+        });
+
+        match crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 3) {
+            Ok(response) => {
+                let content = response["choices"][0]["message"]["content"]
+                    .as_str().unwrap_or("");
+                match serde_json::from_str::<serde_json::Value>(content) {
+                    Ok(output) => {
+                        let ds_type = output["dataset_type"].as_str()
+                            .unwrap_or(&candidate.dataset_type);
+                        let species = output["species"].as_str()
+                            .filter(|s| *s != "null");
+                        
+                        // Insert dataset
+                        let ds_name = candidate.path
+                            .trim_start_matches(scan_root)
+                            .trim_start_matches('/')
+                            .replace('/', "_");
+                        
+                        match sqlite.insert_dataset(
+                            &ds_name, &candidate.path,
+                            Some(ds_type), species,
+                            Some(&candidate.confidence), None,
+                        ) {
+                            Ok(ds_id) => {
+                                datasets_created += 1;
+                                
+                                // Insert assets and link files
+                                if let Some(assets) = output["assets"].as_array() {
+                                    for asset in assets {
+                                        let a_name = asset["name"].as_str();
+                                        let a_type = asset["type"].as_str();
+                                        let a_path = asset.get("dir").and_then(|v| v.as_str());
+                                        
+                                        if let Ok(a_id) = sqlite.insert_asset(
+                                            ds_id, a_name, a_type, a_path
+                                        ) {
+                                            if let Some(files) = asset["files"].as_array() {
+                                                for fe in files {
+                                                    let fname = fe["path"].as_str().unwrap_or("");
+                                                    let role = fe["role"].as_str();
+                                                    // Find file_id by matching path suffix
+                                                    for (fid, fpath, _) in &dataset_files {
+                                                        if fpath.ends_with(fname) {
+                                                            sqlite.link_asset_file(
+                                                                a_id, *fid, role
+                                                            ).ok();
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                eprintln!("  Dataset: {} ({} assets)", ds_name, 
+                                    output["assets"].as_array().map_or(0, |a| a.len()));
+                            }
+                            Err(e) => warn!("Failed to insert dataset {}: {}", ds_name, e),
+                        }
+                    }
+                    Err(e) => warn!("Failed to parse LLM response for {}: {}", candidate.path, e),
+                }
+            }
+            Err(e) => warn!("Asset inference failed for {}: {}", candidate.path, e),
+        }
+    }
+
+    Ok(datasets_created)
+}
+
+/// Build a compact file list prompt for a dataset directory.
+fn build_file_list_prompt(root: &str, files: &[(i64, String, i64)]) -> String {
+    use std::collections::BTreeMap;
+    let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (_, path, _) in files {
+        let p = std::path::Path::new(path);
+        let parent = p.parent()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let fname = p.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        by_dir.entry(parent).or_default().push(fname);
+    }
+    
+    let mut lines = vec![format!("数据集根: {}", root)];
+    for (dir, fnames) in &by_dir {
+        let rel = if dir == root { "(根)".to_string() } 
+            else { dir.strip_prefix(root).unwrap_or(dir).to_string() };
+        let show: Vec<&str> = fnames.iter().take(20).map(|s| s.as_str()).collect();
+        let more = if fnames.len() > 20 { format!(" ... +{} more", fnames.len()-20) } else { String::new() };
+        lines.push(format!("  {}: {}{}", rel, show.join(", "), more));
+    }
+    lines.join("\n")
+}
+
