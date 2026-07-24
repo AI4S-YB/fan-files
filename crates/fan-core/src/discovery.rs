@@ -405,6 +405,17 @@ pub fn run_bottom_up_discovery(
         targets.len(),
         skips.len()
     );
+    // Auto-generate dataset candidates from all targets (Phase A markers)
+    // Each target IS a dataset candidate — Phase C will refine the type
+    if llm_dataset_candidates.is_empty() {
+        llm_dataset_candidates = targets.iter().map(|t| DatasetCandidate {
+            path: t.clone(),
+            dataset_type: "other".to_string(),
+            species: None,
+            confidence: "low".to_string(),
+        }).collect();
+    }
+
     Ok(DiscoveryResult { targets, skips, uniform_dirs, dataset_candidates: llm_dataset_candidates })
 }
 
@@ -495,14 +506,7 @@ fn llm_classify_bottom_up(
     _scan_root: &str,
 ) -> Result<(Vec<String>, Vec<DatasetCandidate>), Box<dyn std::error::Error>> {
     let full_prompt = format!(
-        "你是生物信息数据管理助手。下面是压缩后的目录树，每个目录标注了文件组成。\n\
-         用你的专业知识完成两个任务:\n\
-         1. 判断 ? 目录: 是否为生信数据目录(纳入扫描)还是噪音(跳过)\n\
-         2. 对纳入扫描的目录，判断它是哪种组学数据集类型\n\n\
-         数据集类型参考（推理起点）:\n\
-         genome, transcriptome, variant, epigenome, metagenome, germplasm, proteome, other\n\n\
-         输出JSON: {{\"scan_targets\":[{{\"path\":\"路径\"}}],\n\
-         \"datasets\":[{{\"path\":\"路径\",\"type\":\"genome|transcriptome|...\",\"species\":\"物种或null\",\"confidence\":\"high|medium|low\"}}]}}\n\n{}",
+        "你是生物信息学家。下面是压缩后的目录树，每个目录标注了文件组成。\n\
          用你的专业知识判断：哪些目录是\"数据集\"以及它是什么类型。\n\n\
          数据集 = 一组相关生物信息文件的集合，通常对应某类组学数据。\n\
          数据集类型参考（推理起点，不是硬规则）：\n\

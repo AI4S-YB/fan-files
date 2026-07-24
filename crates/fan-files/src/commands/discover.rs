@@ -170,16 +170,26 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
     let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
 
     // Phase C: Dataset + Asset inference
-    if !all_dataset_candidates.is_empty() {
-        eprintln!("  Inferring datasets from {} candidates...", all_dataset_candidates.len());
-        match infer_hierarchical::run_dataset_asset_inference(
-            &index.sqlite, &llm_client, 
-            scan_roots.first().unwrap_or(&""),
-            &all_dataset_candidates
-        ) {
-            Ok(n) => eprintln!("  → {} datasets created", n),
-            Err(e) => eprintln!("  Dataset inference failed: {}", e),
-        }
+    // Fallback: if Phase A returned no candidates, use scan_roots directly
+    let candidates: Vec<fan_core::discovery::DatasetCandidate> = if all_dataset_candidates.is_empty() {
+        scan_roots.iter().map(|r| fan_core::discovery::DatasetCandidate {
+            path: r.to_string(),
+            dataset_type: "other".to_string(),
+            species: None,
+            confidence: "low".to_string(),
+        }).collect()
+    } else {
+        all_dataset_candidates
+    };
+
+    eprintln!("  Inferring datasets from {} candidates...", candidates.len());
+    match infer_hierarchical::run_dataset_asset_inference(
+        &index.sqlite, &llm_client,
+        scan_roots.first().unwrap_or(&""),
+        &candidates
+    ) {
+        Ok(n) => eprintln!("  → {} datasets created", n),
+        Err(e) => eprintln!("  Dataset inference failed: {}", e),
     }
 
     println!();
