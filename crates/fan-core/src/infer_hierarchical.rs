@@ -747,6 +747,42 @@ fn back_sync_metadata(
 /// v2 Phase C: Dataset + Asset inference.
 /// Takes Phase A candidates, scans their files from SQLite,
 /// sends to LLM for Asset grouping, writes results to dataset/asset/asset_file tables.
+
+fn load_user_rules() -> String {
+    let path = dirs_fan().join("rules.toml");
+    if !path.exists() { return String::new(); }
+    std::fs::read_to_string(&path).unwrap_or_default()
+}
+
+fn load_correction_patterns() -> String {
+    let path = dirs_fan().join("corrections.json");
+    if !path.exists() { return String::new(); }
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Some(patterns) = json["patterns"].as_array() {
+            let threshold = json["threshold"].as_u64().unwrap_or(3);
+            let rules: Vec<String> = patterns.iter()
+                .filter_map(|p| {
+                    let count = p["count"].as_u64().unwrap_or(0);
+                    let pat = p["pattern"].as_str().unwrap_or("");
+                    if count >= threshold { Some(format!("- {}", pat)) }
+                    else { None }
+                })
+                .collect();
+            return rules.join("
+");
+        }
+    }
+    String::new()
+}
+
+fn dirs_fan() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".fan-files")
+}
+
 pub fn run_dataset_asset_inference(
     sqlite: &SqliteStore,
     llm_client: &LlmClient,
