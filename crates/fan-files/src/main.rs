@@ -76,6 +76,15 @@ enum Commands {
     /// Uninstall fan-files
     Uninstall,
     /// Progressive discovery: bottom-up walk → scan → infer
+    /// Record a manual correction for rules learning
+    Correct {
+        #[arg(long)]
+        dataset: Option<String>,
+        #[arg(long)]
+        asset: Option<String>,
+        #[arg(long)]
+        new_type: Option<String>,
+    },
     Discover {
         /// Precise mode: read magic bytes for format detection (default: extension-only)
         #[arg(long)]
@@ -176,6 +185,9 @@ fn main() {
         Commands::Uninstall => commands::uninstall::run(),
         Commands::Discover { precise } => {
             commands::discover::run(&config, &layer, precise);
+        },
+        Commands::Correct { dataset, asset, new_type } => {
+            commands::correct::run(dataset, asset, new_type);
         },
         Commands::Init => commands::init::run(&config, &layer),
         Commands::Servers(action) => match action {

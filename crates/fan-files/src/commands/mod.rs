@@ -12,3 +12,4 @@ pub mod suggest;
 pub mod uninstall;
 pub mod servers;
 pub mod update;
+pub mod correct;
