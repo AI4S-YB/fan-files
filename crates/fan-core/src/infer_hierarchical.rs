@@ -783,6 +783,14 @@ fn dirs_fan() -> std::path::PathBuf {
         .join(".fan-files")
 }
 
+fn read_prompt(path: &std::path::PathBuf, fallback: &str) -> String {
+    if path.exists() {
+        std::fs::read_to_string(path).unwrap_or_else(|_| fallback.to_string())
+    } else {
+        fallback.to_string()
+    }
+}
+
 pub fn run_dataset_asset_inference(
     sqlite: &SqliteStore,
     llm_client: &LlmClient,
@@ -825,14 +833,17 @@ pub fn run_dataset_asset_inference(
     let mut ds_paths: Vec<(i64, String)> = Vec::new();
 
     while batch_start < total_candidates {
-        let mut batch_prompt = String::from("你是生物信息学家。下面是一组数据集的完整文件列表。请对每个数据集完成:\n\
-            1. 确认数据集类型 (genome|transcriptome|variant|epigenome|metagenome|germplasm|proteome|other)\n\
-            2. 推断物种 (从目录名判断)\n\
-            3. 将文件分组为资产(Asset)\n\
-            4. 标注文件角色: primary|index|auxiliary\n\n\
-            Asset分组参考: assembly(.fa+.fai), annotation(.gtf/.gff3), functional_annotation(func_anno/itak),\n\
-            raw_reads(.fastq.gz), clean_reads, alignments(.bam+.bai), expression(counts/FPKM),\n\
-            variants(.vcf+.tbi), peaks(.bed/.narrowPeak), signals(.bw/.bigwig), other\n\n");
+        // Layer 1-3: read prompts from Markdown files
+        let fan_dir = std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".fan-files"))
+            .unwrap_or_else(|_| std::path::PathBuf::from(".fan-files"));
+        let l1 = read_prompt(&fan_dir.join("prompt-L1-base.md"), "你是生物信息工程师。请按数据集类型分组文件为Asset，标注角色。");
+        let l2 = read_prompt(&fan_dir.join("prompt-L2-user.md"), "");
+        let l3 = read_prompt(&fan_dir.join("prompt-L3-auto.md"), "");
+        let mut batch_prompt = l1;
+        if !l2.is_empty() { batch_prompt.push_str("\n# 用户规则\n"); batch_prompt.push_str(&l2); }
+        if !l3.is_empty() { batch_prompt.push_str("\n# 系统学习\n"); batch_prompt.push_str(&l3); }
+        batch_prompt.push('\n');
 
         let mut batch_ds: Vec<(String, Vec<(i64, String, i64)>, String)> = Vec::new();
         let mut batch_end = batch_start;
