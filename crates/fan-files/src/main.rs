@@ -55,6 +55,9 @@ enum Commands {
     },
     /// Show index status
     Status,
+    /// Snapshot management (list, diff, rollback)
+    #[command(subcommand)]
+    Snapshots(SnapshotAction),
     /// Run LLM inference on indexed files (default: hierarchical tree mode)
     Infer {
         /// Use flat file-by-file mode (legacy)
@@ -115,6 +118,21 @@ enum ProjectAction {
         confidence: Option<String>,
         #[arg(long)]
         assay_type: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotAction {
+    /// List recent snapshots
+    List,
+    /// Diff two snapshots
+    Diff {
+        id1: i64,
+        id2: i64,
+    },
+    /// Rollback to a snapshot
+    Rollback {
+        id: i64,
     },
 }
 
@@ -197,6 +215,11 @@ fn main() {
             commands::correct::run(dataset, asset, new_type);
         },
         Commands::Init => commands::init::run(&config, &layer),
+        Commands::Snapshots(action) => match action {
+            SnapshotAction::List => commands::snapshot::list(&config, &layer),
+            SnapshotAction::Diff { id1, id2 } => commands::snapshot::diff(&config, &layer, id1, id2),
+            SnapshotAction::Rollback { id } => commands::snapshot::rollback(&config, &layer, id),
+        },
         Commands::Servers(action) => match action {
             ServersAction::List => commands::servers::list(&config),
             ServersAction::Add { name } => commands::servers::add(&name),
