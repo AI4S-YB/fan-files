@@ -447,7 +447,7 @@ impl SqliteStore {
         let now = Self::now();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO dataset (name, path, dataset_type, species, species_confidence, summary, indexed_at, updated_at)
+            "INSERT OR REPLACE INTO dataset (name, path, dataset_type, species, species_confidence, summary, indexed_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![name, path, dataset_type, species, confidence, summary, now, now],
         )?;
