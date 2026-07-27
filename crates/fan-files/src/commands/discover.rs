@@ -14,10 +14,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub fn run(config: &Config, layer: &DataLayer, precise: bool) {
-    run_inner(config, layer, precise);
+    run_inner(config, layer, precise, false);
 }
 
-fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
+pub fn run_re_infer(config: &Config, layer: &DataLayer, precise: bool) {
+    run_inner(config, layer, precise, true);
+}
+
+fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) {
     let llm_client = LlmClient::new(config.llm.clone());
     if !llm_client.is_configured() {
         eprintln!("LLM not configured. Set [llm] in config.toml.");
@@ -165,6 +169,19 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool) {
     }
     eprintln!("  Phase B complete: {} files indexed ({} via uniform fast-path, {} filtered by targets)", total_files, uniform_fastpath_count, filtered_skip_count);
     println!();
+
+    // Create snapshot for re-infer tracking
+    let snapshot_id: Option<i64> = if re_infer {
+        let prev = index.sqlite.latest_snapshot().ok().flatten();
+        let prev_summary = prev.map(|(_, s)| s).unwrap_or_default();
+        match index.sqlite.create_snapshot("manual", "", &format!("{} datasets", all_dataset_candidates.len())) {
+            Ok(id) => {
+                eprintln!("  Snapshot #{} created (previous: {})", id, prev_summary);
+                Some(id)
+            }
+            Err(e) => { eprintln!("  Failed to create snapshot: {}", e); None }
+        }
+    } else { None };
 
     // ═══ Phase C: Hierarchical inference ═══
     println!("═══ Phase C: LLM Inference ═══");

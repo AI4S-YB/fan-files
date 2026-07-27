@@ -160,6 +160,27 @@ impl SqliteStore {
             }
         }
 
+        // v4: infer_snapshot for re-infer version tracking
+        {
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap_or(0);
+            if version < 4 {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS infer_snapshot (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at INTEGER NOT NULL,
+                        trigger TEXT NOT NULL,
+                        rule_hash TEXT,
+                        summary TEXT
+                    );
+                    ALTER TABLE dataset ADD COLUMN snapshot_id INTEGER REFERENCES infer_snapshot(id);
+                    ALTER TABLE asset ADD COLUMN snapshot_id INTEGER REFERENCES infer_snapshot(id);
+                    PRAGMA user_version = 4;",
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -487,5 +508,48 @@ impl SqliteStore {
             rusqlite::params![dataset_id],
             |r| r.get(0),
         )
+    }
+
+    // ═══ Snapshot CRUD (re-infer version tracking) ═══
+
+    pub fn create_snapshot(&self, trigger: &str, rule_hash: &str, summary: &str) -> rusqlite::Result<i64> {
+        let now = Self::now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO infer_snapshot (created_at, trigger, rule_hash, summary) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![now, trigger, rule_hash, summary],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn set_dataset_snapshot(&self, dataset_id: i64, snapshot_id: i64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE dataset SET snapshot_id = ?1 WHERE id = ?2",
+            rusqlite::params![snapshot_id, dataset_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_snapshot(&self) -> rusqlite::Result<Option<(i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT id, summary FROM infer_snapshot ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn rollback_to_snapshot(&self, snapshot_id: i64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        // Delete datasets and assets created AFTER this snapshot
+        conn.execute("DELETE FROM asset_file WHERE asset_id IN (SELECT id FROM asset WHERE snapshot_id > ?1)", rusqlite::params![snapshot_id])?;
+        conn.execute("DELETE FROM asset WHERE snapshot_id > ?1", rusqlite::params![snapshot_id])?;
+        conn.execute("DELETE FROM dataset WHERE snapshot_id > ?1", rusqlite::params![snapshot_id])?;
+        Ok(())
     }
 }

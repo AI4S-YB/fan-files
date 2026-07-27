@@ -89,6 +89,9 @@ enum Commands {
         /// Precise mode: read magic bytes for format detection (default: extension-only)
         #[arg(long)]
         precise: bool,
+        /// Re-infer only (skip scan, re-run Phase C with current rules)
+        #[arg(long)]
+        re_infer: bool,
     },
     /// Interactive setup wizard
     Init,
@@ -183,8 +186,12 @@ fn main() {
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::Update => commands::update::run(),
         Commands::Uninstall => commands::uninstall::run(),
-        Commands::Discover { precise } => {
-            commands::discover::run(&config, &layer, precise);
+        Commands::Discover { precise, re_infer } => {
+            if re_infer {
+                commands::discover::run_re_infer(&config, &layer, precise);
+            } else {
+                commands::discover::run(&config, &layer, precise);
+            }
         },
         Commands::Correct { dataset, asset, new_type } => {
             commands::correct::run(dataset, asset, new_type);
