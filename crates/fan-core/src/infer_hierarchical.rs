@@ -443,16 +443,7 @@ pub fn run_hierarchical_inference(
          目录树:\n{}", prompt_text
     );
 
-    let system_prompt = "你是生物信息学数据管理助手。用户提供一个扫描根目录的树状结构，\
-        包含每个子目录的文件数量、扩展名分布和代表性文件名。\n\n\
-        你的任务:\n\
-        1. 识别每个顶层目录对应的生物学项目(物种+实验类型)\n\
-        2. 将明显不是生信数据的目录标记skip:true(如code, venv, testdata, .pnpm-store, scripts)\n\
-        3. 同一物种/项目的多个目录合并(如Oryza_sativa和Oryza_sativa_multi)\n\
-        4. 对无法确定物种的目录，从目录名+文件名推断\n\n\
-        输出JSON格式:\n\
-        {\"projects\":[{\"name\":\"项目名\",\"dirs\":[\"子目录路径\"],\"assay_type\":\"RNA-seq|WGS|genome_annotation|variant_calling|epigenomics|transcriptomics|phenomics|germplasm\",\
-        \"species\":\"物种拉丁名\",\"species_confidence\":\"high|medium|low\",\"summary\":\"描述\",\"skip\":false}]}";
+    let system_prompt = "你是资深生物信息数据工程师，擅长组学数据分类。";
     let body = serde_json::json!({
         "model": llm_client.config.model,
         "messages": [
