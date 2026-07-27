@@ -1001,3 +1001,29 @@ fn build_file_list_prompt(root: &str, files: &[(i64, String, i64)]) -> String {
     lines.join("\n")
 }
 
+
+fn load_rules() -> String {
+    let path = dirs_fan().join("rules.toml");
+    if !path.exists() { return String::new(); }
+    std::fs::read_to_string(&path).unwrap_or_default()
+}
+
+fn load_corrections() -> String {
+    let path = dirs_fan().join("corrections.json");
+    if !path.exists() { return String::new(); }
+    let s = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
+        let threshold = json["threshold"].as_u64().unwrap_or(3);
+        if let Some(patterns) = json["patterns"].as_array() {
+            let rules: Vec<String> = patterns.iter()
+                .filter_map(|p| {
+                    let c = p["count"].as_u64().unwrap_or(0);
+                    let pat = p["pattern"].as_str().unwrap_or("");
+                    if c >= threshold { Some(format!("- {}", pat)) } else { None }
+                }).collect();
+            return rules.join("\n");
+        }
+    }
+    String::new()
+}
+
