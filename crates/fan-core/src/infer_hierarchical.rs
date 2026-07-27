@@ -837,7 +837,7 @@ pub fn run_dataset_asset_inference(
         let fan_dir = std::env::var("HOME")
             .map(|h| std::path::PathBuf::from(h).join(".fan-files"))
             .unwrap_or_else(|_| std::path::PathBuf::from(".fan-files"));
-        let l1 = read_prompt(&fan_dir.join("prompt-L1-base.md"), "你是生物信息工程师。请按数据集类型分组文件为Asset，标注角色。");
+        let l1 = read_prompt(&fan_dir.join("prompt-system.md"), "你是资深生物信息数据工程师。将文件和目录推断为 Dataset→Asset→File 三层结构。");
         let l2 = read_prompt(&fan_dir.join("prompt-L2-user.md"), "");
         let l3 = read_prompt(&fan_dir.join("prompt-L3-auto.md"), "");
         let mut batch_prompt = l1;
@@ -888,7 +888,7 @@ pub fn run_dataset_asset_inference(
         let body = serde_json::json!({
             "model": llm_client.config.model,
             "messages": [
-                {"role": "system", "content": "你是生物信息学家。根据文件列表将数据集中的文件分组为资产(Asset)，推断类型和物种。"},
+                {"role": "system", "content": "你是资深生物信息数据工程师，擅长组学数据分类。"},
                 {"role": "user", "content": batch_prompt}
             ],
             "response_format": {"type": "json_object"},
