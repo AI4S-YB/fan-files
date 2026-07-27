@@ -762,8 +762,12 @@ pub fn run_dataset_asset_inference(
     let mut datasets_created = 0usize;
 
     // Build set of candidate paths for O(1) parent lookup
+    // Build candidate path set for dedup, excluding the scan_root itself
+    // (scan_root is always a target but should not dedup everything below it)
     let candidate_paths: std::collections::HashSet<&str> = candidates.iter()
-        .map(|c| c.path.as_str()).collect();
+        .map(|c| c.path.as_str())
+        .filter(|p| *p != scan_root)
+        .collect();
 
     // Pre-filter candidates: skip subdirectories of other candidates
     let filtered_candidates: Vec<&DatasetCandidate> = candidates.iter()
@@ -777,11 +781,14 @@ pub fn run_dataset_asset_inference(
 
     eprintln!("  Phase C: {} candidates → {} after dedup", candidates.len(), filtered_candidates.len());
 
-        // Process candidates in multiple small batches
-    let mut remaining: Vec<&&DatasetCandidate> = filtered_candidates.iter().collect();
+            // Process candidates in batches to keep LLM prompt under limit
+    let mut batch_start: usize = 0;
     let batch_size_limit: usize = 12000;
+    let total_candidates = filtered_candidates.len();
 
-    while !remaining.is_empty() {
+    let mut ds_paths: Vec<(i64, String)> = Vec::new();
+
+    while batch_start < total_candidates {
         let mut batch_prompt = String::from("你是生物信息学家。下面是一组数据集的完整文件列表。请对每个数据集完成:\n\
             1. 确认数据集类型 (genome|transcriptome|variant|epigenome|metagenome|germplasm|proteome|other)\n\
             2. 推断物种 (从目录名判断)\n\
@@ -792,23 +799,16 @@ pub fn run_dataset_asset_inference(
             variants(.vcf+.tbi), peaks(.bed/.narrowPeak), signals(.bw/.bigwig), other\n\n");
 
         let mut batch_ds: Vec<(String, Vec<(i64, String, i64)>, String)> = Vec::new();
-        let mut next_remaining: Vec<&&DatasetCandidate> = Vec::new();
-        let mut batch_full = false;
+        let mut batch_end = batch_start;
 
-        for candidate in &remaining {
-            if batch_full {
-                next_remaining.push(candidate);
-                continue;
-            }
+        for i in batch_start..total_candidates {
+            let candidate = &filtered_candidates[i];
             
             let dataset_files: Vec<_> = all_files.iter()
                 .filter(|(_, p, _)| p.starts_with(&candidate.path))
                 .cloned()
                 .collect();
-            if dataset_files.len() < 2 {
-                next_remaining.push(candidate);
-                continue;
-            }
+            if dataset_files.len() < 2 { continue; }
             
             let ds_name = candidate.path
                 .trim_start_matches(scan_root)
@@ -819,22 +819,24 @@ pub fn run_dataset_asset_inference(
                 ds_name, candidate.path,
                 build_file_list_prompt(&candidate.path, &dataset_files));
             
-            if batch_prompt.len() + section.len() > batch_size_limit {
-                batch_full = true;
-                next_remaining.push(candidate);
-                continue;
+            if batch_prompt.len() + section.len() > batch_size_limit && !batch_ds.is_empty() {
+                break;  // Batch is full, process what we have
             }
             
             batch_prompt.push_str(&section);
             batch_ds.push((ds_name, dataset_files, candidate.path.clone()));
+            batch_end = i + 1;
         }
 
-        if batch_ds.is_empty() { break; }
+        if batch_ds.is_empty() {
+            batch_start = total_candidates;  // No more valid candidates
+            break;
+        }
 
         batch_prompt.push_str("\n输出JSON: {\"datasets\":[{\"name\":\"数据集名\",\"type\":\"genome|...\",\"species\":\"物种名\",\"assets\":[{\"name\":\"资产名\",\"type\":\"assembly|...\",\"files\":[{\"path\":\"文件名\",\"role\":\"primary|index|auxiliary\"}]}]}]}");
 
-        eprintln!("  Phase C batch: {} candidates, {} chars prompt ({} remaining)",
-            batch_ds.len(), batch_prompt.len(), next_remaining.len());
+        eprintln!("  Phase C batch: {} candidates, {} chars prompt (batch {}-{}/{})",
+            batch_ds.len(), batch_prompt.len(), batch_start+1, batch_end, total_candidates);
 
         let body = serde_json::json!({
             "model": llm_client.config.model,
@@ -862,6 +864,7 @@ pub fn run_dataset_asset_inference(
                                 match sqlite.insert_dataset(ds_name, ds_path, Some(ds_type), species, Some("high"), None) {
                                     Ok(ds_id) => {
                                         datasets_created += 1;
+                                        ds_paths.push((ds_id, ds_path.clone()));
                                         if let Some(assets) = ds_val["assets"].as_array() {
                                             for asset in assets {
                                                 let a_name = asset["name"].as_str();
@@ -891,11 +894,47 @@ pub fn run_dataset_asset_inference(
                     }
                 }
             }
-            Err(e) => warn!("Batch {} failed: {}", datasets_created / batch_ds.len().max(1) + 1, e),
+            Err(e) => warn!("Batch {} failed: {}", batch_start, e),
         }
         
-        remaining = next_remaining;
+        batch_start = batch_end;
     }
+
+    // Post Phase C: link all unlinked files under each dataset as auxiliary_files
+    eprintln!("  Post Phase C: linking auxiliary files...");
+    let mut aux_linked = 0u64;
+    for (ds_id, ds_path) in ds_paths.iter() {
+        let all_under: Vec<i64> = all_files.iter()
+            .filter(|(_, p, _)| p.starts_with(ds_path.as_str()))
+            .map(|(id, _, _)| *id)
+            .collect();
+        if all_under.is_empty() { continue; }
+        
+        let linked: std::collections::HashSet<i64> = {
+            let conn = sqlite.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT af.file_id FROM asset_file af JOIN asset a ON af.asset_id = a.id WHERE a.dataset_id = ?1"
+            ).unwrap();
+            let rows: Vec<i64> = stmt.query_map(rusqlite::params![ds_id], |r| r.get(0))
+                .unwrap().filter_map(|x| x.ok()).collect();
+            rows.into_iter().collect()
+        };
+        
+        let unlinked: Vec<i64> = all_under.iter()
+            .filter(|id| !linked.contains(id))
+            .cloned()
+            .collect();
+        
+        if !unlinked.is_empty() {
+            if let Ok(a_id) = sqlite.insert_asset(*ds_id, Some("auxiliary_files"), Some("other"), None) {
+                for fid in &unlinked {
+                    sqlite.link_asset_file(a_id, *fid, Some("auxiliary")).ok();
+                    aux_linked += 1;
+                }
+            }
+        }
+    }
+    eprintln!("  Post Phase C: {} auxiliary files linked", aux_linked);
 
     Ok(datasets_created)
 }
