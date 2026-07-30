@@ -8,6 +8,8 @@
 
 use crate::index::sqlite::SqliteStore;
 use crate::llm::LlmClient;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use crate::discovery::DatasetCandidate;
 use crate::project::ProjectStore;
 use std::collections::HashMap;
@@ -796,33 +798,50 @@ pub fn run_dataset_asset_inference(
     let all_files = sqlite.all_paths().unwrap_or_default();
     let mut datasets_created = 0usize;
 
-    // Build set of candidate paths for O(1) parent lookup
-    // Build candidate path set for dedup, excluding the scan_root itself
-    // (scan_root is always a target but should not dedup everything below it)
+    // Build set of candidate paths for O(1) parent lookup + hints
     let candidate_paths: std::collections::HashSet<&str> = candidates.iter()
         .map(|c| c.path.as_str())
         .filter(|p| *p != scan_root)
         .collect();
 
-    // Pre-filter candidates: skip subdirectories of other candidates
-    let filtered_candidates: Vec<&DatasetCandidate> = candidates.iter()
-        .filter(|c| {
-            let parent = std::path::Path::new(&c.path).parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            !candidate_paths.contains(parent.as_str())
-        })
-        .collect();
+    // Build parent->children map for prompt hints
+    let mut parent_to_children: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for c in candidates {
+        if let Some(parent) = std::path::Path::new(&c.path).parent() {
+            let parent_str = parent.to_string_lossy().to_string();
+            if candidate_paths.contains(parent_str.as_str()) {
+                parent_to_children
+                    .entry(parent_str.clone())
+                    .or_default()
+                    .push(c.path.to_string());
+            }
+        }
+    }
+
+    // Tree format: group parent + children in one section
+    let use_tree_format = std::env::var("FAN_TREE_FORMAT").is_ok();
+    let use_json_format = std::env::var("FAN_JSON_FORMAT").is_ok();
+
+    // Keep all candidates -- LLM decides
+    let container_hint_count = candidates.iter()
+        .filter(|c| c.candidate_role.as_deref() == Some("classification"))
+        .count();
+    if container_hint_count > 0 {
+        eprintln!("  Phase C: {} classification hints (Phase A)", container_hint_count);
+    }
+    let filtered_candidates: Vec<&DatasetCandidate> = candidates.iter().collect();
 
     eprintln!("  Phase C: {} candidates → {} after dedup", candidates.len(), filtered_candidates.len());
 
             // Process candidates in batches to keep LLM prompt under limit
     let mut batch_start: usize = 0;
-    let batch_size_limit: usize = 12000;
+    let mut batch_size_limit: usize = 12000;
     let total_candidates = filtered_candidates.len();
 
     let mut ds_paths: Vec<(i64, String)> = Vec::new();
 
+    let mut all_batches: Vec<(String, serde_json::Value, Vec<(String, Vec<(i64, String, i64)>, String)>)> = Vec::new();
     while batch_start < total_candidates {
         // Layer 1-3: read prompts from Markdown files
         let fan_dir = std::env::var("HOME")
@@ -853,9 +872,52 @@ pub fn run_dataset_asset_inference(
                 .trim_start_matches('/')
                 .replace('/', "_");
             
-            let section = format!("\n--- Dataset: {} (path: {}) ---\n{}\n",
-                ds_name, candidate.path,
-                build_file_list_prompt(&candidate.path, &dataset_files));
+            let parent_hint = if let Some(children) = parent_to_children.get(candidate.path.as_str()) {
+                let cn: Vec<String> = children.iter()
+                    .map(|c| std::path::Path::new(c).file_name()
+                        .map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).collect();
+                format!("\n[注意: 子目录 {} 也是候选]\n", cn.join(", "))
+            } else { String::new() };
+            let child_hint = if let Some(p) = std::path::Path::new(&candidate.path).parent() {
+                let ps = p.to_string_lossy().to_string();
+                if candidate_paths.contains(ps.as_str()) {
+                    let pn = std::path::Path::new(&ps).file_name()
+                        .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    format!("\n[注意: 上级 \"{}\" 也是候选]\n", pn)
+                } else { String::new() }
+            } else { String::new() };
+            
+            let section = if use_json_format {
+                // JSON format: skip text sections, will build JSON batch below
+                String::new()
+            } else if use_tree_format && parent_to_children.contains_key(candidate.path.as_str()) {
+                let mut tree = format!("\n--- {} (path: {})  [容器: {} 子候选] ---\n{}\n",
+                    candidate.path.trim_start_matches(scan_root).trim_start_matches('/'),
+                    candidate.path,
+                    parent_to_children[candidate.path.as_str()].len(),
+                    build_file_list_prompt(&candidate.path, &dataset_files));
+                if let Some(children) = parent_to_children.get(candidate.path.as_str()) {
+                    for cp in children {
+                        let child_files: Vec<_> = all_files.iter()
+                            .filter(|(_, p, _)| p.starts_with(cp.as_str())).cloned().collect();
+                        if child_files.len() >= 2 {
+                            let cn = std::path::Path::new(cp).file_name()
+                                .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                            let cl = build_file_list_prompt(cp, &child_files);
+                            tree.push_str(&format!("  +-- {}/\n", cn));
+                            for line in cl.lines().skip(1) {
+                                tree.push_str(&format!("  |   {}\n", line));
+                            }
+                        }
+                    }
+                }
+                tree.push('\n');
+                tree
+            } else {
+                format!("\n--- Dataset: {} (path: {}) ---{}{}\n{}\n",
+                    ds_name, candidate.path, parent_hint, child_hint,
+                    build_file_list_prompt(&candidate.path, &dataset_files))
+            };
             
             if batch_prompt.len() + section.len() > batch_size_limit && !batch_ds.is_empty() {
                 break;  // Batch is full, process what we have
@@ -871,7 +933,55 @@ pub fn run_dataset_asset_inference(
             break;
         }
 
-        batch_prompt.push_str("\n输出JSON: {\"datasets\":[{\"name\":\"数据集名\",\"type\":\"genome|...\",\"species\":\"物种名\",\"assets\":[{\"name\":\"资产名\",\"type\":\"assembly|...\",\"files\":[{\"path\":\"文件名\",\"role\":\"primary|index|auxiliary\"}]}]}]}");
+        if use_json_format {
+            // JSON format: build structured candidate list
+            let mut json_candidates = Vec::new();
+            for (ds_name, _, ds_path) in &batch_ds {
+                let mut entry = serde_json::json!({
+                    "path": ds_path,
+                    "name": ds_name,
+                    "files": [],
+                });
+                // Build file listing as structured array
+                let file_list_text = build_file_list_prompt(ds_path,
+                    &all_files.iter().filter(|(_, p, _)| p.starts_with(ds_path.as_str())).cloned().collect::<Vec<_>>());
+                let file_parts: Vec<&str> = file_list_text.lines().collect();
+                let mut file_entries = Vec::new();
+                for line in &file_parts[1..] {  // skip first line (root header)
+                    if !line.trim().is_empty() {
+                        file_entries.push(serde_json::Value::String(line.trim().to_string()));
+                    }
+                }
+                entry["files"] = serde_json::Value::Array(file_entries);
+                // Add children if any
+                if let Some(children) = parent_to_children.get(ds_path.as_str()) {
+                    let child_names: Vec<&str> = children.iter()
+                        .map(|c| std::path::Path::new(c).file_name()
+                            .map(|n| n.to_str().unwrap_or("")).unwrap_or(""))
+                        .filter(|n| !n.is_empty())
+                        .collect();
+                    if !child_names.is_empty() {
+                        entry["children"] = serde_json::Value::Array(
+                            child_names.iter().map(|n| serde_json::Value::String(n.to_string())).collect()
+                        );
+                    }
+                }
+                // Add role hint
+                if let Some(cc) = filtered_candidates.iter().find(|c| c.path == *ds_path) {
+                    if let Some(ref role) = cc.candidate_role {
+                        entry["role_hint"] = serde_json::Value::String(role.clone());
+                    }
+                }
+                json_candidates.push(entry);
+            }
+            let json_input = serde_json::json!({
+                "candidates": json_candidates,
+                "output_format": "Return JSON: {\"datasets\": [{\"name\": \"...\", \"type\": \"genome|transcriptome|...\", \"species\": \"...\", \"assets\": [{\"name\": \"...\", \"type\": \"assembly|annotation|...\", \"files\": [{\"path\": \"...\", \"role\": \"primary|index|auxiliary\"}]}]}]}"
+            });
+            batch_prompt = format!("{}\n{}\n", batch_prompt, serde_json::to_string_pretty(&json_input).unwrap_or_default());
+        } else {
+            batch_prompt.push_str("\n输出JSON: {\"datasets\":[{\"name\":\"数据集名\",\"type\":\"genome|...\",\"species\":\"物种名\",\"assets\":[{\"name\":\"资产名\",\"type\":\"assembly|...\",\"files\":[{\"path\":\"文件名\",\"role\":\"primary|index|auxiliary\"}]}]}]}");
+        }
 
         eprintln!("  Phase C batch: {} candidates, {} chars prompt (batch {}-{}/{})",
             batch_ds.len(), batch_prompt.len(), batch_start+1, batch_end, total_candidates);
@@ -898,7 +1008,11 @@ pub fn run_dataset_asset_inference(
                             let ds_name = ds_val["name"].as_str().unwrap_or("unnamed");
                             
                             if let Some((_, dataset_files, ds_path)) = 
-                                batch_ds.iter().find(|(n, _, _)| n == ds_name) {
+                                batch_ds.iter().find(|(n, _, p)| {
+                                    n == ds_name
+                                    || p.ends_with(&format!("/{}", ds_name))
+                                    || n.ends_with(&format!("_{}", ds_name))
+                                }) {
                                 match sqlite.insert_dataset(ds_name, ds_path, Some(ds_type), species, Some("high"), None) {
                                     Ok(ds_id) => {
                                         datasets_created += 1;
@@ -932,7 +1046,14 @@ pub fn run_dataset_asset_inference(
                     }
                 }
             }
-            Err(e) => warn!("Batch {} failed: {}", batch_start, e),
+            Err(e) => {
+                warn!("Batch {} failed ({} candidates): {}", batch_start, batch_ds.len(), e);
+                if batch_size_limit > 4000 {
+                    batch_size_limit /= 2;
+                    eprintln!("  Batch size limit reduced to {} chars, retrying...", batch_size_limit);
+                }
+                continue;
+            }
         }
         
         batch_start = batch_end;
@@ -980,25 +1101,23 @@ pub fn run_dataset_asset_inference(
 /// Build a compact file list prompt for a dataset directory.
 fn build_file_list_prompt(root: &str, files: &[(i64, String, i64)]) -> String {
     use std::collections::BTreeMap;
-    let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut by_dir: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for (_, path, _) in files {
         let p = std::path::Path::new(path);
-        let parent = p.parent()
-            .map(|x| x.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let fname = p.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        by_dir.entry(parent).or_default().push(fname);
+        let parent = p.parent().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+        let fname = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let ext = crate::discovery::light_file_extension(&fname);
+        by_dir.entry(parent).or_default().push((fname, ext));
     }
-    
     let mut lines = vec![format!("数据集根: {}", root)];
-    for (dir, fnames) in &by_dir {
-        let rel = if dir == root { "(根)".to_string() } 
-            else { dir.strip_prefix(root).unwrap_or(dir).to_string() };
-        let show: Vec<&str> = fnames.iter().take(20).map(|s| s.as_str()).collect();
-        let more = if fnames.len() > 20 { format!(" ... +{} more", fnames.len()-20) } else { String::new() };
-        lines.push(format!("  {}: {}{}", rel, show.join(", "), more));
+    for (dir, entries) in &by_dir {
+        let rel = if dir == root { "(根)".to_string() } else { dir.strip_prefix(root).unwrap_or(dir).to_string() };
+        let mut ext_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, ext) in entries { *ext_counts.entry(ext.as_str()).or_insert(0) += 1; }
+        let mut ext_parts: Vec<String> = ext_counts.iter().map(|(e, c)| format!(".{}×{}", e, c)).collect();
+        if ext_parts.len() > 8 { ext_parts.truncate(8); ext_parts.push(format!("... +{} more types", ext_counts.len() - 8)); }
+        let sample = entries.first().map(|(f, _)| format!("  e.g. {}", f)).unwrap_or_default();
+        lines.push(format!("  {}: {} files [{}]{}", rel, entries.len(), ext_parts.join(", "), sample));
     }
     lines.join("\n")
 }

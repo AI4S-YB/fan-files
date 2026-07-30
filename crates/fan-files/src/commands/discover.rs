@@ -157,15 +157,15 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
 
             if batch_count >= 1000 {
                 index.sqlite.commit_batch().ok();
-                index.tantivy.commit().ok();
                 batch_count = 0;
                 index.sqlite.begin_batch().ok();
             }
         }
+        // Tantivy: commit once per scan_root (avoid per-1000 merge cascade)
+        index.tantivy.commit().ok();
     }
     if batch_count > 0 {
         index.sqlite.commit_batch().ok();
-        index.tantivy.commit().ok();
     }
     eprintln!("  Phase B complete: {} files indexed ({} via uniform fast-path, {} filtered by targets)", total_files, uniform_fastpath_count, filtered_skip_count);
     println!();
@@ -195,6 +195,7 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
             dataset_type: "other".to_string(),
             species: None,
             confidence: "low".to_string(),
+            candidate_role: None,
         }).collect()
     } else {
         all_dataset_candidates

@@ -40,7 +40,9 @@ pub struct DirFingerprint {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DirSignal {
-    Bio,         // Contains or propagates bio signal
+    OwnBio,      // Has bio files directly in this directory
+    PropagatedBio, // Bio signal only from children (pure container)
+    Bio,         // Legacy: kept for backward compat, treated as OwnBio
     Noise,       // Explicitly noise (.git, node_modules, etc.)
     Empty,       // No files, no bio children
     Unknown,     // Needs LLM to decide
@@ -69,6 +71,9 @@ pub struct DatasetCandidate {
     pub dataset_type: String,
     pub species: Option<String>,
     pub confidence: String,
+    /// LLM-classified role: "project_root" | "analysis_step" | "classification"
+    /// analysis_step candidates are skipped in Phase C (they belong to parent project)
+    pub candidate_role: Option<String>,
 }
 
 pub struct DiscoveryResult {
@@ -322,8 +327,13 @@ pub fn run_bottom_up_discovery(
     for (_path, fp) in fingerprints.iter_mut() {
         if fp.signal == DirSignal::Unknown {
             if fp.child_bio > 0 {
-                // Signal propagated from bio children
-                fp.signal = DirSignal::Bio;
+                if fp.has_bio_files {
+                    // Has its own bio files AND bio children → OwnBio
+                    fp.signal = DirSignal::OwnBio;
+                } else {
+                    // Bio signal only from children → pure container, not a dataset
+                    fp.signal = DirSignal::PropagatedBio;
+                }
             } else if fp.file_count > 0 {
                 // Has files but none are bio → let LLM decide
                 fp.signal = DirSignal::Unknown;
@@ -333,12 +343,18 @@ pub fn run_bottom_up_discovery(
         }
     }
 
-    // Step 4: Auto-include all BIO dirs + send ? dirs to LLM
+    // Step 4: Auto-include OwnBio dirs (exclude PropagatedBio containers).
+    // PropagatedBio directories are pure containers with no own data files;
+    // they should not be scan targets or dataset candidates.
     let auto_targets: Vec<String> = fingerprints.iter()
-        .filter(|(_, fp)| fp.signal == DirSignal::Bio)
+        .filter(|(_, fp)| fp.signal == DirSignal::OwnBio || fp.signal == DirSignal::Bio)
         .map(|(p, _)| p.clone())
         .collect();
-    eprintln!("  Bottom-Up: {} BIO dirs auto-included", auto_targets.len());
+    let container_count = fingerprints.values()
+        .filter(|fp| fp.signal == DirSignal::PropagatedBio)
+        .count();
+    eprintln!("  Bottom-Up: {} BIO dirs auto-included ({} containers excluded)",
+        auto_targets.len(), container_count);
 
     // Count ? dirs that need LLM decision
     let unknown_count = fingerprints.values()
@@ -353,7 +369,7 @@ pub fn run_bottom_up_discovery(
         let prompt = build_bottom_up_prompt(&fingerprints, scan_root, base_depth);
         eprintln!("  Bottom-Up: prompt size = {} chars", prompt.len());
 
-        if prompt.len() > 500 {
+        if prompt.len() > 50 {
             let (targets_from_llm, dataset_hints) = llm_classify_bottom_up(llm_client, &prompt, scan_root)?;
             llm_targets = targets_from_llm;
             llm_dataset_candidates = dataset_hints;
@@ -407,16 +423,39 @@ pub fn run_bottom_up_discovery(
     );
     // Auto-generate dataset candidates from all targets (Phase A markers)
     // Each target IS a dataset candidate — Phase C will refine the type
-    if llm_dataset_candidates.is_empty() {
-        llm_dataset_candidates = targets.iter().map(|t| DatasetCandidate {
-            path: t.clone(),
-            dataset_type: "other".to_string(),
-            species: None,
-            confidence: "low".to_string(),
-        }).collect();
+    // Always ensure all auto-targets have candidates
+    let existing_paths: std::collections::HashSet<String> = llm_dataset_candidates.iter()
+        .map(|c| c.path.clone()).collect();
+    for t in &targets {
+        if !existing_paths.contains(t) {
+            llm_dataset_candidates.push(DatasetCandidate {
+                path: t.clone(),
+                dataset_type: "other".to_string(),
+                species: None,
+                confidence: "low".to_string(),
+                candidate_role: None,
+            });
+        }
+    }
+
+    // Mark PropagatedBio containers with explicit role so Phase C can skip them
+    for (path, fp) in &fingerprints {
+        if fp.signal == DirSignal::PropagatedBio {
+            // Find or add as candidate with classification role
+            if !llm_dataset_candidates.iter().any(|c| c.path == *path) {
+                llm_dataset_candidates.push(DatasetCandidate {
+                    path: path.clone(),
+                    dataset_type: "other".to_string(),
+                    species: None,
+                    confidence: "low".to_string(),
+                    candidate_role: Some("classification".to_string()),
+                });
+            }
+        }
     }
 
     Ok(DiscoveryResult { targets, skips, uniform_dirs, dataset_candidates: llm_dataset_candidates })
+
 }
 
 /// Build a condensed annotated tree prompt from bottom-up fingerprints.
@@ -445,6 +484,8 @@ fn build_prompt_recursive(
 
     let prefix = "  ".repeat(indent);
     let signal_icon = match fp.signal {
+        DirSignal::OwnBio => "BIO",
+        DirSignal::PropagatedBio => "BIO↑",
         DirSignal::Bio => "BIO",
         DirSignal::Noise => "NOISE",
         DirSignal::Empty => "EMPTY",
@@ -461,8 +502,8 @@ fn build_prompt_recursive(
         String::new()
     };
 
-    // BIO directories: show summary, don't expand children (saves prompt space)
-    if fp.signal == DirSignal::Bio && indent > 0 {
+    // BIO directories (own or propagated): show summary, don't expand children
+    if (fp.signal == DirSignal::Bio || fp.signal == DirSignal::OwnBio || fp.signal == DirSignal::PropagatedBio) && indent > 0 {
         lines.push(format!(
             "{}{} {}/ (auto:{} files{} sub:{}/{})",
             prefix, signal_icon, fp.name,
@@ -519,6 +560,10 @@ fn llm_classify_bottom_up(
          - proteome: .mzML/.mzXML 或蛋白 .fasta\n\
          - other: 无法归类时使用\n\n\
          判断时考虑：该目录自身文件 + 子目录结构。纯分类框架(0 files)不是数据集。\n\
+         对每个候选，额外判断其角色(role)：\n\
+         - project_root: 独立项目（含完整数据或分析步骤，自成一体）\n\
+         - analysis_step: 项目内分析步骤（编号前缀如01.raw/02.clean/03.align，归入父项目）\n\
+         - classification: 纯容器/分类目录（自身无核心数据文件，仅为组织子目录）\n\\n\
          物种信息能从目录名推断的，一并输出。\n\
          输出JSON: {{\"datasets\":[{{\"path\":\"路径\",\"dataset_type\":\"类型\",\"species\":\"物种\",\"confidence\":\"high\"}}],\n\
          \"scan_targets\":[{{\"path\":\"路径\"}}]}}\n\n{}",
@@ -546,7 +591,19 @@ fn llm_classify_bottom_up(
         .map(|a| a.iter().filter_map(|v| v["path"].as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    Ok((targets, Vec::new()))
+    // Parse dataset candidates with role classification
+    let candidates: Vec<DatasetCandidate> = output["datasets"].as_array()
+        .map(|a| a.iter().filter_map(|v| {
+            Some(DatasetCandidate {
+                path: v["path"].as_str()?.to_string(),
+                dataset_type: v["dataset_type"].as_str().unwrap_or("other").to_string(),
+                species: v["species"].as_str().map(String::from),
+                confidence: v["confidence"].as_str().unwrap_or("medium").to_string(),
+                candidate_role: v["role"].as_str().map(String::from),
+            })
+        }).collect())
+        .unwrap_or_default();
+    Ok((targets, candidates))
 }
 
 // ═══════════════════════════════════════════════════════════
