@@ -203,7 +203,7 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
 
     eprintln!("  Inferring datasets from {} candidates...", candidates.len());
     match infer_hierarchical::run_dataset_asset_inference(
-        &index.sqlite, &llm_client,
+        &index.sqlite, &llm_client, config.threads,
         scan_roots.first().unwrap_or(&""),
         &candidates
     ) {

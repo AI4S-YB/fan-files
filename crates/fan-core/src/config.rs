@@ -20,6 +20,8 @@ pub struct Config {
     #[serde(default)]
     pub llm: LlmConfig,
     #[serde(default)]
+    pub threads: Option<usize>,
+    #[serde(default)]
     pub servers: ServersConfig,
 }
 
@@ -210,6 +212,7 @@ impl Default for Config {
                 full_sync: default_sync_time(),
             },
             llm: LlmConfig::default(),
+            threads: None,
             servers: ServersConfig::default(),
         }
     }

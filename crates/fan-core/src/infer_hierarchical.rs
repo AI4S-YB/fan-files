@@ -787,6 +787,7 @@ fn read_prompt(path: &std::path::PathBuf, fallback: &str) -> String {
 pub fn run_dataset_asset_inference(
     sqlite: &SqliteStore,
     llm_client: &LlmClient,
+    threads: Option<usize>,
     scan_root: &str,
     candidates: &[crate::discovery::DatasetCandidate],
 ) -> Result<usize, Box<dyn std::error::Error>> {
@@ -1006,9 +1007,8 @@ pub fn run_dataset_asset_inference(
         batch_start = batch_end;
     }
 
-    // Concurrent LLM processing (configurable via FAN_WORKERS env, default: 5, set FAN_WORKERS to override)
-    let concurrency: usize = std::env::var("FAN_WORKERS")
-        .unwrap_or_default().parse().unwrap_or(5);
+    // Concurrent LLM processing (configurable via FAN_THREADS env, default: 5, set FAN_THREADS to override)
+    let concurrency: usize = threads.unwrap_or_else(|| std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4).min(10));
     let total_batches = all_batches.len();
     if total_batches > 0 {
         eprintln!("  Phase C: processing {} batches with {} workers...",
