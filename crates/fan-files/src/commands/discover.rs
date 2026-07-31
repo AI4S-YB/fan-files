@@ -218,8 +218,13 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
         Err(e) => eprintln!("  Dataset inference failed: {}", e),
     }
 
-    // Build Tantivy index from SQLite after Phase C (results are final)
+    // Rebuild Tantivy search index from SQLite after Phase C
     eprintln!("  Building search index...");
+    if let Ok(all_files) = index.sqlite.all_paths() {
+        for (id, path, _size) in &all_files {
+            index.tantivy.index_file(*id, &std::path::Path::new(path), path, &[]).ok();
+        }
+    }
     index.tantivy.commit().ok();
 
     println!();
