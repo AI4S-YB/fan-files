@@ -10,7 +10,6 @@ use fan_core::discovery;
 use fan_core::infer_hierarchical;
 use fan_core::index::IndexEngine;
 use fan_core::llm::LlmClient;
-use fan_core::project::ProjectStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -192,7 +191,6 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
 
     // ═══ Phase C: Hierarchical inference ═══
     println!("═══ Phase C: LLM Inference ═══");
-    let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
 
     // Phase C: Dataset + Asset inference
     // Fallback: if Phase A returned no candidates, use scan_roots directly
