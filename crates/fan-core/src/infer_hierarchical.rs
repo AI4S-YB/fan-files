@@ -837,6 +837,7 @@ pub fn run_dataset_asset_inference(
             // Process candidates in batches to keep LLM prompt under limit
     let mut batch_start: usize = 0;
     let mut batch_size_limit: usize = 12000;
+    let json_max = if use_json_format { 25 } else { usize::MAX };
     let total_candidates = filtered_candidates.len();
 
     let mut ds_paths: Vec<(i64, String)> = Vec::new();
@@ -920,7 +921,7 @@ pub fn run_dataset_asset_inference(
             };
             
             let has_children = parent_to_children.contains_key(candidate.path.as_str());
-            if !has_children && batch_prompt.len() + section.len() > batch_size_limit && !batch_ds.is_empty() {
+            if !has_children && (batch_prompt.len() + section.len() > batch_size_limit || batch_ds.len() >= json_max) && !batch_ds.is_empty() {
                 break;  // Batch is full, process what we have
             }
             
