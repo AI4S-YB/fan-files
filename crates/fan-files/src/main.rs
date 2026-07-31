@@ -24,13 +24,13 @@ enum Commands {
         #[arg(long)]
         scan_only: bool,
     },
-    /// Search files by natural language query
+    /// Search files by keyword, dataset name, or metadata
     Search {
         query: String,
         #[arg(long)]
         json: bool,
     },
-    /// Suggest related datasets for a project directory
+    /// Suggest related datasets for a directory
     Suggest {
         path: String,
         #[arg(long)]
@@ -58,13 +58,18 @@ enum Commands {
     /// Snapshot management (list, diff, rollback)
     #[command(subcommand)]
     Snapshots(SnapshotAction),
-    /// Run LLM inference on indexed files (default: hierarchical tree mode)
+    /// Run Phase C LLM inference on indexed files (Dataset/Asset/File)
     Infer {
         /// Use flat file-by-file mode (legacy)
         #[arg(long)]
         flat: bool,
     },
-    /// List projects, or show details if a project name is given
+    /// List datasets, or show details if a dataset name is given
+    Datasets {
+        /// Dataset name to show details for
+        name: Option<String>,
+    },
+    /// [deprecated] Use 'datasets' instead
     Projects {
         #[command(subcommand)]
         action: Option<ProjectAction>,
@@ -78,7 +83,6 @@ enum Commands {
     Update,
     /// Uninstall fan-files
     Uninstall,
-    /// Progressive discovery: bottom-up walk → scan → infer
     /// Record a manual correction for rules learning
     Correct {
         #[arg(long)]
@@ -88,6 +92,8 @@ enum Commands {
         #[arg(long)]
         new_type: Option<String>,
     },
+    /// Phase A→B→C discovery: find datasets, scan files, infer metadata
+    /// Configure threads in config.toml for parallel Phase B + Phase C
     Discover {
         /// Precise mode: read magic bytes for format detection (default: extension-only)
         #[arg(long)]
@@ -194,12 +200,18 @@ fn main() {
                 commands::infer::run(&config, &layer);
             }
         },
-        Commands::Projects { action } => match action {
-            Some(ProjectAction::Show { name }) => commands::projects::run(&config, &layer, Some(name.as_str())),
-            Some(ProjectAction::Update { name, species, confidence, assay_type }) => {
-                commands::projects::run_update(&config, &name, species.as_deref(), confidence.as_deref(), assay_type.as_deref())
+        Commands::Datasets { name } => {
+            commands::datasets::run(&config, &layer, name.as_deref());
+        },
+        Commands::Projects { action } => {
+            eprintln!("⚠ 'projects' is deprecated. Use 'datasets' instead.");
+            match action {
+                Some(ProjectAction::Show { name }) => commands::projects::run(&config, &layer, Some(name.as_str())),
+                Some(ProjectAction::Update { name, species, confidence, assay_type }) => {
+                    commands::projects::run_update(&config, &name, species.as_deref(), confidence.as_deref(), assay_type.as_deref())
+                }
+                None => commands::projects::run(&config, &layer, None),
             }
-            None => commands::projects::run(&config, &layer, None),
         },
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::Update => commands::update::run(),
