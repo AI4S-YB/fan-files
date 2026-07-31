@@ -125,6 +125,9 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
     // Collect uniform dir paths for fast O(1) lookup during scan
     let uniform_parents: std::collections::HashSet<String> = uniform_map.keys().cloned().collect();
 
+    // Sequential root scanning — IndexEngine (Tantivy) is !Sync, parallelization
+    // requires Tantivy isolation or per-thread index instances. `threads` param
+    // controls Phase C concurrency only.
     for root in &scan_roots {
         let scanner = fan_core::scanner::Scanner::new(
             vec![root.to_string()],
@@ -136,14 +139,9 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
 
         eprintln!("  Scanning root: {}", root);
         for file_info in scanner.scan() {
-            let file_path = file_info.path.to_string_lossy();
             let parent = file_info.path.parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-
-            // Uniform dir bulk file: Scanner already did open+read.
-            // For now, count them but the real skip happens when we
-            // bypass Scanner entirely (next iteration).
             let is_uniform_bulk = uniform_parents.contains(&parent);
 
             match index.index_file(&file_info, None) {
@@ -154,20 +152,24 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
                 }
                 Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
             }
-
             if batch_count >= 1000 {
                 index.sqlite.commit_batch().ok();
                 batch_count = 0;
                 index.sqlite.begin_batch().ok();
             }
         }
-        // Tantivy: commit once per scan_root (avoid per-1000 merge cascade)
         index.tantivy.commit().ok();
     }
     if batch_count > 0 {
         index.sqlite.commit_batch().ok();
     }
-    eprintln!("  Phase B complete: {} files indexed ({} via uniform fast-path, {} filtered by targets)", total_files, uniform_fastpath_count, filtered_skip_count);
+
+    // Tantivy: one commit after all roots
+    index.tantivy.commit().ok();
+    if batch_count > 0 {
+        index.sqlite.commit_batch().ok();
+    }
+    eprintln!("  Phase B complete: {} files indexed ({} via uniform fast-path)", total_files, uniform_fastpath_count);
     println!();
 
     // Create snapshot for re-infer tracking
