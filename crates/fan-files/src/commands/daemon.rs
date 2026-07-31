@@ -8,7 +8,6 @@ use fan_core::index::IndexEngine;
 use fan_core::interpreter::InterpreterRegistry;
 use fan_core::llm::LlmClient;
 use fan_core::plugin::registry::PluginRegistry;
-use fan_core::project::ProjectStore;
 use fan_core::scanner::RemoteScanner;
 use fan_core::scanner::Scanner;
 use fan_core::watcher::FileWatcher;
@@ -95,11 +94,10 @@ fn run_inner(config: &Config, layer: &DataLayer, scan_only: bool) {
     {
         let llm_client = LlmClient::new(config.llm.clone());
         if llm_client.is_configured() {
-            let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
             let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
             info!("Running LLM inference on indexed files...");
-            match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, scan_root, &std::collections::HashSet::new()) {
-                Ok((p, r)) => info!("LLM inference complete: {} projects, {} relations", p, r),
+            match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, config.threads, scan_root, &[]) {
+                Ok(n) => info!("LLM inference complete: {} datasets", n),
                 Err(e) => warn!("LLM inference failed: {}", e),
             }
         }
@@ -189,10 +187,9 @@ fn run_inner(config: &Config, layer: &DataLayer, scan_only: bool) {
             {
                 let llm_client = LlmClient::new(config.llm.clone());
                 if llm_client.is_configured() {
-                    let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
                     let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
-                    match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, scan_root, &std::collections::HashSet::new()) {
-                        Ok((p, r)) => info!("LLM inference: {} projects, {} relations", p, r),
+                    match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, config.threads, scan_root, &[]) {
+                        Ok(n) => info!("LLM inference: {} datasets", n),
                         Err(e) => warn!("LLM inference failed: {}", e),
                     }
                 }
@@ -290,10 +287,9 @@ fn read_magic_local(path: &std::path::Path) -> Vec<u8> {
 fn auto_infer(index: &IndexEngine, config: &Config, servers: &[(String, fan_core::config::ServerConfig)]) {
     let llm_client = LlmClient::new(config.llm.clone());
     if llm_client.is_configured() {
-        let project_store = ProjectStore::new(Arc::clone(&index.sqlite.conn));
         let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
-        match infer_hierarchical::run_hierarchical_inference(&index.sqlite, &project_store, &llm_client, scan_root, &std::collections::HashSet::new()) {
-            Ok((p, r)) => info!("Auto-infer: {} projects, {} relations", p, r),
+        match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, config.threads, scan_root, &[]) {
+            Ok(n) => info!("Auto-infer: {} datasets", n),
             Err(e) => warn!("Auto-infer failed: {}", e),
         }
     }
