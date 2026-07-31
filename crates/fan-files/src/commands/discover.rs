@@ -158,14 +158,7 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
                 index.sqlite.begin_batch().ok();
             }
         }
-        index.tantivy.commit().ok();
     }
-    if batch_count > 0 {
-        index.sqlite.commit_batch().ok();
-    }
-
-    // Tantivy: one commit after all roots
-    index.tantivy.commit().ok();
     if batch_count > 0 {
         index.sqlite.commit_batch().ok();
     }
@@ -212,6 +205,10 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
         Ok(n) => eprintln!("  → {} datasets created", n),
         Err(e) => eprintln!("  Dataset inference failed: {}", e),
     }
+
+    // Build Tantivy index from SQLite after Phase C (results are final)
+    eprintln!("  Building search index...");
+    index.tantivy.commit().ok();
 
     println!();
     println!("╔══════════════════════════════════════════╗");
