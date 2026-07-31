@@ -8,8 +8,8 @@
 
 use crate::index::sqlite::SqliteStore;
 use crate::llm::LlmClient;
-use std::sync::{Arc, Mutex};
 use std::thread;
+use std::sync::{Arc, Mutex};
 use crate::discovery::DatasetCandidate;
 use crate::project::ProjectStore;
 use std::collections::HashMap;
@@ -842,6 +842,7 @@ pub fn run_dataset_asset_inference(
     let mut ds_paths: Vec<(i64, String)> = Vec::new();
 
     let mut all_batches: Vec<(String, serde_json::Value, Vec<(String, Vec<(i64, String, i64)>, String)>)> = Vec::new();
+    let mut all_batches: Vec<(String, serde_json::Value, Vec<(String, Vec<(i64, String, i64)>, String)>)> = Vec::new();
     while batch_start < total_candidates {
         // Layer 1-3: read prompts from Markdown files
         let fan_dir = std::env::var("HOME")
@@ -997,66 +998,107 @@ pub fn run_dataset_asset_inference(
             "max_tokens": 16384
         });
 
-        match crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 3) {
-            Ok(response) => {
-                let resp_content = response["choices"][0]["message"]["content"].as_str().unwrap_or("");
-                if let Ok(output) = serde_json::from_str::<serde_json::Value>(resp_content) {
-                    if let Some(datasets) = output["datasets"].as_array() {
-                        for ds_val in datasets {
-                            let ds_type = ds_val["type"].as_str().unwrap_or("other");
-                            let species = ds_val["species"].as_str().filter(|s| *s != "null");
-                            let ds_name = ds_val["name"].as_str().unwrap_or("unnamed");
-                            
-                            if let Some((_, dataset_files, ds_path)) = 
-                                batch_ds.iter().find(|(n, _, p)| {
-                                    n == ds_name
-                                    || p.ends_with(&format!("/{}", ds_name))
-                                    || n.ends_with(&format!("_{}", ds_name))
-                                }) {
-                                match sqlite.insert_dataset(ds_name, ds_path, Some(ds_type), species, Some("high"), None) {
-                                    Ok(ds_id) => {
-                                        datasets_created += 1;
-                                        ds_paths.push((ds_id, ds_path.clone()));
-                                        if let Some(assets) = ds_val["assets"].as_array() {
-                                            for asset in assets {
-                                                let a_name = asset["name"].as_str();
-                                                let a_type = asset["type"].as_str();
-                                                if let Ok(a_id) = sqlite.insert_asset(ds_id, a_name, a_type, None) {
-                                                    if let Some(files) = asset["files"].as_array() {
-                                                        for fe in files {
-                                                            let fname = fe["path"].as_str().unwrap_or("");
-                                                            let role = fe["role"].as_str();
-                                                            for (fid, fpath, _) in dataset_files {
-                                                                if fpath.ends_with(fname) {
-                                                                    sqlite.link_asset_file(a_id, *fid, role).ok();
-                                                                    break;
+        // Queue batch for concurrent processing
+        let batch_clone: Vec<_> = batch_ds.iter()
+            .map(|(n, f, p)| (n.clone(), f.clone(), p.clone())).collect();
+        all_batches.push((batch_prompt.clone(), body.clone(), batch_clone));
+        batch_start = batch_end;
+    }
+
+    // Concurrent LLM processing (configurable via FAN_WORKERS env, default: CPU cores (max 10))
+    let concurrency: usize = std::env::var("FAN_WORKERS")
+        .unwrap_or_default().parse().unwrap_or_else(|_| { let n = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4); if n > 10 { 10 } else { n } });
+    let total_batches = all_batches.len();
+    if total_batches > 0 {
+        eprintln!("  Phase C: processing {} batches with {} workers...",
+            total_batches, concurrency);
+        let sqlite_mutex = Mutex::new(&sqlite);
+        let sqlite_arc = Arc::new(sqlite_mutex);
+        let config_arc = Arc::new(llm_client.config.clone());
+
+        for chunk in all_batches.chunks(concurrency) {
+            thread::scope(|s| {
+                let mut handles = Vec::new();
+                for (_prompt, body_c, batch_c) in chunk {
+                    let sqlite = Arc::clone(&sqlite_arc);
+                    let config = Arc::clone(&config_arc);
+                    let body = body_c.clone();
+                    let bd = batch_c.clone();
+                    handles.push(s.spawn(move || -> usize {
+                        match crate::llm::llm_api_call_with_retry(&config, &body, 2) {
+                            Ok(resp) => {
+                                let rc = resp["choices"][0]["message"]["content"]
+                                    .as_str().unwrap_or("");
+                                if let Ok(output) = serde_json::from_str::<serde_json::Value>(rc) {
+                                    if let Some(datasets) = output["datasets"].as_array() {
+                                        let mut guard = sqlite.lock().unwrap();
+                                        let mut created = 0usize;
+                                        for ds_val in datasets {
+                                            let ds_type = ds_val["type"].as_str().unwrap_or("other");
+                                            let species = ds_val["species"].as_str()
+                                                .filter(|s| *s != "null");
+                                            let ds_name = ds_val["name"].as_str().unwrap_or("unnamed");
+                                            if let Some((_, df, dp)) = bd.iter()
+                                                .find(|(n, _, p)| {
+                                                    n == ds_name
+                                                    || p.ends_with(&format!("/{}", ds_name))
+                                                    || n.ends_with(&format!("_{}", ds_name))
+                                                })
+                                            {
+                                                match guard.insert_dataset(ds_name, dp,
+                                                    Some(ds_type), species, Some("high"), None)
+                                                {
+                                                    Ok(ds_id) => {
+                                                        created += 1;
+                                                        if let Some(assets) = ds_val["assets"].as_array() {
+                                                            for asset in assets {
+                                                                if let Ok(a_id) = guard.insert_asset(
+                                                                    ds_id, asset["name"].as_str(),
+                                                                    asset["type"].as_str(), None)
+                                                                {
+                                                                    if let Some(files) = asset["files"].as_array() {
+                                                                        for fe in files {
+                                                                            let fnm = fe["path"].as_str().unwrap_or("");
+                                                                            for (fid, fp, _) in df {
+                                                                                if fp.ends_with(fnm) {
+                                                                                    guard.link_asset_file(
+                                                                                        a_id, *fid,
+                                                                                        fe["role"].as_str()).ok();
+                                                                                    break;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                         }
+                                                        eprintln!("  Dataset: {} ({} assets)", ds_name,
+                                                            ds_val["assets"].as_array().map_or(0,|a| a.len()));
                                                     }
+                                                    Err(e) => eprintln!("  FAIL: {}", e),
                                                 }
                                             }
                                         }
-                                        eprintln!("  Dataset: {} ({} assets)", ds_name, ds_val["assets"].as_array().map_or(0, |a| a.len()));
+                                        return created;
                                     }
-                                    Err(e) => warn!("Failed to insert dataset {}: {}", ds_name, e),
                                 }
+                                0
                             }
+                            Err(e) => { eprintln!("  Worker failed: {}", e); 0 }
                         }
-                    }
+                    }));
                 }
-            }
-            Err(e) => {
-                warn!("Batch {} failed ({} candidates): {}", batch_start, batch_ds.len(), e);
-                if batch_size_limit > 4000 {
-                    batch_size_limit /= 2;
-                    eprintln!("  Batch size limit reduced to {} chars, retrying...", batch_size_limit);
+                for h in handles {
+                    if let Ok(c) = h.join() { datasets_created += c; }
                 }
-                continue;
-            }
+            });
         }
-        
-        batch_start = batch_end;
+    }
+    drop(all_batches);
+
+    // Collect ds_paths for Post Phase C
+    if let Ok(all_ds) = sqlite.all_datasets() {
+        for d in all_ds { ds_paths.push((d.id, d.path)); }
     }
 
     // Post Phase C: link all unlinked files under each dataset as auxiliary_files
