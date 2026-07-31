@@ -919,7 +919,8 @@ pub fn run_dataset_asset_inference(
                     build_file_list_prompt(&candidate.path, &dataset_files))
             };
             
-            if batch_prompt.len() + section.len() > batch_size_limit && !batch_ds.is_empty() {
+            let has_children = parent_to_children.contains_key(candidate.path.as_str());
+            if !has_children && batch_prompt.len() + section.len() > batch_size_limit && !batch_ds.is_empty() {
                 break;  // Batch is full, process what we have
             }
             
