@@ -1,17 +1,11 @@
 use fan_core::config::{Config, DataLayer};
+use fan_core::index;
 use fan_core::index::sqlite::SqliteStore;
 
 pub fn run(_config: &Config, layer: &DataLayer, show_name: Option<&str>) {
-    let data_dir = match layer {
-        DataLayer::User => fan_core::config::dirs_fan().join("data"),
-        DataLayer::Global => fan_core::config::dirs_fan_global().join("data"),
-    };
-    let sqlite = match SqliteStore::open(&data_dir) {
+    let sqlite = match index::open_sqlite(layer) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to open index: {}", e);
-            return;
-        }
+        Err(e) => { eprintln!("Failed to open index: {}", e); return; }
     };
 
     match show_name {

@@ -80,3 +80,12 @@ pub fn open_index_for_layer(
     };
     IndexEngine::open_at(&data_dir, config, matches!(effective_mode, IndexMode::ReadOnly))
 }
+
+/// Open SQLite store for a given data layer (convenience wrapper).
+pub fn open_sqlite(layer: &DataLayer) -> Result<SqliteStore, rusqlite::Error> {
+    let data_dir = match layer {
+        DataLayer::User => crate::config::dirs_fan().join("data"),
+        DataLayer::Global => crate::config::dirs_fan_global().join("data"),
+    };
+    SqliteStore::open(&data_dir)
+}
