@@ -1,7 +1,11 @@
+//! Deprecated: use Dataset/Asset/File model instead (see index/sqlite.rs).
+//! Kept for backward compat with daemon/infer/projects commands.
+
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+#[deprecated(since = "0.2.0", note = "Use Dataset/Asset/File model via SqliteStore")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: i64,
@@ -17,6 +21,7 @@ pub struct Project {
     pub updated_at: i64,
 }
 
+#[deprecated(since = "0.2.0", note = "Use SqliteStore + Dataset/Asset/File tables")]
 pub struct ProjectStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
 }

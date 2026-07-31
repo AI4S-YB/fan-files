@@ -1,3 +1,6 @@
+//! Deprecated: use `datasets` command instead (Dataset/Asset/File model).
+//! Kept for backward compatibility.
+
 use fan_core::config::{Config, DataLayer};
 use fan_core::index::sqlite::SqliteStore;
 use fan_core::project::ProjectStore;
