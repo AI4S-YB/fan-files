@@ -218,11 +218,30 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
         Err(e) => eprintln!("  Dataset inference failed: {}", e),
     }
 
-    // Rebuild Tantivy search index from SQLite after Phase C
+    // Rebuild Tantivy search index with Phase C metadata
     eprintln!("  Building search index...");
-    if let Ok(all_files) = index.sqlite.all_paths() {
+    if let (Ok(all_files), Ok(all_datasets)) =
+        (index.sqlite.all_paths(), index.sqlite.all_datasets())
+    {
+        // Sort datasets by path length descending (most specific first → break early)
+        let mut ds_info: Vec<(&str, &str, &str)> = all_datasets.iter().map(|d| {
+            (d.path.as_str(),
+             d.dataset_type.as_deref().unwrap_or("?"),
+             d.species.as_deref().unwrap_or("?"))
+        }).collect();
+        ds_info.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
         for (id, path, _size) in &all_files {
-            index.tantivy.index_file(*id, &std::path::Path::new(path), path, &[]).ok();
+            let metadata = path.clone();
+            for (ds_path, ds_type, ds_species) in &ds_info {
+                if path.starts_with(ds_path) {
+                    let md = format!("{} | dataset:{} | type:{} | species:{}",
+                        path, ds_path, ds_type, ds_species);
+                    index.tantivy.index_file(*id, &std::path::Path::new(path),
+                        &md, &[ds_path]).ok();
+                    break;
+                }
+            }
         }
     }
     index.tantivy.commit().ok();
