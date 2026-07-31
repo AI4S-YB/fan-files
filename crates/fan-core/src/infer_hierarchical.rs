@@ -8,8 +8,8 @@
 
 use crate::index::sqlite::SqliteStore;
 use crate::llm::LlmClient;
-use std::thread;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use crate::discovery::DatasetCandidate;
 use crate::project::ProjectStore;
 use std::collections::HashMap;
@@ -837,11 +837,11 @@ pub fn run_dataset_asset_inference(
             // Process candidates in batches to keep LLM prompt under limit
     let mut batch_start: usize = 0;
     let mut batch_size_limit: usize = 12000;
+    let json_max = if use_json_format { 25 } else { usize::MAX };
     let total_candidates = filtered_candidates.len();
 
     let mut ds_paths: Vec<(i64, String)> = Vec::new();
 
-    let mut all_batches: Vec<(String, serde_json::Value, Vec<(String, Vec<(i64, String, i64)>, String)>)> = Vec::new();
     let mut all_batches: Vec<(String, serde_json::Value, Vec<(String, Vec<(i64, String, i64)>, String)>)> = Vec::new();
     while batch_start < total_candidates {
         // Layer 1-3: read prompts from Markdown files
@@ -920,7 +920,8 @@ pub fn run_dataset_asset_inference(
                     build_file_list_prompt(&candidate.path, &dataset_files))
             };
             
-            if batch_prompt.len() + section.len() > batch_size_limit && !batch_ds.is_empty() {
+            let has_children = parent_to_children.contains_key(candidate.path.as_str());
+            if !has_children && (batch_prompt.len() + section.len() > batch_size_limit || batch_ds.len() >= json_max) && !batch_ds.is_empty() {
                 break;  // Batch is full, process what we have
             }
             
@@ -1005,9 +1006,9 @@ pub fn run_dataset_asset_inference(
         batch_start = batch_end;
     }
 
-    // Concurrent LLM processing (configurable via FAN_WORKERS env, default: CPU cores (max 10))
+    // Concurrent LLM processing (configurable via FAN_WORKERS env, default: 5, set FAN_WORKERS to override)
     let concurrency: usize = std::env::var("FAN_WORKERS")
-        .unwrap_or_default().parse().unwrap_or_else(|_| { let n = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4); if n > 10 { 10 } else { n } });
+        .unwrap_or_default().parse().unwrap_or(5);
     let total_batches = all_batches.len();
     if total_batches > 0 {
         eprintln!("  Phase C: processing {} batches with {} workers...",
