@@ -1005,8 +1005,8 @@ pub fn run_dataset_asset_inference(
         batch_start = batch_end;
     }
 
-    // Concurrent LLM processing (configurable via FAN_CONCURRENCY env, default 5)
-    let concurrency: usize = std::env::var("FAN_CONCURRENCY")
+    // Concurrent LLM processing (configurable via FAN_WORKERS env, default: 5, set FAN_WORKERS to override)
+    let concurrency: usize = std::env::var("FAN_WORKERS")
         .unwrap_or_default().parse().unwrap_or(5);
     let total_batches = all_batches.len();
     if total_batches > 0 {
