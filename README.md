@@ -10,7 +10,8 @@
 - "服务器上有什么数据？"
 - "有没有水稻的 RNA-seq 数据？"
 - "这些文件来自哪台服务器？"
-- "列出所有参考基因组项目"
+- "列出所有基因组数据集"
+- "自动识别物种、实验类型、组装版本"
 
 ## 安装
 
@@ -52,18 +53,27 @@ sudo fan-files init --global
 
 ## 使用
 
+### 发现数据
+
+```bash
+fan-files discover                        # 完整流程: 发现 → 扫描 → LLM 推断
+fan-files discover --precise              # 精确模式 (读取文件 magic bytes)
+fan-files discover --re-infer             # 仅重新推断 (跳过扫描)
+
+# 配置并发: ~/.fan-files/config.toml
+threads = 5                               # Phase B 并行扫描 + Phase C 并发 LLM
+```
+
 ### 搜索与查询
 
 ```bash
-fan-files search "rice RNA-seq"          # 自然语言搜索（私有 + 公有）
-fan-files projects                        # 列出 LLM 推断的数据项目
-fan-files projects <name>                 # 查看项目详情
-fan-files projects update <name> --species "Oryza sativa" --confidence high
-fan-files info /path/to/file.bam          # 文件详情（含来源服务器）
+fan-files search "rice genome"            # 搜索文件 (关键词 + 数据集名 + 元数据)
+fan-files datasets                        # 列出所有推断的数据集
+fan-files datasets <name>                 # 查看数据集详情 (Asset/File)
+fan-files info /path/to/file.bam          # 文件详情 (含数据集归属)
 fan-files suggest /data/projects/xxx      # 数据推荐
-fan-files status                          # 索引状态 + 元数据覆盖率 + per-server 统计
+fan-files status                          # 索引状态 (datasets/assets/files)
 fan-files list                            # 列出所有文件
-fan-files list --server dev-server        # 按来源服务器过滤
 ```
 
 ### 服务器管理
@@ -89,38 +99,43 @@ fan-files --global search "genome"        # 搜索全局索引
 ## 全部命令
 
 ```
-fan-files init               交互式配置向导
-fan-files daemon             启动守护进程（扫描 + 监控 + 自动 infer）
-fan-files infer              手动触发 LLM 元数据推断（分批处理）
-fan-files search             自然语言搜索
-fan-files projects           列出/查看/更新数据项目
-fan-files pending            查看待完善元数据清单
-fan-files list               按类型/标签/服务器列出文件
-fan-files info               文件详情（含来源服务器）
+fan-files discover           Phase A→B→C 发现流程 (扫描 + LLM 推断)
+fan-files datasets           列出/查看数据集 (Dataset/Asset/File)
+fan-files search             搜索文件 (关键词 + 数据集名 + 元数据)
+fan-files infer              手动触发 Phase C LLM 推断
+fan-files status             索引状态 (datasets/assets/files 统计)
+fan-files list               按类型/标签列出文件
+fan-files info               文件详情 (含数据集归属)
 fan-files suggest            数据推荐
-fan-files status             索引状态 + per-server 统计
-fan-files servers            服务器注册管理子命令
-fan-files update             升级到最新版本（从 GitHub Releases 下载）
-fan-files uninstall          卸载（可选保留数据）
+fan-files correct            记录手动纠错 (规则学习)
+fan-files snapshots          推断快照管理 (list/diff/rollback)
+fan-files daemon             启动守护进程 (扫描 + 监控)
+fan-files servers            服务器注册管理
+fan-files init               交互式配置向导
+fan-files update             升级到最新版本
+fan-files uninstall          卸载
 ```
 
 ## 架构
 
 ```
-┌─ Mac mini / 服务器 ────────────────────────────┐
-│  fan-files                                       │
-│  ├── SQLite + Tantivy 本地索引                   │
-│  ├── 多用户：公有层 + 私有层                     │
-│  ├── 远程扫描：SSH + 缓存 + fan-agent            │
-│  └── 搜索：自然语言 + 语义 + 全文                │
-│         │                                         │
-│         │ SSH / fan-agent                        │
-│         ▼                                         │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
-│  │ dev-srv  │  │ ai-srv   │  │ gpu-h100 │ ...  │
-│  │ 本地扫描 │  │ 本地扫描 │  │ 本地扫描 │      │
-│  └──────────┘  └──────────┘  └──────────┘      │
-└─────────────────────────────────────────────────┘
+discover 流程:
+  Phase A (15s)     Phase B (5-12min)      Phase C (2-15min)
+  ┌──────────────┐  ┌──────────────┐       ┌──────────────────┐
+  │ 目录指纹采集   │→│ 文件并行扫描   │  →   │ JSON batch 构建   │
+  │ bottom-up 传播 │  │ SQLite 批量写  │      │ 并发 LLM 推断     │
+  │ LLM 角色分类   │  │ (threads 参数) │      │ Dataset→Asset→File│
+  └──────────────┘  └──────────────┘       └──────────────────┘
+                                                │
+                                           Tantivy 搜索索引
+                                           (Phase C 后一次性构建)
+
+数据模型:
+  Dataset → Asset → File  (三层结构)
+  示例: Cucumis_melo_CM3.6.1 → assembly → genome.fa
+
+索引:
+  SQLite (结构化查询) + Tantivy (全文搜索)
 ```
 
 ## 升级
