@@ -5,6 +5,7 @@
 //! Phase C: Hierarchical LLM inference
 
 use fan_core::config::{Config, DataLayer};
+use std::thread;
 use fan_core::discovery;
 use fan_core::infer_hierarchical;
 use fan_core::index::IndexEngine;
@@ -125,44 +126,55 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
     // Collect uniform dir paths for fast O(1) lookup during scan
     let uniform_parents: std::collections::HashSet<String> = uniform_map.keys().cloned().collect();
 
-    // Sequential root scanning — IndexEngine (Tantivy) is !Sync, parallelization
-    // requires Tantivy isolation or per-thread index instances. `threads` param
-    // controls Phase C concurrency only.
-    for root in &scan_roots {
-        let scanner = fan_core::scanner::Scanner::new(
-            vec![root.to_string()],
-            config.scan.exclude.clone(),
-            "discovery".to_string(),
-        )
-        .with_skip_magic(uniform_parents.clone())
-        .with_precise_mode(precise);
+    // Parallel root scanning — SqliteStore is Sync (internal Mutex).
+    // Each root scanned in its own thread, SQLite writes are serialized by Mutex.
+    let sqlite_ref = &index.sqlite;
+    let scan_exclude = config.scan.exclude.clone();
+    let up = uniform_parents.clone();
+    let n_threads = config.threads.unwrap_or_else(|| scan_roots.len().min(10));
+    for chunk in scan_roots.chunks(n_threads.max(1)) {
+        thread::scope(|s| {
+            let mut handles = Vec::new();
+            for root in chunk {
+                let root = root.to_string();
+                let exclude = scan_exclude.clone();
+                let up2 = up.clone();
+                handles.push(s.spawn(move || {
+                    let scanner = fan_core::scanner::Scanner::new(
+                        vec![root.clone()],
+                        exclude,
+                        "discovery".to_string(),
+                    )
+                    .with_skip_magic(up2)
+                    .with_precise_mode(precise);
 
-        eprintln!("  Scanning root: {}", root);
-        for file_info in scanner.scan() {
-            let parent = file_info.path.parent()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let is_uniform_bulk = uniform_parents.contains(&parent);
+                    let mut local_files = 0u64;
+                    let mut local_batch = 0usize;
+                    sqlite_ref.begin_batch().ok();
 
-            match index.index_file(&file_info, None) {
-                Ok(_) => {
-                    total_files += 1;
-                    batch_count += 1;
-                    if is_uniform_bulk { uniform_fastpath_count += 1; }
-                }
-                Err(e) => eprintln!("  Failed to index {}: {}", file_info.path.display(), e),
+                    for info in scanner.scan() {
+                        match sqlite_ref.upsert(&info, None) {
+                            Ok(_) => { local_files += 1; local_batch += 1; }
+                            Err(e) => eprintln!("  Failed to index {}: {}",
+                                info.path.display(), e),
+                        }
+                        if local_batch >= 1000 {
+                            sqlite_ref.commit_batch().ok();
+                            local_batch = 0;
+                            sqlite_ref.begin_batch().ok();
+                        }
+                    }
+                    if local_batch > 0 { sqlite_ref.commit_batch().ok(); }
+                    eprintln!("  Root {}: {} files indexed", root, local_files);
+                    local_files
+                }));
             }
-            if batch_count >= 1000 {
-                index.sqlite.commit_batch().ok();
-                batch_count = 0;
-                index.sqlite.begin_batch().ok();
+            for h in handles {
+                if let Ok(f) = h.join() { total_files += f; }
             }
-        }
+        });
     }
-    if batch_count > 0 {
-        index.sqlite.commit_batch().ok();
-    }
-    eprintln!("  Phase B complete: {} files indexed ({} via uniform fast-path)", total_files, uniform_fastpath_count);
+    eprintln!("  Phase B complete: {} files indexed", total_files);
     println!();
 
     // Create snapshot for re-infer tracking
