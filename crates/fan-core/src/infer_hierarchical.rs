@@ -867,7 +867,7 @@ pub fn run_dataset_asset_inference(
                 .filter(|(_, p, _)| p.starts_with(&candidate.path))
                 .cloned()
                 .collect();
-            if dataset_files.len() < 2 { continue; }
+            if dataset_files.is_empty() { continue; }
             
             let ds_name = candidate.path
                 .trim_start_matches(scan_root)
@@ -940,8 +940,14 @@ pub fn run_dataset_asset_inference(
             // JSON format: build structured candidate list
             let mut json_candidates = Vec::new();
             for (ds_name, _, ds_path) in &batch_ds {
+                // Extract path segments for LLM to understand hierarchy
+                let ds_rel = ds_path
+                    .trim_start_matches(scan_root)
+                    .trim_start_matches('/');
+                let path_segments: Vec<&str> = ds_rel.split('/').collect();
                 let mut entry = serde_json::json!({
                     "path": ds_path,
+                    "path_segments": path_segments,
                     "name": ds_name,
                     "files": [],
                 });

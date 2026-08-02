@@ -89,7 +89,8 @@ const BIO_EXTENSIONS: &[&str] = &[
     "fastq", "fastq.gz", "fq", "fq.gz",
     "bam", "sam", "cram", "sra",
     // ═══ Sequences ═══
-    "fa", "fasta", "fna", "faa", "ffn", "frn", "fa.gz", "fasta.gz",
+    "fa", "fasta", "fna", "faa", "ffn", "frn",
+    "fa.gz", "fasta.gz",
     "cds", "pep", "rna", "dna",
     // ═══ Alignment indices ═══
     "bai", "crai", "fai", "tbi", "csi", "paf",
@@ -141,11 +142,33 @@ const NOISE_PATTERNS: &[&str] = &[
     "__MACOSX", ".idea", ".vscode", "target",
 ];
 
-/// Extension extraction (handles compound extensions like .fastq.gz).
+/// Common compression suffixes in bioinformatics.
+const COMPRESS_SUFFIXES: &[&str] = &["gz", "bz2", "bz", "xz", "zst", "zstd"];
+
+/// Extension extraction (handles compound extensions like .fastq.gz, .fna.bz2, etc.).
 pub fn light_file_extension(name: &str) -> String {
     let lower = name.to_lowercase();
+
+    // Generic compression handling: .fna.gz, .fna.bz2, .faa.xz, etc.
+    // If stripping a compression suffix reveals a known bio extension,
+    // return the compound form "{bio_ext}.{comp}".
+    for comp in COMPRESS_SUFFIXES {
+        let suffix = format!(".{}", comp);
+        if lower.ends_with(&suffix) {
+            let inner = &lower[..lower.len() - suffix.len()];
+            if let Some(pos) = inner.rfind('.') {
+                let inner_ext = &inner[pos + 1..];
+                if is_bio_ext(inner_ext) {
+                    return format!("{}.{}", inner_ext, comp);
+                }
+            }
+        }
+    }
+
+    // Explicit compound list for non-bio compressed files (e.g. .csv.gz, .txt.gz)
+    // and other multi-part extensions.
     for compound in &[".fastq.gz", ".fq.gz", ".vcf.gz", ".gff.gz",
-                       ".tsv.gz", ".csv.gz", ".txt.gz", ".tab.gz", ".fa.gz"] {
+                       ".tsv.gz", ".csv.gz", ".txt.gz", ".tab.gz"] {
         if lower.ends_with(compound) { return compound[1..].to_string(); }
     }
     if let Some(pos) = name.rfind('.') {
@@ -156,8 +179,22 @@ pub fn light_file_extension(name: &str) -> String {
 }
 
 /// Check if an extension looks like a bioinformatics file format.
+/// Also recognizes compressed variants (e.g. "fna.gz", "faa.bz2").
 fn is_bio_ext(ext: &str) -> bool {
-    BIO_EXTENSIONS.contains(&ext)
+    if BIO_EXTENSIONS.contains(&ext) {
+        return true;
+    }
+    // Strip compression suffix and check inner extension.
+    // e.g. "fna.gz" → "fna", "faa.bz2" → "faa"
+    for comp in COMPRESS_SUFFIXES {
+        let suffix = format!(".{}", comp);
+        if let Some(inner) = ext.strip_suffix(&suffix) {
+            if BIO_EXTENSIONS.contains(&inner) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Check if a directory name matches known noise patterns.
@@ -361,18 +398,63 @@ pub fn run_bottom_up_discovery(
         .filter(|fp| fp.signal == DirSignal::Unknown && fp.file_count > 0)
         .count();
 
+    // Collect PropagatedBio containers that need LLM judgment.
+    // Some PropagatedBio dirs are analysis pipeline projects (e.g. tie_sRNA/
+    // with subdirs 01.raw, 02.clean) — they should be Datasets, not excluded.
+    // We filter out only the most obvious non-analysis directories locally
+    // (bare version numbers, obsolete markers). Everything else goes to LLM.
+    let ambig_containers: Vec<(String, Vec<String>)> = fingerprints.iter()
+        .filter(|(_, fp)| fp.signal == DirSignal::PropagatedBio && !fp.subdir_names.is_empty())
+        .filter(|(_, fp)| {
+            // Keep if any subdir doesn't look like a bare version tag or obsolete marker.
+            // The LLM (guided by L2 rules) makes the final call.
+            !fp.subdir_names.iter().all(|n| is_trivial_version_or_obsolete(n))
+        })
+        .map(|(path, fp)| (path.clone(), fp.subdir_names.clone()))
+        .collect();
+    if !ambig_containers.is_empty() {
+        eprintln!("  Bottom-Up: {} PropagatedBio containers need LLM classification (others filtered locally)",
+            ambig_containers.len());
+    }
+
     let mut llm_targets: Vec<String> = Vec::new();
     let mut llm_dataset_candidates: Vec<DatasetCandidate> = Vec::new();
-    if unknown_count > 0 {
-        // Build compressed annotated tree for LLM
-        eprintln!("  Bottom-Up: building compressed tree for LLM ({} ? dirs)...", unknown_count);
+
+    // Use match (not ?) so LLM failure doesn't kill Phase A entirely.
+    // auto_targets are always preserved regardless of LLM outcome.
+    let llm_result: Result<_, Box<dyn std::error::Error>> = (|| {
+        if unknown_count == 0 && ambig_containers.is_empty() {
+            return Ok((vec![], vec![], vec![]));
+        }
+        eprintln!("  Bottom-Up: building compressed tree for LLM ({} ? dirs, {} ambiguous containers)...",
+            unknown_count, ambig_containers.len());
         let prompt = build_bottom_up_prompt(&fingerprints, scan_root, base_depth);
         eprintln!("  Bottom-Up: prompt size = {} chars", prompt.len());
+        if prompt.len() <= 50 {
+            return Ok((vec![], vec![], vec![]));
+        }
+        llm_classify_bottom_up(llm_client, &prompt, scan_root, &ambig_containers)
+    })();
 
-        if prompt.len() > 50 {
-            let (targets_from_llm, dataset_hints) = llm_classify_bottom_up(llm_client, &prompt, scan_root)?;
+    match llm_result {
+        Ok((targets_from_llm, dataset_hints, container_roles)) => {
             llm_targets = targets_from_llm;
             llm_dataset_candidates = dataset_hints;
+            for (path, role) in &container_roles {
+                if role == "analysis_project" {
+                    llm_dataset_candidates.push(DatasetCandidate {
+                        path: path.clone(),
+                        dataset_type: "other".to_string(),
+                        species: None,
+                        confidence: "low".to_string(),
+                        candidate_role: None,
+                    });
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("  Bottom-Up: LLM call failed ({}). Proceeding with auto-detected targets.", e);
+            // auto_targets are preserved — continue without LLM hints
         }
     }
 
@@ -435,22 +517,6 @@ pub fn run_bottom_up_discovery(
                 confidence: "low".to_string(),
                 candidate_role: None,
             });
-        }
-    }
-
-    // Mark PropagatedBio containers with explicit role so Phase C can skip them
-    for (path, fp) in &fingerprints {
-        if fp.signal == DirSignal::PropagatedBio {
-            // Find or add as candidate with classification role
-            if !llm_dataset_candidates.iter().any(|c| c.path == *path) {
-                llm_dataset_candidates.push(DatasetCandidate {
-                    path: path.clone(),
-                    dataset_type: "other".to_string(),
-                    species: None,
-                    confidence: "low".to_string(),
-                    candidate_role: Some("classification".to_string()),
-                });
-            }
         }
     }
 
@@ -540,13 +606,30 @@ fn build_prompt_recursive(
     }
 }
 
+/// Minimal local filter: only skip directories whose subdirs are so obviously
+/// non-analysis that sending to LLM would be wasteful.
+/// This is intentionally conservative — it lets the LLM (with L2 rules) decide
+/// ambiguous cases. Data-specific naming conventions belong in prompt-L2-user.md.
+fn is_trivial_version_or_obsolete(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    // Bare version tag: "v1", "v2.0", "v1.1.3"
+    (lower.starts_with('v')
+        && lower.len() >= 2
+        && lower[1..].chars().all(|c| c.is_ascii_digit() || c == '.' || c == '_'))
+    // Obsolete marker: "obsolete", "obsolete_v1"
+    || lower.starts_with("obsolete")
+    // Empty or near-empty
+    || lower.is_empty()
+}
+
 /// Send annotated tree to LLM for classification.
 fn llm_classify_bottom_up(
     llm_client: &LlmClient,
     tree_prompt: &str,
     _scan_root: &str,
-) -> Result<(Vec<String>, Vec<DatasetCandidate>), Box<dyn std::error::Error>> {
-    let full_prompt = format!(
+    ambig_containers: &[(String, Vec<String>)],
+) -> Result<(Vec<String>, Vec<DatasetCandidate>, Vec<(String, String)>), Box<dyn std::error::Error>> {
+    let mut full_prompt = format!(
         "你是生物信息学家。下面是压缩后的目录树，每个目录标注了文件组成。\n\
          用你的专业知识判断：哪些目录是\"数据集\"以及它是什么类型。\n\n\
          数据集 = 一组相关生物信息文件的集合，通常对应某类组学数据。\n\
@@ -569,6 +652,24 @@ fn llm_classify_bottom_up(
          \"scan_targets\":[{{\"path\":\"路径\"}}]}}\n\n{}",
         tree_prompt
     );
+
+    // Append container classification task if needed
+    if !ambig_containers.is_empty() {
+        let container_lines: Vec<String> = ambig_containers.iter()
+            .map(|(path, subs)| format!("  {} → 子目录: [{}]", path, subs.join(", ")))
+            .collect();
+        full_prompt.push_str(&format!(
+            "\n\n---\n\n另外，以下目录自身没有文件，但在目录树中被标记为BIO↑。\n\
+             请判断每个目录的子目录是否构成有序分析步骤/管线编排：\n\n\
+             {}\n\n\
+             判断规则:\n\
+             - role=analysis_project: 子目录形成有序步骤（数字/字母编号、阶段/步骤序列等）\n\
+             - role=taxonomic_container: 子目录是版本名、品种名、accession ID、或废弃标记，无步骤关系\n\
+             在输出JSON中添加\"container_roles\":\n\
+             {{\"container_roles\":[{{\"path\":\"路径\",\"role\":\"analysis_project|taxonomic_container\"}}]}}",
+            container_lines.join("\n")
+        ));
+    }
 
     let body = serde_json::json!({
         "model": llm_client.config.model,
@@ -603,7 +704,18 @@ fn llm_classify_bottom_up(
             })
         }).collect())
         .unwrap_or_default();
-    Ok((targets, candidates))
+    // Parse container classification results
+    let container_roles: Vec<(String, String)> = output["container_roles"].as_array()
+        .map(|a| a.iter()
+            .filter_map(|v| {
+                let path = v["path"].as_str()?.to_string();
+                let role = v["role"].as_str().unwrap_or("taxonomic_container").to_string();
+                Some((path, role))
+            })
+            .collect())
+        .unwrap_or_default();
+
+    Ok((targets, candidates, container_roles))
 }
 
 // ═══════════════════════════════════════════════════════════
