@@ -50,22 +50,25 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
+
+      - name: Install system dependencies
+        run: |
+          brew install cmake protobuf openssl@3
 
       - name: Build release binary
-        run: cargo build --release --bin fan-files --target aarch64-apple-darwin
+        env:
+          OPENSSL_ROOT_DIR: /usr/local/opt/openssl@3
+        run: cargo build --release --bin fan-files
 
       - name: Package
         run: |
-          cd target/aarch64-apple-darwin/release
+          cd target/release
           strip fan-files || true
           tar czf fan-files-macos-arm64.tar.gz fan-files
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/aarch64-apple-darwin/release/fan-files-macos-arm64.tar.gz
-          body_path: RELEASE.md
+          files: target/release/fan-files-macos-arm64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
