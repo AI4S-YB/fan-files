@@ -5,49 +5,28 @@ on:
     tags:
       - 'v*'
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-
 jobs:
   build:
     name: Build (linux-x86_64)
     runs-on: ubuntu-24.04
+    container:
+      image: rust:latest
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
+          apt-get update
+          apt-get install -y \
             cmake \
             libclang-dev \
-            llvm-dev \
             libssl-dev \
-            pkg-config \
             protobuf-compiler \
             libprotobuf-dev \
             libsqlite3-dev
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+      - uses: actions/checkout@v4
 
       - name: Build release binary
-        env:
-          LIBCLANG_PATH: /usr/lib/llvm-18/lib
-          BINDGEN_EXTRA_CLANG_ARGS: -I/usr/include
         run: cargo build --release --bin fan-files
 
       - name: Strip binary
