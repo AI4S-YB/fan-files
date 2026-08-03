@@ -15,9 +15,6 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: fan-files
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            artifact: fan-files-static
 
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +27,9 @@ jobs:
             cmake \
             libclang-dev \
             libssl-dev \
-            pkg-config
+            pkg-config \
+            protobuf-compiler \
+            libprotobuf-dev
 
       - name: Install musl tools (if needed)
         if: matrix.target == 'x86_64-unknown-linux-musl'
