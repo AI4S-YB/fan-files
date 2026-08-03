@@ -9,10 +9,9 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-linux:
     name: Build (linux-x86_64)
     runs-on: ubuntu-22.04
-
     steps:
       - uses: actions/checkout@v4
 
@@ -23,25 +22,50 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            cmake \
-            libclang-dev \
-            libssl-dev \
-            pkg-config \
-            protobuf-compiler \
-            libprotobuf-dev \
-            libsqlite3-dev
+            build-essential cmake libclang-dev libssl-dev \
+            pkg-config protobuf-compiler libprotobuf-dev libsqlite3-dev
 
       - name: Build release binary
         run: cargo build --release --bin fan-files
 
-      - name: Strip binary
-        run: strip target/release/fan-files
+      - name: Package
+        run: |
+          cd target/release
+          strip fan-files
+          tar czf fan-files-linux-x86_64.tar.gz fan-files
 
-      - name: Upload binary to release
+      - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/fan-files
-          generate_release_notes: true
+          files: target/release/fan-files-linux-x86_64.tar.gz
+          body_path: RELEASE.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    name: Build (macOS-arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build release binary
+        run: cargo build --release --bin fan-files --target aarch64-apple-darwin
+
+      - name: Package
+        run: |
+          cd target/aarch64-apple-darwin/release
+          strip fan-files || true
+          tar czf fan-files-macos-arm64.tar.gz fan-files
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/aarch64-apple-darwin/release/fan-files-macos-arm64.tar.gz
+          body_path: RELEASE.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
