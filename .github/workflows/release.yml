@@ -24,10 +24,12 @@ jobs:
             build-essential \
             cmake \
             libclang-dev \
+            llvm-dev \
             libssl-dev \
             pkg-config \
             protobuf-compiler \
-            libprotobuf-dev
+            libprotobuf-dev \
+            libsqlite3-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -43,6 +45,9 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build release binary
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+          BINDGEN_EXTRA_CLANG_ARGS: -I/usr/include
         run: cargo build --release --bin fan-files
 
       - name: Strip binary
