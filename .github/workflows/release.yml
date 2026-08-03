@@ -29,19 +29,25 @@ jobs:
             libprotobuf-dev \
             libsqlite3-dev
 
-      - name: Verify build environment
+      - name: Build release (capture errors)
+        id: build
+        continue-on-error: true
         run: |
-          rustc --version
-          cargo --version
-          cc --version
-          pkg-config --libs openssl
-          protoc --version
+          cargo build --release --bin fan-files 2>&1 | tee /tmp/build.log
+          echo "EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
 
-      - name: Check compilation (fast)
-        run: cargo check --release --bin fan-files
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
 
-      - name: Build release binary
-        run: cargo build --release --bin fan-files
+      - name: Check build result
+        if: steps.build.outputs.EXIT_CODE != '0'
+        run: |
+          echo "Build failed. Check the build-log artifact for details."
+          exit 1
 
       - name: Strip binary
         run: strip target/release/fan-files
