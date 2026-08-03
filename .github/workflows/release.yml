@@ -8,23 +8,37 @@ on:
 jobs:
   build:
     name: Build (linux-x86_64)
-    runs-on: ubuntu-24.04
-    container:
-      image: rust:latest
+    runs-on: ubuntu-22.04
 
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install system dependencies
         run: |
-          apt-get update
-          apt-get install -y \
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
             cmake \
             libclang-dev \
             libssl-dev \
+            pkg-config \
             protobuf-compiler \
             libprotobuf-dev \
             libsqlite3-dev
 
-      - uses: actions/checkout@v4
+      - name: Verify build environment
+        run: |
+          rustc --version
+          cargo --version
+          cc --version
+          pkg-config --libs openssl
+          protoc --version
+
+      - name: Check compilation (fast)
+        run: cargo check --release --bin fan-files
 
       - name: Build release binary
         run: cargo build --release --bin fan-files
