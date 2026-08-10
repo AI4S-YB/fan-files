@@ -425,7 +425,7 @@ pub fn run_hierarchical_inference(
         return Ok((0, 0));
     }
 
-    let all_files = sqlite.all_paths().unwrap_or_default();
+    let mut all_files = sqlite.all_paths().unwrap_or_default();
 
     // Phase 1: build tree at depth 3, let LLM classify
     let tree = build_dir_tree(scan_root, PHASE1_DEPTH, &all_files);
@@ -796,7 +796,7 @@ pub fn run_dataset_asset_inference(
         return Ok(0);
     }
 
-    let all_files = sqlite.all_paths().unwrap_or_default();
+    let mut all_files = sqlite.all_paths().unwrap_or_default();
     let mut datasets_created = 0usize;
 
     // Build set of candidate paths for O(1) parent lookup + hints
@@ -1108,38 +1108,52 @@ pub fn run_dataset_asset_inference(
         for d in all_ds { ds_paths.push((d.id, d.path)); }
     }
 
-    // Post Phase C: link all unlinked files under each dataset as auxiliary_files
+    // Post Phase C: link auxiliary files -- sort + merge scan
+    // Original O(N*M) = 8108 * 6.5M ~ 52B starts_with calls
+    // Now: sort once, then O(M log N) binary-search merge
     eprintln!("  Post Phase C: linking auxiliary files...");
-    let mut aux_linked = 0u64;
-    for (ds_id, ds_path) in ds_paths.iter() {
-        let all_under: Vec<i64> = all_files.iter()
-            .filter(|(_, p, _)| p.starts_with(ds_path.as_str()))
-            .map(|(id, _, _)| *id)
-            .collect();
-        if all_under.is_empty() { continue; }
-        
-        let linked: std::collections::HashSet<i64> = {
-            let conn = sqlite.conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT af.file_id FROM asset_file af JOIN asset a ON af.asset_id = a.id WHERE a.dataset_id = ?1"
-            ).unwrap();
-            let rows: Vec<i64> = stmt.query_map(rusqlite::params![ds_id], |r| r.get(0))
-                .unwrap().filter_map(|x| x.ok()).collect();
-            rows.into_iter().collect()
-        };
-        
-        let unlinked: Vec<i64> = all_under.iter()
-            .filter(|id| !linked.contains(id))
-            .cloned()
-            .collect();
-        
-        if !unlinked.is_empty() {
-            if let Ok(a_id) = sqlite.insert_asset(*ds_id, Some("auxiliary_files"), Some("other"), None) {
-                for fid in &unlinked {
-                    sqlite.link_asset_file(a_id, *fid, Some("auxiliary")).ok();
-                    aux_linked += 1;
-                }
+
+    // Sort both by path for binary-search merge
+    ds_paths.sort_by(|a, b| a.1.cmp(&b.1));
+    all_files.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // One-shot: all already-linked (dataset_id, file_id) pairs
+    let linked_all: std::collections::HashMap<i64, std::collections::HashSet<i64>> = {
+        let conn = sqlite.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT a.dataset_id, af.file_id FROM asset_file af JOIN asset a ON af.asset_id = a.id"
+        ).unwrap();
+        let mut map: std::collections::HashMap<i64, std::collections::HashSet<i64>> = std::collections::HashMap::new();
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?))) {
+            for row in rows.flatten() {
+                map.entry(row.0).or_default().insert(row.1);
             }
+        }
+        map
+    };
+
+    // Pass 1: collect unlinked files per dataset in memory
+    let mut pending: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+    for (fid, fpath, _) in &all_files {
+        // Find last ds_path <= fpath (parent dirs sort before child files)
+        let end = ds_paths.partition_point(|(_, dp)| dp.as_str() <= fpath.as_str());
+        // Walk backwards: nested parent dirs are clustered before end
+        for i in (0..end).rev() {
+            let (ds_id, ref ds_path) = ds_paths[i];
+            if !fpath.starts_with(ds_path.as_str()) { break; }
+            if !linked_all.get(&ds_id).map_or(false, |s| s.contains(fid)) {
+                pending.entry(ds_id).or_default().push(*fid);
+            }
+        }
+    }
+    drop(linked_all);
+
+    // Pass 2: batch-insert per dataset (one transaction each)
+    let mut aux_linked = 0u64;
+    for (ds_id, file_ids) in &pending {
+        match sqlite.link_auxiliary_batch(*ds_id, file_ids, "auxiliary") {
+            Ok(n) => aux_linked += n,
+            Err(e) => eprintln!("  Failed to link dataset {}: {}", ds_id, e),
         }
     }
     eprintln!("  Post Phase C: {} auxiliary files linked", aux_linked);

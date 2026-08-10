@@ -446,12 +446,22 @@ impl SqliteStore {
     {
         let now = Self::now();
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO dataset (name, path, dataset_type, species, species_confidence, summary, indexed_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        // UPSERT: insert new or update existing (keeps original indexed_at)
+        let id: i64 = conn.query_row(
+            "INSERT INTO dataset (name, path, dataset_type, species, species_confidence, summary, indexed_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(path) DO UPDATE SET
+                 name=excluded.name,
+                 dataset_type=excluded.dataset_type,
+                 species=excluded.species,
+                 species_confidence=excluded.species_confidence,
+                 summary=excluded.summary,
+                 updated_at=excluded.updated_at
+             RETURNING id",
             rusqlite::params![name, path, dataset_type, species, confidence, summary, now, now],
+            |r| r.get(0),
         )?;
-        Ok(conn.last_insert_rowid())
+        Ok(id)
     }
 
     pub fn insert_asset(&self, dataset_id: i64, name: Option<&str>,
@@ -474,6 +484,25 @@ impl SqliteStore {
             rusqlite::params![asset_id, file_id, role],
         )?;
         Ok(())
+    }
+
+    /// Batch-link files under one auxiliary_files asset in a single transaction.
+    /// Creates the asset automatically. Avoids per-file lock overhead at scale.
+    pub fn link_auxiliary_batch(&self, ds_id: i64, file_ids: &[i64], role: &str) -> rusqlite::Result<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        let now = Self::now();
+        conn.execute(
+            "INSERT INTO asset (dataset_id, name, asset_type, indexed_at) VALUES (?1, 'auxiliary_files', 'other', ?2)",
+            rusqlite::params![ds_id, now],
+        )?;
+        let a_id = conn.last_insert_rowid();
+        let mut stmt = conn.prepare(
+            "INSERT OR REPLACE INTO asset_file (asset_id, file_id, role) VALUES (?1, ?2, ?3)"
+        )?;
+        for fid in file_ids {
+            stmt.execute(rusqlite::params![a_id, fid, role])?;
+        }
+        Ok(file_ids.len() as u64)
     }
 
     pub fn all_datasets(&self) -> rusqlite::Result<Vec<crate::types::DatasetEntry>> {
