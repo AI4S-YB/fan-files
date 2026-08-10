@@ -1071,6 +1071,15 @@ pub fn run_dataset_asset_inference(
                                                                                     guard.link_asset_file(
                                                                                         a_id, *fid,
                                                                                         fe["role"].as_str()).ok();
+                                                                                    // P1: write dataset_type + species to file bio_metadata
+                                                                                    if ds_type != "other" || species.is_some() {
+                                                                                        let meta = fan_plugin_sdk::BioMetadata {
+                                                                                            assay_type: Some(ds_type.to_string()),
+                                                                                            species: species.map(|s| s.to_string()),
+                                                                                            ..Default::default()
+                                                                                        };
+                                                                                        guard.update_bio_metadata(*fid, &meta).ok();
+                                                                                    }
                                                                                     break;
                                                                                 }
                                                                             }
