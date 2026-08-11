@@ -10,8 +10,8 @@ pub fn run(config: &Config, layer: &DataLayer) {
         return;
     }
 
-    let sqlite = match index::open_sqlite(layer) {
-        Ok(s) => s,
+    let index = match index::open_index_for_layer(config, layer, index::IndexMode::ReadWrite) {
+        Ok(i) => i,
         Err(e) => { eprintln!("Failed to open index: {}", e); return; }
     };
 
@@ -22,7 +22,7 @@ pub fn run(config: &Config, layer: &DataLayer) {
         .unwrap_or("/");
 
     println!("Running Phase C LLM inference...");
-    match infer_hierarchical::run_dataset_asset_inference(&sqlite, &llm_client, config.threads, scan_root, &[]) {
+    match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, &index.tantivy, config.threads, scan_root, &[]) {
         Ok(n) => println!("Inference complete: {} datasets created", n),
         Err(e) => eprintln!("Inference failed: {}", e),
     }

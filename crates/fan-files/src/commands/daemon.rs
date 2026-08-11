@@ -96,7 +96,7 @@ fn run_inner(config: &Config, layer: &DataLayer, scan_only: bool) {
         if llm_client.is_configured() {
             let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
             info!("Running LLM inference on indexed files...");
-            match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, config.threads, scan_root, &[]) {
+            match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, &index.tantivy, config.threads, scan_root, &[]) {
                 Ok(n) => info!("LLM inference complete: {} datasets", n),
                 Err(e) => warn!("LLM inference failed: {}", e),
             }
@@ -188,7 +188,7 @@ fn run_inner(config: &Config, layer: &DataLayer, scan_only: bool) {
                 let llm_client = LlmClient::new(config.llm.clone());
                 if llm_client.is_configured() {
                     let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
-                    match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, config.threads, scan_root, &[]) {
+                    match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, &index.tantivy, config.threads, scan_root, &[]) {
                         Ok(n) => info!("LLM inference: {} datasets", n),
                         Err(e) => warn!("LLM inference failed: {}", e),
                     }
@@ -288,7 +288,7 @@ fn auto_infer(index: &IndexEngine, config: &Config, servers: &[(String, fan_core
     let llm_client = LlmClient::new(config.llm.clone());
     if llm_client.is_configured() {
         let scan_root = servers.first().and_then(|(_, c)| c.scan_roots.first().map(|s| s.as_str())).unwrap_or("/");
-        match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, config.threads, scan_root, &[]) {
+        match infer_hierarchical::run_dataset_asset_inference(&index.sqlite, &llm_client, &index.tantivy, config.threads, scan_root, &[]) {
             Ok(n) => info!("Auto-infer: {} datasets", n),
             Err(e) => warn!("Auto-infer failed: {}", e),
         }

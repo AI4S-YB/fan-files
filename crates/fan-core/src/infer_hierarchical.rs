@@ -11,6 +11,7 @@ use crate::llm::LlmClient;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use crate::discovery::DatasetCandidate;
+use crate::index::tantivy::TantivyIndex;
 use crate::project::ProjectStore;
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -787,6 +788,7 @@ fn read_prompt(path: &std::path::PathBuf, fallback: &str) -> String {
 pub fn run_dataset_asset_inference(
     sqlite: &SqliteStore,
     llm_client: &LlmClient,
+    tantivy: &TantivyIndex,
     threads: Option<usize>,
     scan_root: &str,
     candidates: &[crate::discovery::DatasetCandidate],
@@ -1166,6 +1168,35 @@ pub fn run_dataset_asset_inference(
         }
     }
     eprintln!("  Post Phase C: {} auxiliary files linked", aux_linked);
+
+    // Enrich Tantivy index with Phase C metadata (dataset_type + species)
+    if let Ok(conn) = sqlite.conn.lock() {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT af.file_id, f.path, d.dataset_type, d.species
+             FROM asset_file af
+             JOIN asset a ON af.asset_id = a.id
+             JOIN dataset d ON a.dataset_id = d.id
+             JOIN files f ON f.id = af.file_id
+             WHERE d.dataset_type IS NOT NULL OR d.species IS NOT NULL"
+        ).unwrap();
+        let mut enriched = 0u64;
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<String>>(2)?, r.get::<_,Option<String>>(3)?))
+        }) {
+            for row in rows.flatten() {
+                let (file_id, path, ds_type, species) = row;
+                let meta = format!("{}", path);
+                let extra = format!("{} {}", ds_type.unwrap_or_default(), species.unwrap_or_default());
+                let combined = if extra.trim().is_empty() { meta } else { format!("{} {}", meta, extra) };
+                tantivy.index_file(file_id, &std::path::Path::new(&path), &combined, &[]).ok();
+                enriched += 1;
+            }
+        }
+        if enriched > 0 {
+            tantivy.commit().ok();
+            eprintln!("  Tantivy enriched: {} files with dataset metadata", enriched);
+        }
+    }
 
     Ok(datasets_created)
 }
