@@ -14,4 +14,5 @@ pub mod uninstall;
 pub mod servers;
 pub mod update;
 pub mod correct;
+pub mod rebuild_index;
 pub mod snapshot;

@@ -55,6 +55,8 @@ enum Commands {
     },
     /// Show index status
     Status,
+    /// Rebuild Tantivy index from SQLite data (metadata enrichment)
+    RebuildIndex,
     /// Snapshot management (list, diff, rollback)
     #[command(subcommand)]
     Snapshots(SnapshotAction),
@@ -193,6 +195,7 @@ fn main() {
         Commands::List { category, tag, server, json } => commands::list::run(&config, &layer, category.as_deref(), tag.as_deref(), server.as_deref(), json),
         Commands::Info { path, json } => commands::info::run(&config, &layer, &path, json),
         Commands::Status => commands::status::run(&config, &layer),
+        Commands::RebuildIndex => commands::rebuild_index::run(&config, &layer),
         Commands::Infer { flat } => {
             if flat {
                 commands::infer::run_flat(&config, &layer);
