@@ -1251,3 +1251,93 @@ fn load_corrections() -> String {
     String::new()
 }
 
+
+#[cfg(test)]
+
+#[cfg(test)]
+mod tests {
+    use crate::index::sqlite::SqliteStore;
+
+    #[test]
+    fn test_upsert_preserves_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(tmp.path()).expect("open");
+        let id1 = store.insert_dataset("ds1", "/path/a", Some("genome"), Some("species_x"), Some("high"), None).unwrap();
+        let id2 = store.insert_dataset("ds1_renamed", "/path/a", Some("transcriptome"), Some("species_y"), Some("high"), None).unwrap();
+        assert_eq!(id1, id2);
+        let conn = store.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT name, dataset_type, species FROM dataset WHERE id=?1",
+            rusqlite::params![id1],
+            |r| Ok((r.get::<_,String>(0)?, r.get::<_,Option<String>>(1)?, r.get::<_,Option<String>>(2)?)),
+        ).unwrap();
+        assert_eq!(row.0, "ds1_renamed");
+        assert_eq!(row.1.unwrap(), "transcriptome");
+        assert_eq!(row.2.unwrap(), "species_y");
+    }
+
+    #[test]
+    fn test_upsert_different_path_different_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(tmp.path()).expect("open");
+        let id1 = store.insert_dataset("ds1", "/path/a", None, None, None, None).unwrap();
+        let id2 = store.insert_dataset("ds2", "/path/b", None, None, None, None).unwrap();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_prefix_matching_logic() {
+        let ds_paths = vec![
+            (1i64, "/data/bio/agent_test/bar".to_string()),
+            (2i64, "/data/bio/agent_test/foo".to_string()),
+            (3i64, "/data/bio/projects/scRNA".to_string()),
+        ];
+        let fpath = "/data/bio/agent_test/foo/genome.fa".to_string();
+        let end = ds_paths.partition_point(|(_, dp)| dp.as_str() <= fpath.as_str());
+        assert!(end > 0);
+        let mut matched = false;
+        for i in (0..end).rev() {
+            if fpath.starts_with(ds_paths[i].1.as_str()) {
+                assert_eq!(ds_paths[i].0, 2);
+                matched = true;
+                break;
+            }
+        }
+        assert!(matched);
+
+        let fpath_eq = "/data/bio/agent_test/foo".to_string();
+        let end2 = ds_paths.partition_point(|(_, dp)| dp.as_str() <= fpath_eq.as_str());
+        assert!(end2 > 0);
+        let mut matched2 = false;
+        for i in (0..end2).rev() {
+            if fpath_eq.starts_with(ds_paths[i].1.as_str()) {
+                matched2 = true;
+                break;
+            }
+        }
+        assert!(matched2);
+
+        let fpath_early = "/data/bio/aaa".to_string();
+        let end3 = ds_paths.partition_point(|(_, dp)| dp.as_str() <= fpath_early.as_str());
+        assert_eq!(end3, 0);
+    }
+
+    #[test]
+    fn test_empty_ds_or_files() {
+        let empty_ds: Vec<(i64, String)> = vec![];
+        let files: Vec<(i64, String, i64)> = vec![(1, "/data/file.fa".to_string(), 1000)];
+        let end = empty_ds.partition_point(|(_, dp)| dp.as_str() <= files[0].1.as_str());
+        assert_eq!(end, 0);
+
+        let ds_paths = vec![(1i64, "/data".to_string())];
+        let empty_files: Vec<(i64, String, i64)> = vec![];
+        for (_, fpath, _) in &empty_files {
+            let end_d = ds_paths.partition_point(|(_, dp)| dp.as_str() <= fpath.as_str());
+            for i in (0..end_d).rev() {
+                if fpath.starts_with(ds_paths[i].1.as_str()) {
+                    panic!("Should not match on empty files");
+                }
+            }
+        }
+    }
+}
