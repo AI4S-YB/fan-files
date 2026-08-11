@@ -2,6 +2,7 @@ pub mod prompt;
 
 use crate::config::LlmConfig;
 use prompt::{LlmOutput, system_prompt};
+use std::time::Duration;
 use tracing::info;
 
 pub struct LlmClient {
@@ -58,7 +59,10 @@ impl LlmClient {
             "temperature": 0.3,
             "max_tokens": 50
         });
-        let response = ureq::post(&self.config.endpoint)
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(120))
+            .build();
+        let response = agent.post(&self.config.endpoint)
             .set("Authorization", &format!("Bearer {}", self.config.api_key))
             .set("Content-Type", "application/json")
             .send_json(&body)
@@ -86,7 +90,10 @@ pub(crate) fn llm_api_call_with_retry(
             "Calling LLM API at {} (model: {}, attempt {}/{})",
             config.endpoint, config.model, attempt + 1, max_retries
         );
-        match ureq::post(&config.endpoint)
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(120))
+            .build();
+        match agent.post(&config.endpoint)
             .set("Authorization", &format!("Bearer {}", config.api_key))
             .set("Content-Type", "application/json")
             .send_json(body)
