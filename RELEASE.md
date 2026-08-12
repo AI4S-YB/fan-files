@@ -1,4 +1,4 @@
-# fan-files v0.2.2 — Post Phase C Performance Fix & Stability Improvements
+# fan-files — Post Phase C Performance Fix & Stability Improvements
 
 > Bugfix release: eliminates ~18h hang on production-scale data, resolves FOREIGN KEY errors, enriches search index.
 
