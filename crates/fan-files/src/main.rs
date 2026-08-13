@@ -191,7 +191,7 @@ fn main() {
             }
         },
         Commands::Search { query, json } => commands::search::run(&config, &layer, &query, json),
-        Commands::Suggest { path, json } => commands::suggest::run(&config, &path, json),
+        Commands::Suggest { path, json } => commands::suggest::run(&config, &layer, &path, json),
         Commands::List { category, tag, server, json } => commands::list::run(&config, &layer, category.as_deref(), tag.as_deref(), server.as_deref(), json),
         Commands::Info { path, json } => commands::info::run(&config, &layer, &path, json),
         Commands::Status => commands::status::run(&config, &layer),

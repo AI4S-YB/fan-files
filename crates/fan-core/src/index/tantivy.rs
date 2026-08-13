@@ -1,11 +1,11 @@
 use std::path::Path;
-use tantivy::schema::{Schema, SchemaBuilder, STORED, TEXT};
-use tantivy::schema::Value;
-use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument};
-use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::directory::MmapDirectory;
 use std::sync::Mutex;
+use tantivy::collector::TopDocs;
+use tantivy::directory::MmapDirectory;
+use tantivy::query::QueryParser;
+use tantivy::schema::Value;
+use tantivy::schema::{INDEXED, STORED, Schema, SchemaBuilder, TEXT};
+use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument};
 
 pub struct TantivyIndex {
     index: Index,
@@ -17,17 +17,19 @@ impl TantivyIndex {
     /// Open the index. If read_only is true, no writer is created (safe for concurrent readers).
     pub fn open(data_dir: &Path, read_only: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let index_dir = data_dir.join("tantivy");
-        std::fs::create_dir_all(&index_dir).ok();
-
-        let mut schema_builder = SchemaBuilder::new();
-        schema_builder.add_i64_field("file_id", STORED);
-        schema_builder.add_text_field("path", TEXT | STORED);
-        schema_builder.add_text_field("metadata", TEXT);
-        schema_builder.add_text_field("tags", TEXT);
-        let schema = schema_builder.build();
+        if !read_only {
+            std::fs::create_dir_all(&index_dir)?;
+        }
 
         let dir = MmapDirectory::open(&index_dir)?;
-        let index = Index::open_or_create(dir, schema.clone())?;
+        let index = if index_dir.join("meta.json").exists() {
+            // Keep old indexes readable. `rebuild-index` writes the new schema
+            // to a fresh directory and swaps it in only after validation.
+            Index::open(dir)?
+        } else {
+            Index::open_or_create(dir, Self::schema())?
+        };
+        let schema = index.schema();
 
         let writer = if read_only {
             None
@@ -35,7 +37,22 @@ impl TantivyIndex {
             Some(Mutex::new(index.writer(50_000_000)?))
         };
 
-        Ok(Self { index, writer, schema })
+        Ok(Self {
+            index,
+            writer,
+            schema,
+        })
+    }
+
+    fn schema() -> Schema {
+        let mut schema_builder = SchemaBuilder::new();
+        // INDEXED is required for delete_term(file_id) to remove superseded
+        // documents. The previous STORED-only field caused duplicate buildup.
+        schema_builder.add_i64_field("file_id", INDEXED | STORED);
+        schema_builder.add_text_field("path", TEXT | STORED);
+        schema_builder.add_text_field("metadata", TEXT);
+        schema_builder.add_text_field("tags", TEXT);
+        schema_builder.build()
     }
 
     pub fn index_file(
@@ -45,7 +62,9 @@ impl TantivyIndex {
         metadata_text: &str,
         tags: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let writer = self.writer.as_ref()
+        let writer = self
+            .writer
+            .as_ref()
             .ok_or("index opened in read-only mode")?;
         let file_id_field = self.schema.get_field("file_id").unwrap();
         let path_field = self.schema.get_field("path").unwrap();
@@ -84,11 +103,8 @@ impl TantivyIndex {
         let tags_field = self.schema.get_field("tags").unwrap();
         let file_id_field = self.schema.get_field("file_id").unwrap();
 
-        let query_parser = QueryParser::for_index(&self.index, vec![
-            metadata_field,
-            path_field,
-            tags_field,
-        ]);
+        let query_parser =
+            QueryParser::for_index(&self.index, vec![metadata_field, path_field, tags_field]);
 
         let query = query_parser.parse_query(query_str)?;
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
@@ -107,7 +123,9 @@ impl TantivyIndex {
     }
 
     pub fn delete(&self, file_id: i64) -> Result<(), Box<dyn std::error::Error>> {
-        let writer = self.writer.as_ref()
+        let writer = self
+            .writer
+            .as_ref()
             .ok_or("index opened in read-only mode")?;
         let file_id_field = self.schema.get_field("file_id").unwrap();
         let mut w = writer.lock().unwrap();
@@ -124,5 +142,33 @@ impl TantivyIndex {
             w.commit()?;
         }
         Ok(())
+    }
+
+    pub fn num_docs(&self) -> Result<u64, Box<dyn std::error::Error>> {
+        let reader = self.index.reader()?;
+        Ok(reader.searcher().num_docs())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reindexing_a_file_id_replaces_the_old_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = TantivyIndex::open(temp.path(), false).unwrap();
+        index
+            .index_file(7, Path::new("/data/old.fastq"), "old", &[])
+            .unwrap();
+        index.commit().unwrap();
+        index
+            .index_file(7, Path::new("/data/new.fastq"), "new", &[])
+            .unwrap();
+        index.commit().unwrap();
+
+        assert_eq!(index.num_docs().unwrap(), 1);
+        assert!(index.search("old", 10).unwrap().is_empty());
+        assert_eq!(index.search("new", 10).unwrap().len(), 1);
     }
 }

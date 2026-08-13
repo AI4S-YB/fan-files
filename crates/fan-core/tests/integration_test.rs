@@ -115,3 +115,112 @@ fn test_sqlite_mark_deleted() {
     let entry = store.get_by_path(&info.path).unwrap().unwrap();
     assert!(entry.deleted);
 }
+
+#[test]
+fn test_dataset_suggest_queries_are_path_and_species_bounded() {
+    use fan_core::index::sqlite::SqliteStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(tmp.path()).unwrap();
+    let current_id = store
+        .insert_dataset(
+            "rice-rna",
+            "/data/rice/rna",
+            Some("RNA-seq"),
+            Some("Oryza sativa"),
+            Some("high"),
+            None,
+        )
+        .unwrap();
+    store
+        .insert_dataset(
+            "rice-atac",
+            "/data/rice/atac",
+            Some("ATAC-seq"),
+            Some("Oryza sativa"),
+            Some("high"),
+            None,
+        )
+        .unwrap();
+    store
+        .insert_dataset(
+            "maize-atac",
+            "/data/maize/atac",
+            Some("ATAC-seq"),
+            Some("Zea mays"),
+            Some("high"),
+            None,
+        )
+        .unwrap();
+    store
+        .insert_dataset(
+            "wildcard-lookalike",
+            "/data/riceXrna",
+            Some("ATAC-seq"),
+            Some("Oryza sativa"),
+            Some("high"),
+            None,
+        )
+        .unwrap();
+
+    let current = store
+        .find_dataset_for_path("/data/rice/rna/sample")
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.id, current_id);
+    assert!(store
+        .find_dataset_for_path("/data/rice_rna/sample")
+        .unwrap()
+        .is_none());
+
+    let candidates = store
+        .datasets_by_species("oryza SATIVA", current_id, 10)
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].path, "/data/rice/atac");
+}
+
+#[test]
+fn test_embedding_lookup_is_restricted_to_candidates() {
+    use fan_core::index::sqlite::SqliteStore;
+    use fan_core::types::RawFileInfo;
+    use std::path::PathBuf;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(tmp.path()).unwrap();
+    let make_file = |path: &str| RawFileInfo {
+        path: PathBuf::from(path),
+        source_server: "test".into(),
+        size: 1,
+        mtime_secs: 1,
+        hash_sha256: None,
+        magic_bytes: Vec::new(),
+        mime_type: "application/octet-stream".into(),
+    };
+    let first = store.upsert(&make_file("/data/first"), None).unwrap();
+    let second = store.upsert(&make_file("/data/second"), None).unwrap();
+    store.store_embedding(first, &[1.0, 0.0]).unwrap();
+    store.store_embedding(second, &[0.0, 1.0]).unwrap();
+
+    let result = store.load_embeddings_for_ids(&[second]).unwrap();
+    assert_eq!(result, vec![(second, vec![0.0, 1.0])]);
+    assert!(store.load_embeddings_for_ids(&[]).unwrap().is_empty());
+}
+
+#[test]
+fn test_sqlite_read_only_connection_rejects_writes() {
+    use fan_core::index::sqlite::SqliteStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    drop(SqliteStore::open(tmp.path()).unwrap());
+    let store = SqliteStore::open_read_only(tmp.path()).unwrap();
+    let result = store.insert_dataset(
+        "should-fail",
+        "/data/should-fail",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(result.is_err());
+}

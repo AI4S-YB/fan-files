@@ -29,12 +29,19 @@ impl IndexEngine {
         config: &Config,
         read_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Clean stale locks
-        let _ = std::fs::remove_file(data_dir.join("tantivy/.tantivy-writer.lock"));
-        let _ = std::fs::remove_file(data_dir.join("tantivy/.tantivy-meta.lock"));
+        if !read_only {
+            // Only a writer may clean stale writer locks. Read-only commands
+            // must never mutate an index directory.
+            let _ = std::fs::remove_file(data_dir.join("tantivy/.tantivy-writer.lock"));
+            let _ = std::fs::remove_file(data_dir.join("tantivy/.tantivy-meta.lock"));
+        }
 
         Ok(Self {
-            sqlite: SqliteStore::open(data_dir)?,
+            sqlite: if read_only {
+                SqliteStore::open_read_only(data_dir)?
+            } else {
+                SqliteStore::open(data_dir)?
+            },
             tantivy: tantivy::TantivyIndex::open(data_dir, read_only)?,
             embedding: embedding::EmbeddingEngine::new(config)?,
         })
@@ -88,4 +95,12 @@ pub fn open_sqlite(layer: &DataLayer) -> Result<SqliteStore, rusqlite::Error> {
         DataLayer::Global => crate::config::dirs_fan_global().join("data"),
     };
     SqliteStore::open(&data_dir)
+}
+
+pub fn open_sqlite_read_only(layer: &DataLayer) -> Result<SqliteStore, rusqlite::Error> {
+    let data_dir = match layer {
+        DataLayer::User => crate::config::dirs_fan().join("data"),
+        DataLayer::Global => crate::config::dirs_fan_global().join("data"),
+    };
+    SqliteStore::open_read_only(&data_dir)
 }

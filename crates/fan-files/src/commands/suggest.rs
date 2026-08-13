@@ -1,16 +1,16 @@
-use fan_core::config::Config;
+use fan_core::config::{Config, DataLayer};
 use fan_core::suggest::SuggestEngine;
 
-pub fn run(config: &Config, path: &str, json: bool) {
-    let index = match fan_core::index::open_index(config, fan_core::index::IndexMode::ReadOnly) {
-        Ok(i) => i,
+pub fn run(_config: &Config, layer: &DataLayer, path: &str, json: bool) {
+    let sqlite = match fan_core::index::open_sqlite_read_only(layer) {
+        Ok(store) => store,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);
             return;
         }
     };
 
-    let suggestions = SuggestEngine::suggest(&index, path, 10).unwrap_or_default();
+    let suggestions = SuggestEngine::suggest(&sqlite, path, 10).unwrap_or_default();
 
     if json {
         println!("{}", serde_json::to_string_pretty(&suggestions).unwrap());

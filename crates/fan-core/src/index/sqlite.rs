@@ -1,6 +1,6 @@
 use crate::types::{FileEntry, IndexStatus, RawFileInfo};
 use fan_plugin_sdk::{BioMetadata, FormatInfo};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -17,13 +17,33 @@ impl SqliteStore {
              PRAGMA synchronous=NORMAL;
              PRAGMA cache_size=-64000;
              PRAGMA mmap_size=268435456;
-             PRAGMA temp_store=MEMORY;"
+             PRAGMA temp_store=MEMORY;",
         )?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn open_read_only(data_dir: &Path) -> rusqlite::Result<Self> {
+        let db_path = data_dir.join("index.db");
+        let uri = format!("file:{}?mode=ro&immutable=1", db_path.to_string_lossy());
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.execute_batch(
+            "PRAGMA query_only=ON;
+             PRAGMA cache_size=-64000;
+             PRAGMA mmap_size=268435456;
+             PRAGMA temp_store=MEMORY;",
+        )?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Begin an explicit transaction for batch writes.
@@ -105,11 +125,7 @@ impl SqliteStore {
         // v2 migration: source_server tracking
         {
             let version: i64 = conn
-                .query_row(
-                    "PRAGMA user_version",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap_or(0);
             if version < 2 {
                 conn.execute_batch(
@@ -329,7 +345,11 @@ impl SqliteStore {
 
     /// Fallback search: LIKE query on path + bio_metadata_json + format_info_json.
     /// Returns (file_id, relevance_score) pairs.
-    pub fn search_by_metadata(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<(i64, i32)>> {
+    pub fn search_by_metadata(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(i64, i32)>> {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", query);
         let mut stmt = conn.prepare(
@@ -340,7 +360,7 @@ impl SqliteStore {
              FROM files WHERE deleted=0 AND (
                  path LIKE ?1 OR bio_metadata_json LIKE ?1 OR format_info_json LIKE ?1
              )
-             ORDER BY score DESC LIMIT ?2"
+             ORDER BY score DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pattern, limit as i64], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -362,6 +382,41 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT file_id, vector FROM embeddings")?;
         let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            let floats: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            Ok((id, floats))
+        })?;
+        rows.collect()
+    }
+
+    /// Return embeddings only for the supplied full-text candidates.
+    ///
+    /// Search used to deserialize every embedding in the database for every
+    /// query. Restricting the lookup to the (at most 50) Tantivy candidates
+    /// keeps the interactive path bounded and avoids loading the model when
+    /// none of those candidates has an embedding.
+    pub fn load_embeddings_for_ids(
+        &self,
+        file_ids: &[i64],
+    ) -> rusqlite::Result<Vec<(i64, Vec<f32>)>> {
+        if file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let placeholders = std::iter::repeat_n("?", file_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT file_id, vector FROM embeddings WHERE file_id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(file_ids.iter()), |row| {
             let id: i64 = row.get(0)?;
             let bytes: Vec<u8> = row.get(1)?;
             let floats: Vec<f32> = bytes
@@ -402,9 +457,13 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
         let indexed: i64 =
-            conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |r| r.get(0))?;
+            conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=0", [], |r| {
+                r.get(0)
+            })?;
         let deleted: i64 =
-            conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=1", [], |r| r.get(0))?;
+            conn.query_row("SELECT COUNT(*) FROM files WHERE deleted=1", [], |r| {
+                r.get(0)
+            })?;
         let last_scan: Option<i64> =
             conn.query_row("SELECT MAX(indexed_at) FROM files", [], |r| r.get(0))?;
         let last_change: Option<i64> =
@@ -437,13 +496,17 @@ impl SqliteStore {
         rows.collect()
     }
 
-
     // ═══ v2: Dataset/Asset CRUD ═══
 
-    pub fn insert_dataset(&self, name: &str, path: &str,
-        dataset_type: Option<&str>, species: Option<&str>,
-        confidence: Option<&str>, summary: Option<&str>) -> rusqlite::Result<i64>
-    {
+    pub fn insert_dataset(
+        &self,
+        name: &str,
+        path: &str,
+        dataset_type: Option<&str>,
+        species: Option<&str>,
+        confidence: Option<&str>,
+        summary: Option<&str>,
+    ) -> rusqlite::Result<i64> {
         let now = Self::now();
         let conn = self.conn.lock().unwrap();
         // UPSERT: insert new or update existing (keeps original indexed_at)
@@ -464,9 +527,13 @@ impl SqliteStore {
         Ok(id)
     }
 
-    pub fn insert_asset(&self, dataset_id: i64, name: Option<&str>,
-        asset_type: Option<&str>, path: Option<&str>) -> rusqlite::Result<i64>
-    {
+    pub fn insert_asset(
+        &self,
+        dataset_id: i64,
+        name: Option<&str>,
+        asset_type: Option<&str>,
+        path: Option<&str>,
+    ) -> rusqlite::Result<i64> {
         let now = Self::now();
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -477,7 +544,12 @@ impl SqliteStore {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn link_asset_file(&self, asset_id: i64, file_id: i64, role: Option<&str>) -> rusqlite::Result<()> {
+    pub fn link_asset_file(
+        &self,
+        asset_id: i64,
+        file_id: i64,
+        role: Option<&str>,
+    ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO asset_file (asset_id, file_id, role) VALUES (?1, ?2, ?3)",
@@ -488,7 +560,12 @@ impl SqliteStore {
 
     /// Batch-link files under one auxiliary_files asset in a single transaction.
     /// Creates the asset automatically. Avoids per-file lock overhead at scale.
-    pub fn link_auxiliary_batch(&self, ds_id: i64, file_ids: &[i64], role: &str) -> rusqlite::Result<u64> {
+    pub fn link_auxiliary_batch(
+        &self,
+        ds_id: i64,
+        file_ids: &[i64],
+        role: &str,
+    ) -> rusqlite::Result<u64> {
         let mut conn = self.conn.lock().unwrap();
         let now = Self::now();
         conn.execute(
@@ -497,7 +574,7 @@ impl SqliteStore {
         )?;
         let a_id = conn.last_insert_rowid();
         let mut stmt = conn.prepare(
-            "INSERT OR REPLACE INTO asset_file (asset_id, file_id, role) VALUES (?1, ?2, ?3)"
+            "INSERT OR REPLACE INTO asset_file (asset_id, file_id, role) VALUES (?1, ?2, ?3)",
         )?;
         for fid in file_ids {
             stmt.execute(rusqlite::params![a_id, fid, role])?;
@@ -512,11 +589,142 @@ impl SqliteStore {
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(crate::types::DatasetEntry {
-                id: row.get(0)?, name: row.get(1)?, path: row.get(2)?,
-                dataset_type: row.get(3)?, species: row.get(4)?,
-                species_confidence: row.get(5)?, species_source: row.get(6)?,
-                summary: row.get(7)?, indexed_at: row.get(8)?, updated_at: row.get(9)?,
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                dataset_type: row.get(3)?,
+                species: row.get(4)?,
+                species_confidence: row.get(5)?,
+                species_source: row.get(6)?,
+                summary: row.get(7)?,
+                indexed_at: row.get(8)?,
+                updated_at: row.get(9)?,
             })
+        })?;
+        rows.collect()
+    }
+
+    /// Find the most specific dataset that contains the requested path, or a
+    /// child dataset when the requested path is a broader project directory.
+    pub fn find_dataset_for_path(
+        &self,
+        path: &str,
+    ) -> rusqlite::Result<Option<crate::types::DatasetEntry>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, path, dataset_type, species, species_confidence,
+                    species_source, summary, indexed_at, updated_at
+             FROM dataset
+             WHERE path=?1
+                OR (length(?1)>length(path)
+                    AND substr(?1, 1, length(path)+1)=path || '/')
+                OR (length(path)>length(?1)
+                    AND substr(path, 1, length(?1)+1)=?1 || '/')
+             ORDER BY CASE
+                        WHEN path=?1 THEN 0
+                        WHEN length(?1)>length(path)
+                         AND substr(?1, 1, length(path)+1)=path || '/' THEN 1
+                        ELSE 2
+                      END,
+                      abs(length(path) - length(?1))
+             LIMIT 1",
+            rusqlite::params![path.trim_end_matches('/')],
+            |row| {
+                Ok(crate::types::DatasetEntry {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    dataset_type: row.get(3)?,
+                    species: row.get(4)?,
+                    species_confidence: row.get(5)?,
+                    species_source: row.get(6)?,
+                    summary: row.get(7)?,
+                    indexed_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    /// Return a bounded set of candidate datasets for a species. The dataset
+    /// table is the authoritative inferred-metadata layer and is several
+    /// orders of magnitude smaller than the files table.
+    pub fn datasets_by_species(
+        &self,
+        species: &str,
+        exclude_id: i64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<crate::types::DatasetEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, path, dataset_type, species, species_confidence,
+                    species_source, summary, indexed_at, updated_at
+             FROM dataset
+             WHERE id != ?1 AND species = ?2 COLLATE NOCASE
+             ORDER BY updated_at DESC, id
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![exclude_id, species, limit as i64],
+            |row| {
+                Ok(crate::types::DatasetEntry {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    dataset_type: row.get(3)?,
+                    species: row.get(4)?,
+                    species_confidence: row.get(5)?,
+                    species_source: row.get(6)?,
+                    summary: row.get(7)?,
+                    indexed_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    /// Read a bounded page of data needed to rebuild the full-text index.
+    /// This avoids holding millions of paths and issuing one SQLite query per
+    /// file during a rebuild.
+    pub fn index_documents_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, format_info_json, bio_metadata_json
+             FROM files
+             WHERE deleted=0 AND id>?1
+             ORDER BY id
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![after_id, limit as i64], |row| {
+            let id: i64 = row.get(0)?;
+            let path: String = row.get(1)?;
+            let format_json: Option<String> = row.get(2)?;
+            let bio_json: Option<String> = row.get(3)?;
+
+            let format_text = format_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<FormatInfo>(raw).ok())
+                .map(|format| format!("{:?}", format))
+                .unwrap_or_default();
+            let bio = bio_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<BioMetadata>(raw).ok());
+            let species = bio
+                .as_ref()
+                .and_then(|metadata| metadata.species.as_deref())
+                .unwrap_or("");
+            let assay = bio
+                .as_ref()
+                .and_then(|metadata| metadata.assay_type.as_deref())
+                .unwrap_or("");
+            let metadata_text = format!("{} {} {} {}", path, species, assay, format_text);
+            Ok((id, path, metadata_text))
         })?;
         rows.collect()
     }
@@ -541,7 +749,12 @@ impl SqliteStore {
 
     // ═══ Snapshot CRUD (re-infer version tracking) ═══
 
-    pub fn create_snapshot(&self, trigger: &str, rule_hash: &str, summary: &str) -> rusqlite::Result<i64> {
+    pub fn create_snapshot(
+        &self,
+        trigger: &str,
+        rule_hash: &str,
+        summary: &str,
+    ) -> rusqlite::Result<i64> {
         let now = Self::now();
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -577,8 +790,14 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         // Delete datasets and assets created AFTER this snapshot
         conn.execute("DELETE FROM asset_file WHERE asset_id IN (SELECT id FROM asset WHERE snapshot_id > ?1)", rusqlite::params![snapshot_id])?;
-        conn.execute("DELETE FROM asset WHERE snapshot_id > ?1", rusqlite::params![snapshot_id])?;
-        conn.execute("DELETE FROM dataset WHERE snapshot_id > ?1", rusqlite::params![snapshot_id])?;
+        conn.execute(
+            "DELETE FROM asset WHERE snapshot_id > ?1",
+            rusqlite::params![snapshot_id],
+        )?;
+        conn.execute(
+            "DELETE FROM dataset WHERE snapshot_id > ?1",
+            rusqlite::params![snapshot_id],
+        )?;
         Ok(())
     }
 }

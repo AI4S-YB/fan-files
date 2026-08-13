@@ -1,11 +1,24 @@
-use crate::index::IndexEngine;
-use fan_plugin_sdk::{BioMetadata, DataSource, SearchResult};
+use crate::index::sqlite::SqliteStore;
+use crate::types::DatasetEntry;
+use fan_plugin_sdk::{DataSource, SearchResult};
+use std::collections::HashSet;
 use tracing::info;
 
-/// 实验类型互补矩阵
-static COMPLEMENTARY_ASSAYS: &[(&str, &[&str])] = &[
-    ("RNA-seq", &["ChIP-seq", "ATAC-seq", "WGBS"] as &[&str]),
+/// Complementary experiment/data types. Dataset inference sometimes emits
+/// broad names (for example `transcriptome`) and sometimes assay names, so the
+/// matrix intentionally covers both forms.
+static COMPLEMENTARY_TYPES: &[(&str, &[&str])] = &[
+    ("RNA-seq", &["ChIP-seq", "ATAC-seq", "WGBS"]),
+    ("transcriptome", &["epigenome", "genome", "proteome"]),
     ("WGS", &["WGBS", "RNA-seq", "ChIP-seq"]),
+    (
+        "genome",
+        &["transcriptome", "genome_annotation", "epigenome"],
+    ),
+    (
+        "genome_annotation",
+        &["transcriptome", "proteome", "functional"],
+    ),
     ("scRNA-seq", &["scATAC-seq", "CITE-seq"]),
     ("ChIP-seq", &["RNA-seq", "ATAC-seq"]),
     ("ATAC-seq", &["RNA-seq", "ChIP-seq"]),
@@ -16,104 +29,126 @@ pub struct SuggestEngine;
 
 impl SuggestEngine {
     pub fn suggest(
-        index: &IndexEngine,
+        sqlite: &SqliteStore,
         project_dir: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>> {
-        // 1. Search for files in the project directory via Tantivy
-        let project_files = index.tantivy.search(project_dir, 50).unwrap_or_default();
-        info!("Found {} files in project directory", project_files.len());
-
-        // 2. Collect bio metadata from project files
-        let mut project_meta: Vec<BioMetadata> = Vec::new();
-        for (file_id, _score) in &project_files {
-            if let Ok(Some(entry)) = index.sqlite.get_by_id(*file_id) {
-                if let Some(meta) = &entry.bio_metadata {
-                    project_meta.push(meta.clone());
-                }
-            }
+        if limit == 0 {
+            return Ok(Vec::new());
         }
 
-        if project_meta.is_empty() {
-            info!("No bio metadata found for project, returning empty suggestions");
-            return Ok(vec![]);
-        }
+        let Some(current) = sqlite.find_dataset_for_path(project_dir)? else {
+            info!("No inferred dataset found for path: {}", project_dir);
+            return Ok(Vec::new());
+        };
+        let Some(species) = current.species.as_deref().filter(|value| !value.is_empty()) else {
+            info!("Dataset {} has no species metadata", current.path);
+            return Ok(Vec::new());
+        };
 
-        // 3. Extract key dimensions from project metadata
-        let species = project_meta.iter().find_map(|m| m.species.clone());
-        let tissue = project_meta.iter().find_map(|m| m.tissue.clone());
-        let project = project_meta.iter().find_map(|m| m.project.clone());
-        let assay_types: Vec<String> = project_meta.iter()
-            .filter_map(|m| m.assay_type.clone())
+        // Fetch a bounded candidate pool. A larger pool than the output limit
+        // lets complementary types rank ahead of generic same-species matches.
+        let candidate_limit = limit.saturating_mul(20).max(100);
+        let candidates = sqlite.datasets_by_species(species, current.id, candidate_limit)?;
+        let wanted = complementary_types(current.dataset_type.as_deref());
+
+        let mut scored: Vec<SearchResult> = candidates
+            .into_iter()
+            .filter_map(|candidate| score_dataset(&current, candidate, &wanted))
             .collect();
-
-        // 4. Find complementary assay types
-        let want_assays: Vec<String> = assay_types.iter()
-            .flat_map(|a| {
-                COMPLEMENTARY_ASSAYS.iter()
-                    .filter(|(k, _)| k == &a.as_str())
-                    .flat_map(|(_, v)| v.iter().map(|s| s.to_string()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        info!("Want complementary assays: {:?}", want_assays);
-
-        // 5. Score all indexed files
-        let candidates = index.sqlite.all_paths().unwrap_or_default();
-        let project_file_ids: Vec<i64> = project_files.iter().map(|(id, _)| *id).collect();
-        let mut scored: Vec<SearchResult> = Vec::new();
-
-        for (id, path_str, _mtime) in &candidates {
-            // Skip files already in the project
-            if project_file_ids.contains(id) {
-                continue;
-            }
-
-            if let Ok(Some(entry)) = index.sqlite.get_by_id(*id) {
-                let mut score: f64 = 0.0;
-                let mut reasons: Vec<String> = Vec::new();
-
-                if let Some(ref meta) = entry.bio_metadata {
-                    if species.is_some() && meta.species == species {
-                        score += 0.3;
-                        reasons.push("same species".into());
-                    }
-                    if tissue.is_some() && meta.tissue == tissue {
-                        score += 0.2;
-                        reasons.push("same tissue".into());
-                    }
-                    if project.is_some() && meta.project == project {
-                        score += 0.3;
-                        reasons.push("same project".into());
-                    }
-                    if meta.assay_type.as_ref().map(|a| want_assays.contains(a)).unwrap_or(false) {
-                        score += 0.15;
-                        reasons.push("complementary assay".into());
-                    }
-                    if meta.genome_build.is_some() {
-                        score += 0.05;
-                    }
-                }
-
-                if score > 0.1 {
-                    scored.push(SearchResult {
-                        path: path_str.clone(),
-                        score,
-                        file_type: entry.format_info.as_ref().map(|f| f.file_type.clone()),
-                        assay_type: entry.bio_metadata.as_ref().and_then(|m| m.assay_type.clone()),
-                        species: entry.bio_metadata.as_ref().and_then(|m| m.species.clone()),
-                        tags: entry.bio_metadata.as_ref().map(|m| m.tags.clone()).unwrap_or_default(),
-                        summary: reasons.join(", "),
-                        source: DataSource::Local,
-                    });
-                }
-            }
-        }
-
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.path.cmp(&right.path))
+        });
         scored.truncate(limit);
-        info!("Returning {} suggestions", scored.len());
+        info!(
+            "Returning {} dataset suggestions for {}",
+            scored.len(),
+            current.path
+        );
         Ok(scored)
+    }
+}
+
+fn complementary_types(dataset_type: Option<&str>) -> HashSet<String> {
+    let Some(dataset_type) = dataset_type else {
+        return HashSet::new();
+    };
+    COMPLEMENTARY_TYPES
+        .iter()
+        .filter(|(source, _)| source.eq_ignore_ascii_case(dataset_type))
+        .flat_map(|(_, targets)| targets.iter().map(|target| target.to_ascii_lowercase()))
+        .collect()
+}
+
+fn score_dataset(
+    current: &DatasetEntry,
+    candidate: DatasetEntry,
+    wanted: &HashSet<String>,
+) -> Option<SearchResult> {
+    let candidate_type = candidate.dataset_type.as_deref().unwrap_or("");
+    let same_type = current
+        .dataset_type
+        .as_deref()
+        .is_some_and(|source| source.eq_ignore_ascii_case(candidate_type));
+    let complementary = wanted.contains(&candidate_type.to_ascii_lowercase());
+
+    let mut score = 0.5; // same species: enforced by the SQL query
+    let mut reasons = vec!["same species".to_string()];
+    if complementary {
+        score += 0.35;
+        reasons.push("complementary dataset type".to_string());
+    } else if !same_type && !candidate_type.is_empty() {
+        score += 0.15;
+        reasons.push("different dataset type".to_string());
+    }
+    if candidate.species_confidence.as_deref() == Some("high") {
+        score += 0.05;
+        reasons.push("high-confidence species".to_string());
+    }
+
+    Some(SearchResult {
+        path: candidate.path,
+        score,
+        file_type: candidate.dataset_type.clone(),
+        assay_type: candidate.dataset_type,
+        species: candidate.species,
+        tags: Vec::new(),
+        summary: reasons.join(", "),
+        source: DataSource::Local,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dataset(id: i64, path: &str, dataset_type: &str) -> DatasetEntry {
+        DatasetEntry {
+            id,
+            name: format!("dataset-{id}"),
+            path: path.to_string(),
+            dataset_type: Some(dataset_type.to_string()),
+            species: Some("Oryza sativa".to_string()),
+            species_confidence: Some("high".to_string()),
+            species_source: None,
+            summary: None,
+            indexed_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn complementary_dataset_ranks_above_same_type() {
+        let current = dataset(1, "/data/rice/rna", "RNA-seq");
+        let wanted = complementary_types(current.dataset_type.as_deref());
+        let complementary =
+            score_dataset(&current, dataset(2, "/data/rice/atac", "ATAC-seq"), &wanted).unwrap();
+        let same =
+            score_dataset(&current, dataset(3, "/data/rice/rna-2", "RNA-seq"), &wanted).unwrap();
+        assert!(complementary.score > same.score);
     }
 }

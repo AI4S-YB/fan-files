@@ -3,7 +3,11 @@ use fan_plugin_sdk::{DataSource, SearchResult};
 use std::collections::HashMap;
 
 pub fn run(config: &Config, layer: &DataLayer, query: &str, json: bool) {
-    let index = match fan_core::index::open_index_for_layer(config, layer, fan_core::index::IndexMode::ReadOnly) {
+    let index = match fan_core::index::open_index_for_layer(
+        config,
+        layer,
+        fan_core::index::IndexMode::ReadOnly,
+    ) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Failed to open index: {}", e);
@@ -14,24 +18,31 @@ pub fn run(config: &Config, layer: &DataLayer, query: &str, json: bool) {
     // 1. Tantivy full-text search
     let tantivy_results = index.tantivy.search(query, 50).unwrap_or_default();
 
-    // If Tantivy returns nothing, fall back to SQLite LIKE search
-    let file_ids: Vec<(i64, f32)> = if tantivy_results.is_empty() {
-        index.sqlite.search_by_metadata(query, 50).unwrap_or_default()
-            .into_iter().map(|(id, score)| (id, score as f32)).collect()
-    } else {
-        tantivy_results
-    };
+    // Tantivy is the interactive search index. Falling back to a wildcard
+    // SQLite query scans the entire files table when there is no match, which
+    // is prohibitively slow at production scale.
+    let file_ids = tantivy_results;
 
-    let max_tantivy_score = file_ids.iter().map(|(_, s)| *s).fold(0.0f32, f32::max).max(1.0);
+    let max_tantivy_score = file_ids
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(0.0f32, f32::max)
+        .max(1.0);
 
-    // 2. Semantic embedding search (if model available)
-    let query_embedding = index.embedding.embed(query).ok();
-    let embedding_scores: HashMap<i64, f64> = if let Some(ref qvec) = query_embedding {
-        let stored = index.sqlite.load_embeddings().unwrap_or_default();
+    // 2. Semantic reranking, restricted to the full-text candidates. Check for
+    // stored vectors first so an empty embeddings table never loads ONNX.
+    let candidate_ids: Vec<i64> = file_ids.iter().map(|(file_id, _)| *file_id).collect();
+    let stored = index
+        .sqlite
+        .load_embeddings_for_ids(&candidate_ids)
+        .unwrap_or_default();
+    let embedding_scores: HashMap<i64, f64> = if stored.is_empty() {
+        HashMap::new()
+    } else if let Ok(qvec) = index.embedding.embed(query) {
         let mut scores = HashMap::new();
         for (file_id, vec) in &stored {
             if vec.len() == qvec.len() {
-                scores.insert(*file_id, cosine_similarity(qvec, vec));
+                scores.insert(*file_id, cosine_similarity(&qvec, vec));
             }
         }
         scores
@@ -52,16 +63,13 @@ pub fn run(config: &Config, layer: &DataLayer, query: &str, json: bool) {
         };
         merged.insert(*file_id, (combined, *tantivy_score));
     }
-    // Also include files found only by embedding
-    for (file_id, emb_score) in &embedding_scores {
-        if !merged.contains_key(file_id) && *emb_score > 0.3 {
-            merged.insert(*file_id, (*emb_score, 0.0));
-        }
-    }
-
     // Sort by combined score
     let mut sorted: Vec<(i64, (f64, f32))> = merged.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        b.1.0
+            .partial_cmp(&a.1.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     sorted.truncate(20);
 
     // 4. Build results
@@ -76,10 +84,7 @@ pub fn run(config: &Config, layer: &DataLayer, query: &str, json: bool) {
                     .bio_metadata
                     .as_ref()
                     .and_then(|m| m.assay_type.clone()),
-                species: entry
-                    .bio_metadata
-                    .as_ref()
-                    .and_then(|m| m.species.clone()),
+                species: entry.bio_metadata.as_ref().and_then(|m| m.species.clone()),
                 tags: entry
                     .bio_metadata
                     .as_ref()
@@ -110,30 +115,22 @@ pub fn run(config: &Config, layer: &DataLayer, query: &str, json: bool) {
             results.push(r);
         }
     }
-
-
-    // Check metadata coverage
-    let total = index.sqlite.status().unwrap().indexed_files;
-    let with_meta = index.sqlite.count_with_bio_metadata().unwrap_or(0);
-    let coverage_pct = if total > 0 { (with_meta as f64 / total as f64) * 100.0 } else { 0.0 };
-
-    if coverage_pct < 50.0 && total > 10 && !json {
-        eprintln!("⚠  Metadata coverage is low ({:.0}%). Run 'fan-files infer' for better results.", coverage_pct);
-    }
-
     if json {
-        let enriched: Vec<serde_json::Value> = results.iter().map(|r| {
-            let display_path = lookup_server_prefix(&index.sqlite, &r.path);
-            serde_json::json!({
-                "path": display_path,
-                "score": r.score,
-                "file_type": r.file_type,
-                "assay_type": r.assay_type,
-                "species": r.species,
-                "tags": r.tags,
-                "summary": r.summary,
+        let enriched: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                let display_path = lookup_server_prefix(&index.sqlite, &r.path);
+                serde_json::json!({
+                    "path": display_path,
+                    "score": r.score,
+                    "file_type": r.file_type,
+                    "assay_type": r.assay_type,
+                    "species": r.species,
+                    "tags": r.tags,
+                    "summary": r.summary,
+                })
             })
-        }).collect();
+            .collect();
         println!("{}", serde_json::to_string_pretty(&enriched).unwrap());
     } else {
         for r in &results {
@@ -149,15 +146,21 @@ pub fn run(config: &Config, layer: &DataLayer, query: &str, json: bool) {
     }
 }
 
-fn get_project_for_path(sqlite: &fan_core::index::sqlite::SqliteStore, file_path: &str) -> Option<String> {
+fn get_project_for_path(
+    sqlite: &fan_core::index::sqlite::SqliteStore,
+    file_path: &str,
+) -> Option<String> {
     let conn = sqlite.conn.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT p.name FROM project p
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.name FROM project p
          JOIN project_file pf ON p.id = pf.project_id
          JOIN files f ON f.id = pf.file_id
-         WHERE f.path = ?1 LIMIT 1"
-    ).ok()?;
-    stmt.query_row(rusqlite::params![file_path], |row| row.get(0)).ok()
+         WHERE f.path = ?1 LIMIT 1",
+        )
+        .ok()?;
+    stmt.query_row(rusqlite::params![file_path], |row| row.get(0))
+        .ok()
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
