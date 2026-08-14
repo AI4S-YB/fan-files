@@ -1,0 +1,9 @@
+bind = "127.0.0.1:8932"
+database = "/home/fan-files/.fan-files/data/index.db"
+pool_size = 4
+busy_timeout_ms = 5000
+request_timeout_ms = 5000
+stats_cache_seconds = 60
+max_page_size = 200
+expose_absolute_paths = false
+supported_schema_versions = [4]
