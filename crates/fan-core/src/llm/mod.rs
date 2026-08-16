@@ -91,7 +91,7 @@ pub(crate) fn llm_api_call_with_retry(
             config.endpoint, config.model, attempt + 1, max_retries
         );
         let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(1800))
             .build();
         match agent.post(&config.endpoint)
             .set("Authorization", &format!("Bearer {}", config.api_key))

@@ -785,6 +785,76 @@ fn read_prompt(path: &std::path::PathBuf, fallback: &str) -> String {
     }
 }
 
+/// Parse a Phase C batch LLM response and write datasets/assets into SQLite.
+/// Returns Some(created_count) on a valid JSON response, None if the JSON
+/// could not be parsed (caller decides whether to retry).
+fn process_batch_response(
+    sqlite: &Mutex<&&SqliteStore>,
+    bd: &[(String, Vec<(i64, String, i64)>, String)],
+    rc: &str,
+) -> Option<usize> {
+    let output = serde_json::from_str::<serde_json::Value>(rc).ok()?;
+    let datasets = output["datasets"].as_array()?;
+    let mut guard = sqlite.lock().unwrap();
+    let mut created = 0usize;
+    for ds_val in datasets {
+        let ds_type = ds_val["type"].as_str().unwrap_or("other");
+        let species = ds_val["species"].as_str()
+            .filter(|s| *s != "null");
+        let ds_name = ds_val["name"].as_str().unwrap_or("unnamed");
+        if let Some((_, df, dp)) = bd.iter()
+            .find(|(n, _, p)| {
+                n == ds_name
+                || p.ends_with(&format!("/{}", ds_name))
+                || n.ends_with(&format!("_{}", ds_name))
+            })
+        {
+            match guard.insert_dataset(ds_name, dp,
+                Some(ds_type), species, Some("high"), None)
+            {
+                Ok(ds_id) => {
+                    created += 1;
+                    if let Some(assets) = ds_val["assets"].as_array() {
+                        for asset in assets {
+                            if let Ok(a_id) = guard.insert_asset(
+                                ds_id, asset["name"].as_str(),
+                                asset["type"].as_str(), None)
+                            {
+                                if let Some(files) = asset["files"].as_array() {
+                                    for fe in files {
+                                        let fnm = fe["path"].as_str().unwrap_or("");
+                                        for (fid, fp, _) in df {
+                                            if fp.ends_with(fnm) {
+                                                guard.link_asset_file(
+                                                    a_id, *fid,
+                                                    fe["role"].as_str()).ok();
+                                                // P1: write dataset_type + species to file bio_metadata
+                                                if ds_type != "other" || species.is_some() {
+                                                    let meta = fan_plugin_sdk::BioMetadata {
+                                                        assay_type: Some(ds_type.to_string()),
+                                                        species: species.map(|s| s.to_string()),
+                                                        ..Default::default()
+                                                    };
+                                                    guard.update_bio_metadata(*fid, &meta).ok();
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    eprintln!("  Dataset: {} ({} assets)", ds_name,
+                        ds_val["assets"].as_array().map_or(0,|a| a.len()));
+                }
+                Err(e) => eprintln!("  FAIL: {}", e),
+            }
+        }
+    }
+    Some(created)
+}
+
 pub fn run_dataset_asset_inference(
     sqlite: &SqliteStore,
     llm_client: &LlmClient,
@@ -837,10 +907,10 @@ pub fn run_dataset_asset_inference(
 
     eprintln!("  Phase C: {} candidates → {} after dedup", candidates.len(), filtered_candidates.len());
 
-            // Process candidates in batches to keep LLM prompt under limit
+    // Process candidates in batches to keep LLM prompt under limit
     let mut batch_start: usize = 0;
     let mut batch_size_limit: usize = 12000;
-    let json_max = if use_json_format { 25 } else { usize::MAX };
+    let json_max = if use_json_format { 20 } else { usize::MAX };
     let total_candidates = filtered_candidates.len();
 
     let mut ds_paths: Vec<(i64, String)> = Vec::new();
@@ -994,8 +1064,9 @@ pub fn run_dataset_asset_inference(
             batch_prompt.push_str("\n输出JSON: {\"datasets\":[{\"name\":\"数据集名\",\"type\":\"genome|...\",\"species\":\"物种名\",\"assets\":[{\"name\":\"资产名\",\"type\":\"assembly|...\",\"files\":[{\"path\":\"文件名\",\"role\":\"primary|index|auxiliary\"}]}]}]}");
         }
 
-        eprintln!("  Phase C batch: {} candidates, {} chars prompt (batch {}-{}/{})",
-            batch_ds.len(), batch_prompt.len(), batch_start+1, batch_end, total_candidates);
+        eprintln!("  Phase C batch: {} candidates, {} chars prompt (batch {}-{}/{}) first={}",
+            batch_ds.len(), batch_prompt.len(), batch_start+1, batch_end, total_candidates,
+            batch_ds.first().map(|(n, _, _)| n.as_str()).unwrap_or("?"));
 
         let body = serde_json::json!({
             "model": llm_client.config.model,
@@ -1037,70 +1108,23 @@ pub fn run_dataset_asset_inference(
                         match crate::llm::llm_api_call_with_retry(&config, &body, 2) {
                             Ok(resp) => {
                                 let rc = resp["choices"][0]["message"]["content"]
-                                    .as_str().unwrap_or("");
-                                if let Ok(output) = serde_json::from_str::<serde_json::Value>(rc) {
-                                    if let Some(datasets) = output["datasets"].as_array() {
-                                        let mut guard = sqlite.lock().unwrap();
-                                        let mut created = 0usize;
-                                        for ds_val in datasets {
-                                            let ds_type = ds_val["type"].as_str().unwrap_or("other");
-                                            let species = ds_val["species"].as_str()
-                                                .filter(|s| *s != "null");
-                                            let ds_name = ds_val["name"].as_str().unwrap_or("unnamed");
-                                            if let Some((_, df, dp)) = bd.iter()
-                                                .find(|(n, _, p)| {
-                                                    n == ds_name
-                                                    || p.ends_with(&format!("/{}", ds_name))
-                                                    || n.ends_with(&format!("_{}", ds_name))
-                                                })
-                                            {
-                                                match guard.insert_dataset(ds_name, dp,
-                                                    Some(ds_type), species, Some("high"), None)
-                                                {
-                                                    Ok(ds_id) => {
-                                                        created += 1;
-                                                        if let Some(assets) = ds_val["assets"].as_array() {
-                                                            for asset in assets {
-                                                                if let Ok(a_id) = guard.insert_asset(
-                                                                    ds_id, asset["name"].as_str(),
-                                                                    asset["type"].as_str(), None)
-                                                                {
-                                                                    if let Some(files) = asset["files"].as_array() {
-                                                                        for fe in files {
-                                                                            let fnm = fe["path"].as_str().unwrap_or("");
-                                                                            for (fid, fp, _) in df {
-                                                                                if fp.ends_with(fnm) {
-                                                                                    guard.link_asset_file(
-                                                                                        a_id, *fid,
-                                                                                        fe["role"].as_str()).ok();
-                                                                                    // P1: write dataset_type + species to file bio_metadata
-                                                                                    if ds_type != "other" || species.is_some() {
-                                                                                        let meta = fan_plugin_sdk::BioMetadata {
-                                                                                            assay_type: Some(ds_type.to_string()),
-                                                                                            species: species.map(|s| s.to_string()),
-                                                                                            ..Default::default()
-                                                                                        };
-                                                                                        guard.update_bio_metadata(*fid, &meta).ok();
-                                                                                    }
-                                                                                    break;
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        eprintln!("  Dataset: {} ({} assets)", ds_name,
-                                                            ds_val["assets"].as_array().map_or(0,|a| a.len()));
-                                                    }
-                                                    Err(e) => eprintln!("  FAIL: {}", e),
-                                                }
-                                            }
-                                        }
-                                        return created;
-                                    }
+                                    .as_str().unwrap_or("").to_string();
+                                if let Some(c) = process_batch_response(&sqlite, &bd, &rc) {
+                                    return c;
                                 }
-                                0
+                                eprintln!("  Batch JSON parse FAILED ({} chars), retrying once...", rc.len());
+                                match crate::llm::llm_api_call_with_retry(&config, &body, 1) {
+                                    Ok(resp2) => {
+                                        let rc2 = resp2["choices"][0]["message"]["content"]
+                                            .as_str().unwrap_or("").to_string();
+                                        if let Some(c) = process_batch_response(&sqlite, &bd, &rc2) {
+                                            return c;
+                                        }
+                                        eprintln!("  Batch retry parse FAILED ({} chars)", rc2.len());
+                                        0
+                                    }
+                                    Err(e) => { eprintln!("  Batch retry LLM failed: {}", e); 0 }
+                                }
                             }
                             Err(e) => { eprintln!("  Worker failed: {}", e); 0 }
                         }

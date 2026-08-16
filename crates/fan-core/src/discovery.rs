@@ -629,7 +629,7 @@ fn llm_classify_bottom_up(
     _scan_root: &str,
     ambig_containers: &[(String, Vec<String>)],
 ) -> Result<(Vec<String>, Vec<DatasetCandidate>, Vec<(String, String)>), Box<dyn std::error::Error>> {
-    let mut full_prompt = format!(
+    let full_prompt = format!(
         "你是生物信息学家。下面是压缩后的目录树，每个目录标注了文件组成。\n\
          用你的专业知识判断：哪些目录是\"数据集\"以及它是什么类型。\n\n\
          数据集 = 一组相关生物信息文件的集合，通常对应某类组学数据。\n\
@@ -648,28 +648,11 @@ fn llm_classify_bottom_up(
          - analysis_step: 项目内分析步骤（编号前缀如01.raw/02.clean/03.align，归入父项目）\n\
          - classification: 纯容器/分类目录（自身无核心数据文件，仅为组织子目录）\n\\n\
          物种信息能从目录名推断的，一并输出。\n\
+         datasets 只列出你确信是数据集的目录，最多 200 个。\n\
          输出JSON: {{\"datasets\":[{{\"path\":\"路径\",\"dataset_type\":\"类型\",\"species\":\"物种\",\"confidence\":\"high\"}}],\n\
          \"scan_targets\":[{{\"path\":\"路径\"}}]}}\n\n{}",
         tree_prompt
     );
-
-    // Append container classification task if needed
-    if !ambig_containers.is_empty() {
-        let container_lines: Vec<String> = ambig_containers.iter()
-            .map(|(path, subs)| format!("  {} → 子目录: [{}]", path, subs.join(", ")))
-            .collect();
-        full_prompt.push_str(&format!(
-            "\n\n---\n\n另外，以下目录自身没有文件，但在目录树中被标记为BIO↑。\n\
-             请判断每个目录的子目录是否构成有序分析步骤/管线编排：\n\n\
-             {}\n\n\
-             判断规则:\n\
-             - role=analysis_project: 子目录形成有序步骤（数字/字母编号、阶段/步骤序列等）\n\
-             - role=taxonomic_container: 子目录是版本名、品种名、accession ID、或废弃标记，无步骤关系\n\
-             在输出JSON中添加\"container_roles\":\n\
-             {{\"container_roles\":[{{\"path\":\"路径\",\"role\":\"analysis_project|taxonomic_container\"}}]}}",
-            container_lines.join("\n")
-        ));
-    }
 
     let body = serde_json::json!({
         "model": llm_client.config.model,
@@ -683,7 +666,7 @@ fn llm_classify_bottom_up(
     });
 
     eprintln!("  Bottom-Up: asking LLM to classify annotated tree...");
-    let response: serde_json::Value = crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 3)?;
+    let response: serde_json::Value = crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 2)?;
     let content = response["choices"][0]["message"]["content"]
         .as_str().ok_or("No content")?;
 
@@ -704,16 +687,52 @@ fn llm_classify_bottom_up(
             })
         }).collect())
         .unwrap_or_default();
-    // Parse container classification results
-    let container_roles: Vec<(String, String)> = output["container_roles"].as_array()
-        .map(|a| a.iter()
-            .filter_map(|v| {
-                let path = v["path"].as_str()?.to_string();
+
+    // Container classification: chunked calls to stay under endpoint
+    // response-size/time limits (each chunk = one small JSON response).
+    let mut container_roles: Vec<(String, String)> = Vec::new();
+    const CONTAINER_CHUNK: usize = 100;
+    let chunks: Vec<&[(String, Vec<String>)]> = ambig_containers.chunks(CONTAINER_CHUNK).collect();
+    for (ci, chunk) in chunks.iter().enumerate() {
+        let container_lines: Vec<String> = chunk.iter()
+            .map(|(path, subs)| format!("  {} → 子目录: [{}]", path, subs.join(", ")))
+            .collect();
+        let cprompt = format!(
+            "你是生物信息学家。以下目录自身没有文件，但在目录树中被标记为BIO↑。\n\
+             请判断每个目录的子目录是否构成有序分析步骤/管线编排：\n\n\
+             {}\n\n\
+             判断规则:\n\
+             - role=analysis_project: 子目录形成有序步骤（数字/字母编号、阶段/步骤序列等）\n\
+             - role=taxonomic_container: 子目录是版本名、品种名、accession ID、或废弃标记，无步骤关系\n\
+             输出JSON: {{\"container_roles\":[{{\"path\":\"路径\",\"role\":\"analysis_project|taxonomic_container\"}}]}}",
+            container_lines.join("\n")
+        );
+        let cbody = serde_json::json!({
+            "model": llm_client.config.model,
+            "messages": [
+                {"role": "system", "content": "你是生物信息学家。根据子目录名称判断容器目录的分类角色。"},
+                {"role": "user", "content": cprompt}
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+            "max_tokens": 8192
+        });
+        eprintln!("  Bottom-Up: container classification chunk {}/{} ({} containers)...",
+            ci + 1, chunks.len(), chunk.len());
+        let cresp: serde_json::Value = crate::llm::llm_api_call_with_retry(&llm_client.config, &cbody, 2)?;
+        let ccontent = cresp["choices"][0]["message"]["content"]
+            .as_str().ok_or("No content")?;
+        let coutput: serde_json::Value = serde_json::from_str(ccontent)?;
+        if let Some(arr) = coutput["container_roles"].as_array() {
+            for v in arr {
+                let path = v["path"].as_str().unwrap_or("").to_string();
                 let role = v["role"].as_str().unwrap_or("taxonomic_container").to_string();
-                Some((path, role))
-            })
-            .collect())
-        .unwrap_or_default();
+                if !path.is_empty() {
+                    container_roles.push((path, role));
+                }
+            }
+        }
+    }
 
     Ok((targets, candidates, container_roles))
 }
