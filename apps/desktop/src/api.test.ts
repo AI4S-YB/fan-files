@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { fetchStats, fetchDatasets, searchDatasets, fetchDatasetDetail } from "./api";
+import { fetchStats, fetchDatasets, searchDatasets, fetchDatasetDetail, fetchFiles } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -95,6 +95,37 @@ describe("api client", () => {
     const detail = await fetchDatasetDetail(1);
     expect(m).toHaveBeenCalledWith(expect.stringContaining("/api/v1/datasets/1"));
     expect(detail.assets[0].file_count).toBe(3);
+  });
+
+  it("fetchFiles calls /api/v1/datasets/:id/files with limit and optional cursor", async () => {
+    const m = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [
+          {
+            id: 101,
+            asset_id: 7,
+            name: "ref.fa",
+            size: 123,
+            role: null,
+            mime_type: null,
+            source_server: "srv",
+            path: "/data/orders/rice/ref.fa",
+          },
+        ],
+        meta: { limit: 50, next_cursor: null, has_more: false },
+      }),
+    });
+    vi.stubGlobal("fetch", m);
+    const page = await fetchFiles(1);
+    let url = m.mock.calls[0][0] as string;
+    expect(url).toContain("/api/v1/datasets/1/files");
+    expect(url).toContain("limit=50");
+    expect(url).not.toContain("cursor");
+    await fetchFiles(1, 42);
+    url = m.mock.calls[1][0] as string;
+    expect(url).toContain("cursor=42");
+    expect(page.data[0].name).toBe("ref.fa");
   });
 
   it("throws on non-ok responses", async () => {

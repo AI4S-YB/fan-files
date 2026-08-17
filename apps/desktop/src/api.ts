@@ -116,3 +116,8 @@ export const fetchDatasets = (q: DatasetQuery = {}) => {
 export const searchDatasets = (q: string) =>
   get<DatasetSummary[]>(`/api/v1/search?q=${encodeURIComponent(q)}`);
 export const fetchDatasetDetail = (id: number) => get<DatasetDetail>(`/api/v1/datasets/${id}`);
+// 文件分页（详情弹层只取第一页；FileQuery: asset_id/cursor/limit）
+export const fetchFiles = (id: number, cursor?: number) =>
+  getPage<FileSummary>(
+    `/api/v1/datasets/${id}/files?limit=50${cursor !== undefined ? `&cursor=${cursor}` : ""}`
+  );
