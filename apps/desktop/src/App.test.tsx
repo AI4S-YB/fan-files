@@ -11,7 +11,8 @@ describe("App shell", () => {
   });
   it("switches page on sidebar click", () => {
     render(<App />);
-    fireEvent.click(screen.getByText("数据集"));
-    expect(screen.getByText("数据集页面（占位）")).toBeInTheDocument();
+    const btn = screen.getByText("数据集").closest("button")!;
+    fireEvent.click(btn);
+    expect(btn).toHaveClass("side-item", "active");
   });
 });
