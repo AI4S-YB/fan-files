@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import DatasetsPage from "./DatasetsPage";
 import * as api from "../api";
@@ -107,7 +107,28 @@ describe("DatasetsPage", () => {
     const share = screen.getByRole("button", { name: /共享/ });
     expect(share).toBeDisabled();
     expect(share).toHaveAttribute("title", "即将推出");
-    expect(screen.getByRole("button", { name: /打开目录/ })).toBeInTheDocument();
+    // T13 接入前"打开目录"同样禁用占位，不留可点但无响应的按钮
+    const openDir = screen.getByRole("button", { name: /打开目录/ });
+    expect(openDir).toBeDisabled();
+    expect(openDir).toHaveAttribute("title", "即将接入");
+  });
+
+  it("disables type chips while a page request is in flight", async () => {
+    let resolvePage!: (p: typeof pageOne) => void;
+    mockedApi.fetchDatasets.mockReturnValue(
+      new Promise((r) => {
+        resolvePage = r;
+      }) as never
+    );
+    render(<DatasetsPage />);
+    // 请求在途（loading=true）：chips 与翻页按钮都禁用，防止切筛选后旧响应覆盖 UI。
+    // 注意在途时 typeCounts 尚未到达，chip 显示回退集文案（无计数）
+    await waitFor(() => expect(screen.getByRole("button", { name: "genome" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: "上一页" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "下一页" })).toBeDisabled();
+    resolvePage(pageOne);
+    expect(await screen.findByText("Oryza_sativa_v1")).toBeInTheDocument();
+    expect(screen.getByText("genome (12)")).toBeEnabled();
   });
 
   it("disables next page button when next_cursor is null", async () => {

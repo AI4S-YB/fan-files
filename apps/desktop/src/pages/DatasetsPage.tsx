@@ -88,6 +88,8 @@ export default function DatasetsPage() {
           <button
             key={t}
             className={type === t ? "chip active" : "chip"}
+            // 翻页请求在途时禁用筛选，防止"切筛选 → 旧响应后到覆盖 UI"的竞态
+            disabled={loading}
             onClick={() => setType(type === t ? undefined : t)}
           >
             {countOf(t) != null ? `${t} (${countOf(t)})` : t}
@@ -128,8 +130,10 @@ export default function DatasetsPage() {
               <button disabled title="即将推出">
                 📤 共享
               </button>
-              {/* Task 13 接 invoke("open_path", { path: detail.path })，本任务空实现 */}
-              <button onClick={() => {}}>📂 打开目录</button>
+              {/* Task 13 接 invoke("open_path", { path: detail.path })，接入前禁用占位 */}
+              <button disabled title="即将接入">
+                📂 打开目录
+              </button>
             </div>
           </div>
         </div>

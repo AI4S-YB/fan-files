@@ -53,4 +53,27 @@ describe("DataTable", () => {
     render(<DataTable rows={[]} onSelect={() => {}} />);
     expect(screen.getByText("还没有数据集 — 去首页开始扫描")).toBeInTheDocument();
   });
+
+  it("renders custom emptyText for empty rows (T11 搜索页复用)", () => {
+    render(<DataTable rows={[]} onSelect={() => {}} emptyText="试试搜索 “水稻 基因组”" />);
+    expect(screen.getByText("试试搜索 “水稻 基因组”")).toBeInTheDocument();
+  });
+
+  it("falls back to badge-other styling for types without a badge class", () => {
+    const unknown: DatasetSummary = {
+      id: 3,
+      name: "Weird",
+      type: "pan-genome",
+      species: null,
+      summary: null,
+      path: null,
+      asset_count: 0,
+      file_count: 0,
+      updated_at: 0,
+    };
+    render(<DataTable rows={[unknown]} onSelect={() => {}} />);
+    const badge = screen.getByText("pan-genome");
+    expect(badge).toHaveClass("badge", "badge-other");
+    expect(badge).not.toHaveClass("badge-pan-genome");
+  });
 });
