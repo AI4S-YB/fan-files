@@ -25,14 +25,18 @@ export default function HomePage() {
   const [configured, setConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
 
+  const refreshStats = () => {
+    fetchStats()
+      .then(setStats)
+      .catch(() => setStats(null));
+  };
+
   useEffect(() => {
     invoke<FanConfig>("read_config")
       .then((cfg) => setConfigured(cfg.include.length > 0))
       .catch(() => setConfigured(false))
       .finally(() => setLoading(false));
-    fetchStats()
-      .then(setStats)
-      .catch(() => setStats(null));
+    refreshStats();
   }, []);
 
   const lastScan = stats ? formatLastScan(stats.last_indexed_at) : "—";
@@ -40,7 +44,7 @@ export default function HomePage() {
   return (
     <div className="page">
       <h2>首页</h2>
-      {!loading && !configured ? (
+      {loading ? null : !configured ? (
         <div className="empty-cta">
           <p>先告诉 fan-files 你的数据在哪里</p>
           {/* TODO(T12/T13): 点击后打开目录选择器/跳转设置页，本任务先空实现 */}
@@ -62,7 +66,7 @@ export default function HomePage() {
               <span>最近扫描</span>
             </div>
           </div>
-          <ScanPanel />
+          <ScanPanel onDone={refreshStats} />
         </>
       )}
     </div>
