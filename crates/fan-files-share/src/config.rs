@@ -1,6 +1,6 @@
 use clap::Parser;
 use serde::Deserialize;
-use std::{fs, net::SocketAddr, path::PathBuf};
+use std::{env, fs, net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "fan-files-share", version)]
@@ -55,6 +55,12 @@ impl Settings {
         }
         if let Some(bind) = args.bind {
             value.bind = bind;
+        }
+        // The sidecar may be started from an arbitrary working directory
+        // (e.g. the desktop shell), so make the database path absolute;
+        // the tantivy index dir is derived from its parent.
+        if value.database.is_relative() {
+            value.database = env::current_dir()?.join(&value.database);
         }
         if value.pool_size == 0 || value.max_page_size == 0 {
             return Err("pool_size and max_page_size must be positive".into());
