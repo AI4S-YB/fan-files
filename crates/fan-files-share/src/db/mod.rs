@@ -260,6 +260,38 @@ impl Database {
         })
     }
 
+    /// Map Tantivy-hit file ids to the datasets that contain those files,
+    /// deduplicated per dataset, with the count of matched files per dataset.
+    pub fn search_datasets(
+        &self,
+        file_ids: &[i64],
+        expose_path: bool,
+    ) -> Result<Vec<DatasetSummary>, AppError> {
+        if file_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let conn = self.pool.get()?;
+        let placeholders = vec!["?"; file_ids.len()].join(",");
+        let sql = format!(
+            "SELECT d.id,d.name,d.dataset_type,d.species,d.summary,d.path,d.updated_at,
+                    COUNT(DISTINCT a.id),COUNT(DISTINCT f.id)
+             FROM files f
+             JOIN asset_file af ON af.file_id = f.id
+             JOIN asset a ON a.id = af.asset_id
+             JOIN dataset d ON d.id = a.dataset_id
+             WHERE f.id IN ({placeholders})
+             GROUP BY d.id
+             ORDER BY COUNT(DISTINCT f.id) DESC, d.id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<DatasetSummary> = stmt
+            .query_map(rusqlite::params_from_iter(file_ids.iter()), |row| {
+                dataset_summary(row, expose_path)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn facets(&self) -> Result<Facets, AppError> {
         let conn = self.pool.get()?;
         fn values(
@@ -515,5 +547,43 @@ mod tests {
         let second = db.datasets(&query, 1, false).unwrap();
         assert_ne!(first.data[0].id, second.data[0].id);
         assert_eq!(second.data[0].id, 4);
+    }
+
+    #[test]
+    fn search_datasets_maps_file_ids_to_datasets() {
+        let (_temp, settings) = fixture();
+        let db = Database::open(&settings).unwrap();
+        let rows = db.search_datasets(&[100], false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "rice_reference");
+        assert_eq!(rows[0].dataset_type.as_deref(), Some("genome"));
+        assert_eq!(rows[0].file_count, 1);
+        assert!(rows[0].path.is_none());
+    }
+
+    #[test]
+    fn search_datasets_deduplicates_files_per_dataset() {
+        let (_temp, settings) = fixture();
+        let db = Database::open(&settings).unwrap();
+        let rows = db.search_datasets(&[100, 101], false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].file_count, 2);
+    }
+
+    #[test]
+    fn search_datasets_exposes_paths_when_enabled() {
+        let (_temp, settings) = fixture();
+        let db = Database::open(&settings).unwrap();
+        let rows = db.search_datasets(&[100], true).unwrap();
+        assert_eq!(rows[0].path.as_deref(), Some("/data/rice"));
+    }
+
+    #[test]
+    fn search_datasets_returns_empty_for_unknown_ids() {
+        let (_temp, settings) = fixture();
+        let db = Database::open(&settings).unwrap();
+        assert!(db.search_datasets(&[999], false).unwrap().is_empty());
+        assert!(db.search_datasets(&[], false).unwrap().is_empty());
     }
 }

@@ -84,6 +84,10 @@ pub struct FileQuery {
     pub cursor: Option<i64>,
     pub limit: Option<u32>,
 }
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+}
 
 #[derive(Debug, Serialize, Clone)]
 pub struct Facet {
