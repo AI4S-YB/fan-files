@@ -74,27 +74,67 @@ fn read_config_at(path: &Path) -> Result<FanConfig, String> {
 }
 
 /// 将 config 写入指定路径（自动创建父目录）。
+///
+/// read-modify-write：只重写 GUI 拥有的键（threads、[scan] include/exclude、
+/// [llm] endpoint/api_key/model），保留文件中的其他配置节（如 CLI 的
+/// [servers] 远程服务器注册表、[daemon]、[watch] 等），避免 GUI 保存一次
+/// 就静默删除 CLI 配置。文件不存在或无法解析为 TOML 表时从空表开始。
 fn write_config_at(path: &Path, cfg: FanConfig) -> Result<(), String> {
-    // toml::toml! 只接受字面量 token（不支持表达式），故显式构建 Value，
-    // 输出结构与 CLI 一致：threads、[scan] include/exclude、[llm] endpoint/api_key/model。
-    let mut scan = toml::map::Map::new();
-    scan.insert("include".into(), toml::Value::Array(cfg.include.iter().map(|s| toml::Value::String(s.clone())).collect()));
-    scan.insert("exclude".into(), toml::Value::Array(cfg.exclude.iter().map(|s| toml::Value::String(s.clone())).collect()));
-    let mut llm = toml::map::Map::new();
-    llm.insert("endpoint".into(), toml::Value::String(cfg.endpoint));
-    llm.insert("api_key".into(), toml::Value::String(cfg.api_key));
-    llm.insert("model".into(), toml::Value::String(cfg.model));
-    let mut root = toml::map::Map::new();
-    if let Some(threads) = cfg.threads {
-        root.insert("threads".into(), toml::Value::Integer(threads as i64));
+    let mut root = match std::fs::read_to_string(path) {
+        Ok(raw) => match toml::from_str::<toml::Value>(&raw) {
+            Ok(toml::Value::Table(t)) => t,
+            _ => toml::map::Map::new(), // unparseable → start fresh
+        },
+        Err(_) => toml::map::Map::new(),
+    };
+    // only touch the keys the GUI owns
+    match cfg.threads {
+        Some(t) => {
+            root.insert("threads".into(), toml::Value::Integer(t as i64));
+        }
+        None => {
+            root.remove("threads");
+        }
     }
-    root.insert("scan".into(), toml::Value::Table(scan));
-    root.insert("llm".into(), toml::Value::Table(llm));
-    let v = toml::Value::Table(root);
+    root.insert(
+        "scan".into(),
+        toml::Value::Table({
+            let mut scan = toml::map::Map::new();
+            scan.insert(
+                "include".into(),
+                toml::Value::Array(
+                    cfg.include
+                        .iter()
+                        .map(|s| toml::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+            scan.insert(
+                "exclude".into(),
+                toml::Value::Array(
+                    cfg.exclude
+                        .iter()
+                        .map(|s| toml::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+            scan
+        }),
+    );
+    root.insert(
+        "llm".into(),
+        toml::Value::Table({
+            let mut llm = toml::map::Map::new();
+            llm.insert("endpoint".into(), toml::Value::String(cfg.endpoint.clone()));
+            llm.insert("api_key".into(), toml::Value::String(cfg.api_key.clone()));
+            llm.insert("model".into(), toml::Value::String(cfg.model.clone()));
+            llm
+        }),
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(path, toml::to_string_pretty(&v).map_err(|e| e.to_string())?)
+    std::fs::write(path, toml::to_string_pretty(&toml::Value::Table(root)).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
 }
 
@@ -196,6 +236,73 @@ mod tests {
         assert_eq!(back, dto);
         let raw = std::fs::read_to_string(&p).unwrap();
         assert!(!raw.contains("threads"), "threads=None 应省略该键:\n{raw}");
+        cleanup(&p);
+    }
+
+    /// 回归：write_config_at 必须 read-modify-write，保留 GUI 不拥有的配置节
+    /// （如 CLI 的 [servers.*] 远程服务器注册表与 [daemon]），只更新 threads/[scan]/[llm]。
+    #[test]
+    fn write_config_preserves_unknown_sections() {
+        let p = temp_config_path("preserve-sections");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"threads = 8
+[servers.foo]
+url = "http://remote:8929"
+token = "abc"
+[daemon]
+port = 3232
+[scan]
+include = ["/old"]
+exclude = []
+[llm]
+endpoint = "http://old"
+api_key = ""
+model = "old-model"
+"#,
+        )
+        .unwrap();
+        write_config_at(&p, sample_config()).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("url = \"http://remote:8929\""), "servers.foo.url 应逐字保留:\n{raw}");
+        assert!(raw.contains("token = \"abc\""), "servers.foo.token 应逐字保留:\n{raw}");
+        assert!(raw.contains("[daemon]"), "[daemon] 节应保留:\n{raw}");
+        assert!(raw.contains("port = 3232"), "daemon.port 应保留:\n{raw}");
+        // [scan]/[llm] 与 threads 已按 GUI 值更新
+        let back = read_config_at(&p).unwrap();
+        assert_eq!(back, sample_config());
+        cleanup(&p);
+    }
+
+    /// threads=None 时从已有文件里删除 threads 键（而非仅在新文件中省略）。
+    #[test]
+    fn write_config_none_threads_removes_existing_key() {
+        let p = temp_config_path("remove-threads");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "threads = 4\n[servers.foo]\nurl = \"http://x\"\n").unwrap();
+        let mut dto = sample_config();
+        dto.threads = None;
+        write_config_at(&p, dto.clone()).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(!raw.contains("threads"), "threads=None 应删除既有键:\n{raw}");
+        assert!(raw.contains("[servers.foo]"), "未知节应保留:\n{raw}");
+        assert_eq!(read_config_at(&p).unwrap(), dto);
+        cleanup(&p);
+    }
+
+    /// 文件存在但无法解析成 TOML 表时从空表开始重建（不报错、不残留旧内容）。
+    #[test]
+    fn write_config_unparseable_file_starts_fresh() {
+        let p = temp_config_path("unparseable");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "not valid toml [[[ ~~~~").unwrap();
+        let dto = sample_config();
+        write_config_at(&p, dto.clone()).unwrap();
+        assert_eq!(read_config_at(&p).unwrap(), dto);
         cleanup(&p);
     }
 
