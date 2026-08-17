@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import { searchDatasets, type DatasetSummary } from "../api";
 import DataTable from "../components/DataTable";
 
@@ -7,15 +7,21 @@ export default function SearchPage() {
   // rows === null 表示"尚未搜索"；[] 表示"搜索过但没有结果"
   const [rows, setRows] = useState<DatasetSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 请求序号（last-write-wins）：连发两次搜索时，旧响应返回后不覆盖新结果
+  const seq = useRef(0);
 
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     // 客户端校验：q 为空不发起请求（后端空 q 会 400）
     if (!q.trim()) return;
+    const id = ++seq.current;
     try {
+      const result = await searchDatasets(q.trim());
+      if (id !== seq.current) return; // 已有更新的请求，丢弃陈旧响应
       setError(null);
-      setRows(await searchDatasets(q.trim()));
+      setRows(result);
     } catch {
+      if (id !== seq.current) return;
       // 失败时不清空已有结果，仅显示错误行（T15 全局横幅前的最小反馈）
       setError("搜索失败，请检查引擎状态");
     }

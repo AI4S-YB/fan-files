@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SearchPage from "./SearchPage";
 import * as api from "../api";
@@ -46,5 +46,41 @@ describe("SearchPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     await waitFor(() => expect(screen.getByText(/搜索失败/)).toBeInTheDocument());
     expect(screen.getByText("A")).toBeInTheDocument();
+  });
+  it("clears error line and shows results after a successful retry", async () => {
+    mockedApi.searchDatasets
+      .mockRejectedValueOnce(new Error("HTTP 500"))
+      .mockResolvedValueOnce([{ id: 1, name: "Oryza_sativa_v1", type: "genome", species: "Oryza sativa", path: "/a/v1", file_count: 3, asset_count: 2, summary: null, updated_at: 1787000000 }]);
+    render(<SearchPage />);
+    fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "水稻" } });
+    fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
+    await waitFor(() => expect(screen.getByText(/搜索失败/)).toBeInTheDocument());
+    // 重试同一查询：成功后错误行消失，新结果渲染
+    fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
+    await waitFor(() => expect(screen.getByText("Oryza_sativa_v1")).toBeInTheDocument());
+    expect(screen.queryByText(/搜索失败/)).not.toBeInTheDocument();
+  });
+  it("ignores stale response when a newer search resolves first", async () => {
+    let resolveFirst!: (r: api.DatasetSummary[]) => void;
+    let resolveSecond!: (r: api.DatasetSummary[]) => void;
+    mockedApi.searchDatasets
+      .mockReturnValueOnce(new Promise((r) => (resolveFirst = r)) as never)
+      .mockReturnValueOnce(new Promise((r) => (resolveSecond = r)) as never);
+    render(<SearchPage />);
+    fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "a" } });
+    fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
+    fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "b" } });
+    fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
+    // 第二次请求先返回
+    await act(async () => {
+      resolveSecond([{ id: 2, name: "B_result", type: "genome", species: null, path: "/b", file_count: 1, asset_count: 1, summary: null, updated_at: 0 }]);
+    });
+    expect(screen.getByText("B_result")).toBeInTheDocument();
+    // 第一次（陈旧）响应后返回，不得覆盖新结果
+    await act(async () => {
+      resolveFirst([{ id: 1, name: "A_result", type: "genome", species: null, path: "/a", file_count: 1, asset_count: 1, summary: null, updated_at: 0 }]);
+    });
+    expect(screen.getByText("B_result")).toBeInTheDocument();
+    expect(screen.queryByText("A_result")).not.toBeInTheDocument();
   });
 });
