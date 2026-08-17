@@ -1086,6 +1086,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "fan-core",
  "http",
  "r2d2",
  "r2d2_sqlite",
