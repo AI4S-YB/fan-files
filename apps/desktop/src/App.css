@@ -66,3 +66,5 @@ body {
   padding: 20px;
   overflow: auto;
 }
+
+.stat-cards{display:flex;gap:12px;margin:16px 0} .stat-card{flex:1;background:#fcfcfb;border:1px solid #e1e0d9;border-radius:8px;padding:14px;text-align:center} .stat-card b{display:block;font-size:22px;margin-bottom:4px} .stat-card span{color:#898781;font-size:12px} .empty-cta{padding:40px;text-align:center} .empty-cta p{color:#52514e} .primary{background:#2a78d6;color:#fff;border:none;border-radius:6px;padding:8px 16px;cursor:pointer;font-size:14px} .primary:disabled{opacity:.5;cursor:default} .scan-panel{margin-top:16px} .scan-log{background:#f6f6f4;border-radius:6px;padding:10px;font-size:11px;max-height:200px;overflow:auto;white-space:pre-wrap}
