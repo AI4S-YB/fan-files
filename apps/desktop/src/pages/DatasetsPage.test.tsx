@@ -72,7 +72,8 @@ const filesPage = {
 };
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // resetAllMocks：连未消费的 mockResolvedValueOnce 队列也清掉，避免一个用例中途失败污染后续用例
+  vi.resetAllMocks();
   mockedApi.fetchDatasets.mockResolvedValue(pageOne);
   mockedApi.fetchDatasetDetail.mockResolvedValue(detailFixture);
   mockedApi.fetchFiles.mockResolvedValue(filesPage);
@@ -130,6 +131,57 @@ describe("DatasetsPage", () => {
     await screen.findByText("Oryza_sativa_v1");
     fireEvent.click(screen.getByRole("button", { name: "下一页" }));
     expect(await screen.findByText("Second_page_dataset")).toBeInTheDocument();
+    expect(mockedApi.fetchDatasets).toHaveBeenLastCalledWith({ cursor: 2, limit: 50, type: undefined });
+  });
+
+  it("disables 上一页 until a page is pushed, then returns to page 1 with undefined cursor", async () => {
+    mockedApi.fetchDatasets
+      .mockResolvedValueOnce(pageOne)
+      .mockResolvedValueOnce({
+        data: [{ ...summary1, id: 51, name: "Second_page_dataset" }],
+        meta: { limit: 50, next_cursor: 3, has_more: true },
+      })
+      .mockResolvedValueOnce(pageOne);
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    const prev = screen.getByRole("button", { name: "上一页" });
+    expect(prev).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    expect(await screen.findByText("Second_page_dataset")).toBeInTheDocument();
+    expect(prev).toBeEnabled();
+    fireEvent.click(prev);
+    expect(await screen.findByText("Oryza_sativa_v1")).toBeInTheDocument();
+    expect(mockedApi.fetchDatasets).toHaveBeenCalledTimes(3);
+    // 返回第一页：cursor 为 undefined
+    expect(mockedApi.fetchDatasets).toHaveBeenLastCalledWith({ cursor: undefined, limit: 50, type: undefined });
+    // 历史栈清空后上一页再次禁用
+    expect(prev).toBeDisabled();
+  });
+
+  it("back from third page loads with the first stacked cursor", async () => {
+    const page2 = {
+      data: [{ ...summary1, id: 51, name: "P2" }],
+      meta: { limit: 50, next_cursor: 3, has_more: true },
+    };
+    const page3 = {
+      data: [{ ...summary1, id: 101, name: "P3" }],
+      meta: { limit: 50, next_cursor: null, has_more: false },
+    };
+    mockedApi.fetchDatasets
+      .mockResolvedValueOnce(pageOne)
+      .mockResolvedValueOnce(page2)
+      .mockResolvedValueOnce(page3)
+      .mockResolvedValueOnce(page2);
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    await screen.findByText("P2");
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    await screen.findByText("P3");
+    fireEvent.click(screen.getByRole("button", { name: "上一页" }));
+    await screen.findByText("P2");
+    expect(mockedApi.fetchDatasets).toHaveBeenCalledTimes(4);
+    // 栈 [2,3] → pop 3 → 用栈顶 cursor 2 重新 fetch（不是 undefined）
     expect(mockedApi.fetchDatasets).toHaveBeenLastCalledWith({ cursor: 2, limit: 50, type: undefined });
   });
 
