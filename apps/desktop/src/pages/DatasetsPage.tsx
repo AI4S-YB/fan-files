@@ -42,6 +42,8 @@ export default function DatasetsPage() {
     "idle" | "running" | "done-ok" | "done-err"
   >("idle");
   const [receiveLog, setReceiveLog] = useState<string[]>([]);
+  // 最近一次接收的目标目录（"打开接收目录"用）
+  const [receiveDir, setReceiveDir] = useState<string | null>(null);
   // 传输历史
   const [transferHistory, setTransferHistory] = useState<HistoryEntry[]>([]);
 
@@ -130,10 +132,17 @@ export default function DatasetsPage() {
       // 接收输出到 ~/Downloads/fan-received（默认接收目录）
       const home = await invoke<string>("fan_home");
       const downloads = home.replace("/.fan-files", "/Downloads/fan-received");
+      setReceiveDir(downloads);
       await invoke("receive_dataset", { code, output: downloads });
     } catch (e) {
       setReceiveStatus("done-err");
       setReceiveLog((l) => [...l, `接收启动失败: ${String(e)}`]);
+    }
+  }
+
+  function openReceiveDir() {
+    if (receiveDir) {
+      invoke("open_path", { path: receiveDir }).catch(console.error);
     }
   }
 
@@ -212,7 +221,12 @@ export default function DatasetsPage() {
           {receiveStatus === "running" ? "接收中…" : "接收"}
         </button>
         {receiveStatus === "done-ok" && (
-          <span className="feedback-ok">✅ 已接收（~/Downloads/fan-received）</span>
+          <span className="feedback-ok">✅ 已接收</span>
+        )}
+        {receiveStatus === "done-ok" && (
+          <button className="secondary" onClick={() => openReceiveDir()}>
+            📂 打开接收目录
+          </button>
         )}
         {receiveStatus === "done-err" && (
           <span className="feedback-err">❌ 接收失败</span>
