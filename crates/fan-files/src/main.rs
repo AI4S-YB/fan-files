@@ -109,6 +109,9 @@ enum Commands {
     },
     /// Interactive setup wizard
     Init,
+    /// P2P data transfer (magic-wormhole): send / get / log
+    #[command(subcommand)]
+    Transfer(TransferAction),
     /// Manage registered servers
     #[command(subcommand)]
     Servers(ServersAction),
@@ -169,6 +172,28 @@ enum ServersAction {
     Watch {
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum TransferAction {
+    /// 数据方：分享一个 dataset 或目录，输出一次性配对码
+    Send {
+        /// dataset 名称（来自索引）或本地路径
+        dataset: String,
+        /// 配对码有效期（小时，默认 24）
+        #[arg(long, default_value_t = 24)]
+        ttl_hours: u64,
+    },
+    /// 请求方：凭配对码接收数据
+    Get {
+        /// 配对码（如 8-purple-hammer）
+        code: String,
+        /// 输出路径（默认当前目录 + 原文件名）
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// 查看审计日志
+    Log,
 }
 
 fn main() {
@@ -235,6 +260,13 @@ fn main() {
             commands::correct::run(dataset, asset, new_type);
         },
         Commands::Init => commands::init::run(&config, &layer),
+        Commands::Transfer(action) => commands::transfer::run(&config, &layer, match action {
+            TransferAction::Send { dataset, ttl_hours } =>
+                commands::transfer::TransferAction::Send { dataset, ttl_hours },
+            TransferAction::Get { code, output } =>
+                commands::transfer::TransferAction::Get { code, output },
+            TransferAction::Log => commands::transfer::TransferAction::Log,
+        }),
         Commands::Snapshots(action) => match action {
             SnapshotAction::List => commands::snapshot::list(&config, &layer),
             SnapshotAction::Diff { id1, id2 } => commands::snapshot::diff(&config, &layer, id1, id2),
