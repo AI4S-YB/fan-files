@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   fetchDatasets,
   fetchDatasetDetail,
@@ -14,6 +15,13 @@ import DataTable from "../components/DataTable";
 // meta.type_counts 缺失时（老后端/空库）回退到固定类型集
 const FALLBACK_TYPES = ["genome", "transcriptome", "variant", "other"];
 
+// 共享状态：null=未共享，code=已生成码等待接收，running=传输中，done=完成
+type ShareState =
+  | { status: "idle" }
+  | { status: "running" }
+  | { status: "code"; code: string }
+  | { status: "done"; ok: boolean };
+
 export default function DatasetsPage() {
   const [rows, setRows] = useState<DatasetSummary[]>([]);
   const [nextCursor, setNextCursor] = useState<number | null>(null);
@@ -25,6 +33,45 @@ export default function DatasetsPage() {
   const [history, setHistory] = useState<number[]>([]);
   // 翻页 loading guard：请求在途时禁用上一页/下一页，防连点双请求
   const [loading, setLoading] = useState(false);
+  // 数据集共享（P2P）状态 + 进度日志
+  const [share, setShare] = useState<ShareState>({ status: "idle" });
+  const [shareLog, setShareLog] = useState<string[]>([]);
+
+  // 监听共享事件流（share://code / progress / done / error）
+  useEffect(() => {
+    const unCode = listen<string>("share://code", (e) => {
+      setShare({ status: "code", code: e.payload });
+      setShareLog((l) => [...l, `传输码: ${e.payload}`]);
+    });
+    const unProgress = listen<string>("share://progress", (e) => {
+      setShareLog((l) => [...l.slice(-200), e.payload]);
+    });
+    const unDone = listen<number>("share://done", (e) => {
+      setShare({ status: "done", ok: e.payload === 0 });
+      if (e.payload !== 0) setShareLog((l) => [...l, "共享失败"]);
+    });
+    const unError = listen<string>("share://error", (e) => {
+      setShare({ status: "done", ok: false });
+      setShareLog((l) => [...l, `共享错误: ${e.payload}`]);
+    });
+    return () => {
+      unCode.then((u) => u());
+      unProgress.then((u) => u());
+      unDone.then((u) => u());
+      unError.then((u) => u());
+    };
+  }, []);
+
+  async function startShare(path: string) {
+    setShare({ status: "running" });
+    setShareLog([]);
+    try {
+      await invoke("share_dataset", { path });
+    } catch (e) {
+      setShare({ status: "done", ok: false });
+      setShareLog((l) => [...l, `共享启动失败: ${String(e)}`]);
+    }
+  }
 
   // 游标分页：next_cursor 非空则"下一页"可用（cursor 即上一页最后一条的 id）。
   // 错误在内部消化（不向外 reject），失败时清空行/游标/历史栈。
@@ -128,7 +175,11 @@ export default function DatasetsPage() {
               ))}
             </ul>
             <div className="modal-actions">
-              <button disabled title="即将推出">
+              <button
+                disabled={!detail.path || share.status === "running"}
+                title={detail.path ? "生成配对码，对方凭码接收" : "无本地路径"}
+                onClick={() => detail.path && startShare(detail.path)}
+              >
                 📤 共享
               </button>
               {/* T13: 系统文件管理器打开数据集目录；无本地路径时保持禁用 */}
@@ -143,6 +194,28 @@ export default function DatasetsPage() {
                 📂 打开目录
               </button>
             </div>
+            {share.status !== "idle" && (
+              <div className="share-panel">
+                {share.status === "code" && (
+                  <div className="share-code">
+                    <div className="share-code-label">把下面的配对码发给对方，对方执行：</div>
+                    <code className="share-code-value">{share.code}</code>
+                    <div className="share-code-cmd">
+                      fan-files transfer get {share.code}
+                    </div>
+                  </div>
+                )}
+                {share.status === "running" && <div className="share-hint">⏳ 正在连接 rendezvous…</div>}
+                {share.status === "done" && (
+                  <div className={share.ok ? "feedback-ok" : "feedback-err"}>
+                    {share.ok ? "✅ 共享完成" : "❌ 共享失败"}
+                  </div>
+                )}
+                {shareLog.length > 0 && (
+                  <pre className="share-log">{shareLog.join("\n")}</pre>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -108,8 +108,9 @@ describe("DatasetsPage", () => {
     expect(mockedApi.fetchDatasetDetail).toHaveBeenCalledWith(1);
     expect(mockedApi.fetchFiles).toHaveBeenCalledWith(1);
     const share = screen.getByRole("button", { name: /共享/ });
-    expect(share).toBeDisabled();
-    expect(share).toHaveAttribute("title", "即将推出");
+    // 详情带本地路径时"共享"可用（P2P 已接入）
+    expect(share).toBeEnabled();
+    expect(share).toHaveAttribute("title", "生成配对码，对方凭码接收");
     // T13 接入后：详情带本地路径时"打开目录"可用
     const openDir = screen.getByRole("button", { name: /打开目录/ });
     expect(openDir).toBeEnabled();
@@ -245,5 +246,18 @@ describe("DatasetsPage", () => {
     mockedApi.fetchDatasets.mockRejectedValue(new Error("HTTP 503"));
     render(<DatasetsPage />);
     expect(await screen.findByText(/还没有数据集/)).toBeInTheDocument();
+  });
+
+  it("shares the dataset via P2P and shows the pairing code", async () => {
+    vi.mocked(invoke).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
+    await screen.findByText("资产");
+    fireEvent.click(screen.getByRole("button", { name: /共享/ }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("share_dataset", { path: "/data/orders/rice" })
+    );
+    // 传输中显示连接提示
+    expect(screen.getByText(/正在连接/)).toBeInTheDocument();
   });
 });
