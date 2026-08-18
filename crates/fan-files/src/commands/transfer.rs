@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 我们的 rendezvous 服务器（47.94.142.52:4000）
-const RENDEZVOUS_URL: &str = "ws://47.94.142.52:4000/v1";
+const RENDEZVOUS_URL: &str = "wss://hub.moilab.net/wormhole/v1";
 /// 我们的 transit relay（打洞失败时中继兜底）
 const TRANSIT_RELAY: &str = "tcp://47.94.142.52:4001";
 
