@@ -18,3 +18,4 @@ pub mod rebuild_index;
 pub mod snapshot;
 pub mod transfer;
 pub mod udp_punch;
+pub mod quic_link;
