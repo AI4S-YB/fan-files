@@ -3,7 +3,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import App from "./App";
 import * as api from "./api";
 
-vi.mock("./api");
+// 只 mock 网络函数；setApiBase/getApiBase 保留真实实现，
+// 以便断言 retry 后 base 确实更新到 retry_engine 返回的端口。
+vi.mock("./api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api")>();
+  return { ...actual, fetchStats: vi.fn() };
+});
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 // T17：App 挂载 HomePage → ScanPanel 订阅 scan:// 事件，jsdom 无 Tauri IPC，
 // 必须 mock 掉。
@@ -70,7 +75,18 @@ describe("App shell", () => {
     render(<App />);
     await screen.findByText("🔄 重新扫描");
     expect(invoke).toHaveBeenCalledWith("get_share_port");
-    expect(api.setApiBase).toHaveBeenCalledWith(17951);
+    expect(api.getApiBase()).toBe("http://127.0.0.1:17951");
+  });
+  it("home empty-state CTA jumps to the settings page", async () => {
+    // 无目录配置 → HomePage 显示空态 CTA；点击后应切到设置页（出现"保存配置"按钮）
+    mockInvoke({
+      read_config: { include: [], exclude: [], endpoint: "", api_key: "", model: "" },
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByText(/选择目录开始扫描/));
+    expect(
+      await screen.findByRole("button", { name: "保存配置" })
+    ).toBeInTheDocument();
   });
 });
 
@@ -84,5 +100,16 @@ describe("engine banner", () => {
     fireEvent.click(screen.getByText("重试"));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("retry_engine"));
     await waitFor(() => expect(screen.queryByText(/引擎未运行/)).not.toBeInTheDocument());
+  });
+
+  it("retry updates api base to the port returned by retry_engine", async () => {
+    // 冲突回退场景：retry_engine 返回不同于初始端口的新端口
+    mockInvoke({ engine_error: "引擎未运行", retry_engine: 30284 });
+    render(<App />);
+    await screen.findByText(/引擎未运行/);
+    await waitFor(() => expect(api.getApiBase()).toBe("http://127.0.0.1:17951"));
+    fireEvent.click(screen.getByText("重试"));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("retry_engine"));
+    await waitFor(() => expect(api.getApiBase()).toBe("http://127.0.0.1:30284"));
   });
 });

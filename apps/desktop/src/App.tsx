@@ -39,7 +39,10 @@ export default function App() {
 
   const retryEngine = async () => {
     try {
-      await invoke("retry_engine");
+      // 重试可能发生端口回退，retry_engine 返回实际端口——用它更新 API base，
+      // 否则后续请求仍指向旧端口。
+      const port = await invoke<number>("retry_engine");
+      setApiBase(port);
       setEngineError(null);
     } catch (e) {
       setEngineError(String(e));
@@ -51,7 +54,7 @@ export default function App() {
       <Sidebar page={page} onSelect={setPage} />
       <main className="content">
         <EngineBanner error={engineError} onRetry={retryEngine} />
-        {page === "home" && <HomePage />}
+        {page === "home" && <HomePage onGoSettings={() => setPage("settings")} />}
         {page === "datasets" && <DatasetsPage />}
         {page === "search" && <SearchPage />}
         {page === "settings" && <SettingsPage />}

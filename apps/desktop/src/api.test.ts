@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { fetchStats, fetchDatasets, searchDatasets, fetchDatasetDetail, fetchFiles, setApiBase } from "./api";
+import { fetchStats, fetchDatasets, searchDatasets, fetchDatasetDetail, fetchFiles, setApiBase, getApiBase } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -141,5 +141,12 @@ describe("api client", () => {
     await fetchStats();
     expect(m.mock.calls[0][0]).toBe("http://127.0.0.1:20217/api/v1/stats");
     setApiBase(17951); // 复位默认，避免影响其他测试
+  });
+
+  it("getApiBase reflects the last setApiBase port", () => {
+    setApiBase(30284);
+    expect(getApiBase()).toBe("http://127.0.0.1:30284");
+    setApiBase(17951); // 复位默认，避免影响其他测试
+    expect(getApiBase()).toBe("http://127.0.0.1:17951");
   });
 });

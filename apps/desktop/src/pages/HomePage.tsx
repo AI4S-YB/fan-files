@@ -20,7 +20,7 @@ function formatLastScan(ts: number | null): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-export default function HomePage() {
+export default function HomePage({ onGoSettings }: { onGoSettings: () => void }) {
   const [stats, setStats] = useState<Stats | null>(null);
   const [configured, setConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -49,8 +49,9 @@ export default function HomePage() {
       {loading ? null : !configured ? (
         <div className="empty-cta">
           <p>先告诉 fan-files 你的数据在哪里</p>
-          {/* TODO(T12/T13): 点击后打开目录选择器/跳转设置页，本任务先空实现 */}
-          <button className="primary">📁 选择目录开始扫描</button>
+          <button className="primary" onClick={onGoSettings}>
+            📁 选择目录开始扫描
+          </button>
         </div>
       ) : (
         <>

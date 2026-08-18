@@ -102,6 +102,8 @@ pub fn start_share(engine: &Engine) -> Result<u16, String> {
         .arg(format!("127.0.0.1:{port}"))
         .arg("--database")
         .arg(&db)
+        // 桌面壳的路径列/打开目录依赖绝对路径（share 默认不暴露）
+        .arg("--expose-absolute-paths")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -146,4 +148,5 @@ mod tests {
         assert_ne!(port, 17951);
         assert!((20000..35000).contains(&port));
     }
+
 }

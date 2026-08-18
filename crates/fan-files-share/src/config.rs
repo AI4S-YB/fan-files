@@ -11,6 +11,9 @@ pub struct Args {
     pub database: Option<PathBuf>,
     #[arg(long)]
     pub bind: Option<SocketAddr>,
+    /// 暴露数据集的绝对路径（默认关闭；桌面壳需要路径列与"打开目录"）
+    #[arg(long)]
+    pub expose_absolute_paths: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -56,6 +59,11 @@ impl Settings {
         if let Some(bind) = args.bind {
             value.bind = bind;
         }
+        // CLI flag 只负责打开；未传时保持配置文件值或内置默认 false
+        // （share 作为网络服务默认不暴露绝对路径）。
+        if args.expose_absolute_paths {
+            value.expose_absolute_paths = true;
+        }
         // The sidecar may be started from an arbitrary working directory
         // (e.g. the desktop shell), so make the database path absolute;
         // the tantivy index dir is derived from its parent.
@@ -67,4 +75,30 @@ impl Settings {
         }
         Ok(value)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn args_parse_expose_absolute_paths_flag() {
+        let args = Args::try_parse_from(["fan-files-share", "--expose-absolute-paths"]).unwrap();
+        assert!(args.expose_absolute_paths);
+        let args = Args::try_parse_from(["fan-files-share"]).unwrap();
+        assert!(!args.expose_absolute_paths);
+    }
+
+    #[test]
+    fn settings_load_applies_expose_flag_and_keeps_default_false() {
+        let args = Args::try_parse_from(["fan-files-share", "--expose-absolute-paths"]).unwrap();
+        let settings = Settings::load(args).unwrap();
+        assert!(settings.expose_absolute_paths);
+        // 未传 flag：默认 false 不变
+        let args = Args::try_parse_from(["fan-files-share"]).unwrap();
+        let settings = Settings::load(args).unwrap();
+        assert!(!settings.expose_absolute_paths);
+    }
+
 }

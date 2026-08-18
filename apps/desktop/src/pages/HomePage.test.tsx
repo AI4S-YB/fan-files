@@ -1,4 +1,4 @@
-import { render, screen, act, waitFor } from "@testing-library/react";
+import { render, screen, act, waitFor, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import HomePage from "./HomePage";
 import * as api from "../api";
@@ -22,6 +22,7 @@ function emit(name: string, payload: unknown) {
 }
 
 const mockedApi = vi.mocked(api);
+const onGoSettings = vi.fn();
 
 let mockConfig: Record<string, unknown> = {
   include: ["/data/kentnf/orders"],
@@ -58,9 +59,12 @@ describe("HomePage", () => {
   it("shows empty-state CTA when no directories configured", async () => {
     mockConfig = { ...mockConfig, include: [] };
     mockedApi.fetchStats.mockResolvedValue(null as never); // 无索引
-    render(<HomePage />);
+    render(<HomePage onGoSettings={onGoSettings} />);
     // 按钮文案为 "📁 选择目录开始扫描"，用正则做子串匹配
-    expect(await screen.findByText(/选择目录开始扫描/)).toBeInTheDocument();
+    const cta = await screen.findByText(/选择目录开始扫描/);
+    expect(cta).toBeInTheDocument();
+    fireEvent.click(cta);
+    expect(onGoSettings).toHaveBeenCalledTimes(1);
   });
 
   it("renders stat cards when indexed", async () => {
@@ -72,7 +76,7 @@ describe("HomePage", () => {
       last_indexed_at: 1787000000,
       approximate: false,
     });
-    render(<HomePage />);
+    render(<HomePage onGoSettings={onGoSettings} />);
     expect(await screen.findByText("1,453")).toBeInTheDocument();
     expect(screen.getByText("109,796")).toBeInTheDocument();
   });
@@ -88,7 +92,7 @@ describe("HomePage", () => {
       last_indexed_at: 1787000000,
       approximate: false,
     }));
-    render(<HomePage />);
+    render(<HomePage onGoSettings={onGoSettings} />);
     await screen.findByText("1,453");
     // 模拟扫描完成：done(0) → onDone=refreshStats → setStats 触发重渲染。
     // onDone 身份稳定（useCallback）时 ScanPanel 不重订阅，listen 仍为 3 次；

@@ -5,6 +5,11 @@ export function setApiBase(port: number) {
   base = `http://127.0.0.1:${port}`;
 }
 
+// 只读导出，供测试断言 base 已被更新（正常业务代码不应读它）。
+export function getApiBase(): string {
+  return base;
+}
+
 // 形状以 crates/fan-files-share/src/models.rs 为准（serde 序列化后的 JSON 键名）。
 
 export interface Stats {
