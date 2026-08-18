@@ -1,0 +1,66 @@
+name: build-desktop
+
+on:
+  push:
+    branches: [feat/desktop-app]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+          - platform: ubuntu-22.04
+          - platform: windows-latest
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # Tauri v2 system deps + sidecar build deps (candle-onnx needs protoc,
+      # libclang/pkg-config for bindgen-ish deps — mirrors release.yml)
+      - name: Linux deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libssl-dev \
+            build-essential cmake libclang-dev pkg-config \
+            protobuf-compiler libprotobuf-dev libsqlite3-dev
+
+      - name: macOS deps
+        if: matrix.platform == 'macos-latest'
+        run: brew install protobuf cmake
+
+      - name: Windows deps
+        if: matrix.platform == 'windows-latest'
+        run: choco install protoc -y
+
+      - name: Build sidecars
+        run: cargo build --release -p fan-files -p fan-files-share
+
+      - name: Install npm deps
+        working-directory: apps/desktop
+        run: npm install
+
+      - name: Frontend tests
+        working-directory: apps/desktop
+        run: npm test -- --run
+
+      # tauri-action builds the app (src-tauri/build.rs copies the sidecars
+      # from ../../../target/release built in "Build sidecars") and bundles.
+      - uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: apps/desktop
