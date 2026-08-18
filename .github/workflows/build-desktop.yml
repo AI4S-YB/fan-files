@@ -49,7 +49,16 @@ jobs:
         run: choco install protoc -y
 
       - name: Build sidecars
-        run: cargo build --release -p fan-files -p fan-files-share
+        shell: bash
+        run: cargo build --release -p fan-files -p fan-files-share 2>&1 | tee /tmp/sidecar-build.log
+
+      # Job log download requires admin rights; surface build errors as
+      # check-run annotations instead (readable via the public API).
+      - name: Surface sidecar build errors
+        if: failure()
+        shell: bash
+        run: |
+          { grep -iE "error|failed" /tmp/sidecar-build.log | head -6; echo "== last 6 log lines =="; tail -6 /tmp/sidecar-build.log; } | while IFS= read -r line; do echo "::error::${line}"; done
 
       - name: Install npm deps
         working-directory: apps/desktop
