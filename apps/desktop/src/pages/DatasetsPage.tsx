@@ -36,6 +36,12 @@ export default function DatasetsPage() {
   // 数据集共享（P2P）状态 + 进度日志
   const [share, setShare] = useState<ShareState>({ status: "idle" });
   const [shareLog, setShareLog] = useState<string[]>([]);
+  // 接收（P2P）状态
+  const [receiveCode, setReceiveCode] = useState("");
+  const [receiveStatus, setReceiveStatus] = useState<
+    "idle" | "running" | "done-ok" | "done-err"
+  >("idle");
+  const [receiveLog, setReceiveLog] = useState<string[]>([]);
 
   // 监听共享事件流（share://code / progress / done / error）
   useEffect(() => {
@@ -54,11 +60,26 @@ export default function DatasetsPage() {
       setShare({ status: "done", ok: false });
       setShareLog((l) => [...l, `共享错误: ${e.payload}`]);
     });
+    // 接收事件流（receive://progress / done / error）
+    const unRProgress = listen<string>("receive://progress", (e) => {
+      setReceiveLog((l) => [...l.slice(-200), e.payload]);
+    });
+    const unRDone = listen<number>("receive://done", (e) => {
+      setReceiveStatus(e.payload === 0 ? "done-ok" : "done-err");
+      if (e.payload !== 0) setReceiveLog((l) => [...l, "接收失败"]);
+    });
+    const unRError = listen<string>("receive://error", (e) => {
+      setReceiveStatus("done-err");
+      setReceiveLog((l) => [...l, `接收错误: ${e.payload}`]);
+    });
     return () => {
       unCode.then((u) => u());
       unProgress.then((u) => u());
       unDone.then((u) => u());
       unError.then((u) => u());
+      unRProgress.then((u) => u());
+      unRDone.then((u) => u());
+      unRError.then((u) => u());
     };
   }, []);
 
@@ -70,6 +91,22 @@ export default function DatasetsPage() {
     } catch (e) {
       setShare({ status: "done", ok: false });
       setShareLog((l) => [...l, `共享启动失败: ${String(e)}`]);
+    }
+  }
+
+  async function startReceive() {
+    const code = receiveCode.trim();
+    if (!code || receiveStatus === "running") return;
+    setReceiveStatus("running");
+    setReceiveLog([]);
+    try {
+      // 接收输出到 ~/Downloads/fan-received（默认接收目录）
+      const home = await invoke<string>("fan_home");
+      const downloads = home.replace("/.fan-files", "/Downloads/fan-received");
+      await invoke("receive_dataset", { code, output: downloads });
+    } catch (e) {
+      setReceiveStatus("done-err");
+      setReceiveLog((l) => [...l, `接收启动失败: ${String(e)}`]);
     }
   }
 
@@ -131,6 +168,32 @@ export default function DatasetsPage() {
   return (
     <div className="page">
       <h2>数据集</h2>
+      {/* P2P 接收入口：输入对方发来的配对码接收数据 */}
+      <div className="receive-bar">
+        <input
+          className="receive-input"
+          placeholder="📥 输入配对码接收数据（如 8-purple-hammer）"
+          value={receiveCode}
+          onChange={(e) => setReceiveCode(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && startReceive()}
+        />
+        <button
+          className="primary"
+          disabled={receiveStatus === "running" || !receiveCode.trim()}
+          onClick={startReceive}
+        >
+          {receiveStatus === "running" ? "接收中…" : "接收"}
+        </button>
+        {receiveStatus === "done-ok" && (
+          <span className="feedback-ok">✅ 已接收（~/Downloads/fan-received）</span>
+        )}
+        {receiveStatus === "done-err" && (
+          <span className="feedback-err">❌ 接收失败</span>
+        )}
+        {receiveLog.length > 0 && (
+          <pre className="receive-log">{receiveLog.join("\n")}</pre>
+        )}
+      </div>
       <div className="filters">
         {chips.map((t) => (
           <button

@@ -250,3 +250,49 @@ pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result
     });
     Ok(())
 }
+
+/// 数据集接收（P2P）：spawn `fan-files transfer get <code> --output <dir>`。
+/// 事件契约（与共享对称）：
+/// - `receive://progress` 载荷 = stderr 原始行
+/// - `receive://done`     载荷 = 退出码（0 成功）
+/// - `receive://error`    载荷 = 错误信息（spawn 失败时）
+/// 命令立即返回，接收在 async runtime 上跑。
+#[tauri::command]
+pub(crate) async fn receive_dataset(
+    app: tauri::AppHandle,
+    code: String,
+    output: String,
+) -> Result<(), String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut child = match tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"))
+            .arg("transfer")
+            .arg("get")
+            .arg(&code)
+            .arg("--output")
+            .arg(&output)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = handle.emit("receive://error", e.to_string());
+                return;
+            }
+        };
+        use tokio::io::AsyncBufReadExt;
+        if let Some(stderr) = child.stderr.take() {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = handle.emit("receive://progress", &line);
+            }
+        }
+        let status = child.wait().await;
+        let _ = handle.emit(
+            "receive://done",
+            status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1),
+        );
+    });
+    Ok(())
+}
