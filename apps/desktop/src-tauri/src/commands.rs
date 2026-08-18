@@ -203,3 +203,50 @@ pub(crate) async fn scan_now(app: tauri::AppHandle) -> Result<(), String> {
 pub(crate) fn scan_state() -> bool {
     SCANNING.load(Ordering::SeqCst)
 }
+
+/// 数据集共享（P2P）：spawn `fan-files transfer send <path>`，把配对码和进度
+/// 以事件流推给前端。事件契约：
+/// - `share://code`     载荷 = 配对码（如 8-purple-hammer）
+/// - `share://progress` 载荷 = stderr 原始行
+/// - `share://done`     载荷 = 退出码（0 成功）
+/// - `share://error`    载荷 = 错误信息（spawn 失败时）
+/// 命令立即返回，传输在 async runtime 上跑。
+#[tauri::command]
+pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut child = match tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"))
+            .arg("transfer")
+            .arg("send")
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = handle.emit("share://error", e.to_string());
+                return;
+            }
+        };
+        use tokio::io::AsyncBufReadExt;
+        if let Some(stderr) = child.stderr.take() {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                // 从 stderr 输出中提取配对码（格式: 数字-单词-单词-单词）
+                if line.contains("传输码:") {
+                    if let Some(code) = line.split("传输码:").nth(1) {
+                        let _ = handle.emit("share://code", code.trim().to_string());
+                    }
+                }
+                let _ = handle.emit("share://progress", &line);
+            }
+        }
+        let status = child.wait().await;
+        let _ = handle.emit(
+            "share://done",
+            status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1),
+        );
+    });
+    Ok(())
+}

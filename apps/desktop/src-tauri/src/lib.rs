@@ -35,7 +35,8 @@ pub fn run() {
             commands::retry_engine,
             commands::engine_error,
             commands::scan_now,
-            commands::scan_state
+            commands::scan_state,
+            commands::share_dataset
         ])
         .setup(|app| {
             use tauri::{
