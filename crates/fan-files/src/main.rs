@@ -193,7 +193,11 @@ enum TransferAction {
         output: Option<String>,
     },
     /// 查看审计日志
-    Log,
+    Log {
+        /// 输出 JSON（GUI 用）
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -265,7 +269,8 @@ fn main() {
                 commands::transfer::TransferAction::Send { dataset, ttl_hours },
             TransferAction::Get { code, output } =>
                 commands::transfer::TransferAction::Get { code, output },
-            TransferAction::Log => commands::transfer::TransferAction::Log,
+            TransferAction::Log { json } =>
+                commands::transfer::TransferAction::Log { json },
         }),
         Commands::Snapshots(action) => match action {
             SnapshotAction::List => commands::snapshot::list(&config, &layer),

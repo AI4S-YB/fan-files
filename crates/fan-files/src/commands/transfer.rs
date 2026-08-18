@@ -49,7 +49,7 @@ pub fn run(config: &Config, layer: &DataLayer, action: TransferAction) {
     match action {
         TransferAction::Send { dataset, ttl_hours } => send(config, layer, &dataset, ttl_hours),
         TransferAction::Get { code, output } => get(config, layer, &code, output),
-        TransferAction::Log => log(config, layer),
+        TransferAction::Log { json } => log(config, layer, json),
     }
 }
 
@@ -164,6 +164,8 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
         let peer_key = format!("{:x}", wormhole.verifier());
 
         let relay_hints = relay_hints();
+        let total_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tb = total_bytes.clone();
         let res = transfer::send_file_or_folder(
             wormhole,
             relay_hints,
@@ -171,7 +173,8 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
             display_name.clone(),
             transit::Abilities::ALL,
             |info| eprintln!("  连接: {}", fmt_conn(&info.conn_type)),
-            |done, total| {
+            move |done, total| {
+                tb.store(total, std::sync::atomic::Ordering::Relaxed);
                 if total > 0 {
                     eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
                 }
@@ -180,7 +183,11 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
         ).await;
 
         match res {
-            Ok(()) => { println!("\n  ✅ 传输完成，校验通过"); Ok((code, peer_key)) }
+            Ok(()) => {
+                let sent = total_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                println!("\n  ✅ 传输完成，校验通过（{} 字节）", sent);
+                Ok((code, peer_key, sent))
+            }
             Err(e) => Err(format!("传输失败: {}", e)),
         }
     });
@@ -191,8 +198,8 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
     }
 
     match result {
-        Ok((code, peer_key)) => {
-            audit(&store, "send", dataset, &code, Some(&peer_key), 0, 0, "ok", started_at);
+        Ok((code, peer_key, sent)) => {
+            audit(&store, "send", dataset, &code, Some(&peer_key), sent, 0, "ok", started_at);
         }
         Err(e) => {
             audit(&store, "send", dataset, "unknown", None, 0, 0, "failed", started_at);
@@ -279,9 +286,12 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
         // v1 accept 需要 writer（AsyncWrite）写出到文件
         let mut file = async_fs::File::create(&target_path).await
             .map_err(|e| format!("无法创建输出文件 {}: {}", target_path.display(), e))?;
+        let total_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tb = total_bytes.clone();
         let res = req.accept(
             &|info: magic_wormhole::transit::TransitInfo| eprintln!("  连接: {}", fmt_conn(&info.conn_type)),
-            |done, total| {
+            move |done, total| {
+                tb.store(total, std::sync::atomic::Ordering::Relaxed);
                 if total > 0 {
                     eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
                 }
@@ -292,7 +302,8 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
 
         match res {
             Ok(()) => {
-                println!("\n  ✅ 接收完成，SHA-256 校验通过");
+                let received = total_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                println!("\n  ✅ 接收完成，SHA-256 校验通过（{} 字节）", received);
                 println!("  已保存: {}", target_path.display());
                 // 若是 tar 包则自动解包到输出目录（目录数据集场景）
                 if target_path.extension().map(|e| e == "tar").unwrap_or(false) {
@@ -305,15 +316,15 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
                         Err(e) => eprintln!("  ⚠ 解包失败: {}（tar 文件保留在 {}）", e, target_path.display()),
                     }
                 }
-                Ok(peer_key)
+                Ok((peer_key, received))
             }
             Err(e) => Err(format!("接收失败: {}", e)),
         }
     });
 
     match result {
-        Ok(peer_key) => {
-            audit(&store, "get", code_str, code_str, Some(&peer_key), 0, 0, "ok", started_at);
+        Ok((peer_key, received)) => {
+            audit(&store, "get", code_str, code_str, Some(&peer_key), 0, received, "ok", started_at);
         }
         Err(e) => {
             audit(&store, "get", code_str, code_str, None, 0, 0, "failed", started_at);
@@ -331,31 +342,61 @@ fn fmt_conn(t: &transit::ConnectionType) -> &'static str {
     }
 }
 
-/// 审计：`transfer log`
-fn log(config: &Config, layer: &DataLayer) {
+/// 审计：`transfer log`（--json 输出结构化记录供 GUI 使用）
+fn log(config: &Config, layer: &DataLayer, json: bool) {
     let store = open_store(config, layer);
     let conn = match store.conn.lock() {
         Ok(c) => c,
         Err(e) => { eprintln!("无法读审计日志: {}", e); return; }
     };
     let _ = conn.execute_batch(AUDIT_DDL);
-    println!("时间                方向  数据集/码                  状态     字节");
     let mut stmt = match conn.prepare(
-        "SELECT datetime(started_at,'unixepoch','localtime'), direction, dataset, status, bytes_sent+bytes_received
+        "SELECT direction, dataset, code, status, bytes_sent, bytes_received, started_at
          FROM transfer_log ORDER BY id DESC LIMIT 50"
     ) {
         Ok(s) => s,
         Err(e) => { eprintln!("查询失败: {}", e); return; }
     };
     let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?, r.get::<_, i64>(4)?))
+        Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
+            r.get::<_, i64>(6)?,
+        ))
     });
+    if json {
+        let mut out = Vec::new();
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                out.push(serde_json::json!({
+                    "direction": row.0, "dataset": row.1, "code": row.2,
+                    "status": row.3, "bytes_sent": row.4, "bytes_received": row.5,
+                    "time": row.6,
+                }));
+            }
+        }
+        println!("{}", serde_json::to_string(&out).unwrap_or("[]".into()));
+        return;
+    }
+    println!("时间                方向  数据集/码                  状态     字节");
     if let Ok(rows) = rows {
         for row in rows.flatten() {
-            println!("{}  {:5}  {:<24}  {:7}  {}", row.0, row.1, row.2, row.3, row.4);
+            let local = chrono_fmt(row.6);
+            println!("{}  {:5}  {:<24}  {:7}  {}", local, row.0, row.1, row.3, row.4 + row.5);
         }
     }
+}
+
+/// 简化的本地时间格式化（无 chrono 依赖）
+fn chrono_fmt(ts: i64) -> String {
+    // 用系统 date 格式化（可移植）
+    std::process::Command::new("date")
+        .args(["-r", &ts.to_string(), "+%Y-%m-%d %H:%M:%S"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| ts.to_string())
 }
 
 /// CLI 子命令（由 main.rs 解析）
@@ -363,5 +404,5 @@ fn log(config: &Config, layer: &DataLayer) {
 pub enum TransferAction {
     Send { dataset: String, ttl_hours: u64 },
     Get { code: String, output: Option<String> },
-    Log,
+    Log { json: bool },
 }

@@ -42,6 +42,33 @@ export default function DatasetsPage() {
     "idle" | "running" | "done-ok" | "done-err"
   >("idle");
   const [receiveLog, setReceiveLog] = useState<string[]>([]);
+  // 传输历史
+  const [transferHistory, setTransferHistory] = useState<HistoryEntry[]>([]);
+
+  interface HistoryEntry {
+    direction: string;
+    dataset: string;
+    code: string;
+    status: string;
+    bytes_sent: number;
+    bytes_received: number;
+    time: number;
+  }
+
+  async function loadHistory() {
+    try {
+      const h = await invoke<HistoryEntry[]>("transfer_history");
+      setTransferHistory(h ?? []);
+    } catch {
+      setTransferHistory([]);
+    }
+  }
+
+  // 挂载时加载历史；收发完成后刷新
+  useEffect(() => {
+    void loadHistory();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [receiveStatus === "done-ok", share.status === "done"]);
 
   // 监听共享事件流（share://code / progress / done / error）
   useEffect(() => {
@@ -194,6 +221,38 @@ export default function DatasetsPage() {
           <pre className="receive-log">{receiveLog.join("\n")}</pre>
         )}
       </div>
+      {/* P2P 传输历史 */}
+      {transferHistory.length > 0 && (
+        <details className="history-panel">
+          <summary>🕘 传输历史（{transferHistory.length}）</summary>
+          <table className="history-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>方向</th>
+                <th>数据集/码</th>
+                <th>状态</th>
+                <th>字节</th>
+              </tr>
+            </thead>
+            <tbody>
+              {transferHistory.map((h, i) => (
+                <tr key={i}>
+                  <td className="mono">{new Date(h.time * 1000).toLocaleString()}</td>
+                  <td>{h.direction === "send" ? "📤 发送" : "📥 接收"}</td>
+                  <td className="mono">{h.dataset}</td>
+                  <td>
+                    <span className={h.status === "ok" ? "badge badge-other" : "feedback-err"}>
+                      {h.status === "ok" ? "✓ 成功" : "✗ 失败"}
+                    </span>
+                  </td>
+                  <td className="mono">{(h.bytes_sent + h.bytes_received).toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      )}
       <div className="filters">
         {chips.map((t) => (
           <button

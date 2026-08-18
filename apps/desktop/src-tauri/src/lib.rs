@@ -37,7 +37,8 @@ pub fn run() {
             commands::scan_now,
             commands::scan_state,
             commands::share_dataset,
-            commands::receive_dataset
+            commands::receive_dataset,
+            commands::transfer_history
         ])
         .setup(|app| {
             use tauri::{

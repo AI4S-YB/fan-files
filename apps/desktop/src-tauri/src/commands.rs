@@ -296,3 +296,16 @@ pub(crate) async fn receive_dataset(
     });
     Ok(())
 }
+
+/// 读取 P2P 传输历史（审计表），返回最近记录。
+/// 复用 CLI 的 `transfer log --json`（避免桌面端引入 rusqlite 依赖）。
+#[tauri::command]
+pub(crate) fn transfer_history() -> Result<Vec<serde_json::Value>, String> {
+    let out = std::process::Command::new(crate::engine::sidecar_bin("fan-files"))
+        .args(["transfer", "log", "--json"])
+        .output()
+        .map_err(|e| format!("读取传输历史失败: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout)
+        .map_err(|e| format!("解析传输历史失败: {}", e))
+}
