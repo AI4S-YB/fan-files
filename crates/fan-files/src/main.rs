@@ -103,6 +103,9 @@ enum Commands {
         /// Re-infer only (skip scan, re-run Phase C with current rules)
         #[arg(long)]
         re_infer: bool,
+        /// Scan only local [scan].include dirs, ignore remote [servers.*]
+        #[arg(long)]
+        local_only: bool,
     },
     /// Interactive setup wizard
     Init,
@@ -219,9 +222,11 @@ fn main() {
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::Update => commands::update::run(),
         Commands::Uninstall => commands::uninstall::run(),
-        Commands::Discover { precise, re_infer } => {
+        Commands::Discover { precise, re_infer, local_only } => {
             if re_infer {
                 commands::discover::run_re_infer(&config, &layer, precise);
+            } else if local_only {
+                commands::discover::run_local(&config, &layer, precise);
             } else {
                 commands::discover::run(&config, &layer, precise);
             }

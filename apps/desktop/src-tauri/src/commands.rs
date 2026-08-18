@@ -165,7 +165,10 @@ pub(crate) async fn scan_now(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         let mut child = match tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"))
             .env("FAN_JSON_FORMAT", "1")
+            // GUI 桌面壳只扫本机 [scan].include 目录；忽略远程 [servers.*]，
+            // 否则会在本地尝试扫配置里的远程路径（见 discover.rs 的 run_local）。
             .arg("discover")
+            .arg("--local-only")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
