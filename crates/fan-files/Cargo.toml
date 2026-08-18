@@ -32,7 +32,8 @@ sha2 = "0.10"
 rustls-pki-types = "1.15.1"
 # 指纹固定 verifier 需要 rustls 的 dangerous API（ring provider，与 quinn 的 rustls-ring 一致）
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-# quinn 的 runtime-async-std 驱动任务跑在 async-std executor 上，测试/调用方须用 async_std::task::block_on 驱动
+# quinn 的 runtime-async-std 驱动任务跑在 async-std executor 上；调用方用
+# async_std::task::block_on 或 async_io::block_on 驱动均可（测试两种都实测可用）
 async-std = "1"
 
 [dev-dependencies]

@@ -2,9 +2,12 @@
 
 use std::net::UdpSocket;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// QUIC 强制要求 ALPN 协商一致，两端用同一个应用层协议名（本工具自定，不对外兼容）。
 const QUIC_ALPN: &[u8] = b"fan-files/1";
+/// 自签证书 SAN 域名与客户端 SNI server name（两端一致；QUIC 要求 DNS name 形式）。
+const QUIC_SERVER_NAME: &str = "fan-files.local";
 
 /// 证书 SHA-256 指纹（hex）——经 Wormhole 通道预交换，握手时固定校验（防 MITM）。
 pub fn cert_fingerprint(cert: &rustls_pki_types::CertificateDer) -> String {
@@ -15,9 +18,9 @@ pub fn cert_fingerprint(cert: &rustls_pki_types::CertificateDer) -> String {
 
 /// 生成自签证书（打洞 QUIC 用；指纹经 Wormhole 通道验证，无需 CA）
 pub fn self_signed_cert() -> (rustls_pki_types::CertificateDer<'static>, rustls_pki_types::PrivateKeyDer<'static>) {
-    // 用 rcgen 生成自签 ECDSA 证书（域名 fan-files.local，QUIC 需要 SAN）
+    // 用 rcgen 生成自签 ECDSA 证书（域名 QUIC_SERVER_NAME，QUIC 需要 SAN）
     let key_pair = rcgen::KeyPair::generate().expect("keypair gen");
-    let cert = rcgen::CertificateParams::new(vec!["fan-files.local".to_string()])
+    let cert = rcgen::CertificateParams::new(vec![QUIC_SERVER_NAME.to_string()])
         .expect("cert params")
         .self_signed(&key_pair)
         .expect("self-signed cert");
@@ -29,6 +32,19 @@ pub fn gen_cert_with_fingerprint() -> (rustls_pki_types::CertificateDer<'static>
     let (c, k) = self_signed_cert();
     let fp = cert_fingerprint(&c);
     (c, k, fp)
+}
+
+/// 常量时间指纹比较：XOR 累加逐字节比较 + 长度守卫，避免字符串 `==` 在首字节不同时
+/// 提前退出带来的时序泄露（长度泄露可接受：hex 指纹是公开的固定长度格式）。
+fn fp_matches(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.as_bytes().iter().zip(b.as_bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// 指纹固定 verifier：仅信任指纹匹配的自签证书（防 MITM 核心）。
@@ -49,7 +65,7 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
         _now: rustls_pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let fp = cert_fingerprint(end_entity);
-        if fp == self.expected {
+        if fp_matches(&fp, &self.expected) {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(format!(
@@ -96,6 +112,11 @@ impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
 
 /// 服务端：在打通的 UDP socket 上 accept QUIC 连接（证书自签，指纹由客户端校验）。
 /// sock 需已绑定且非阻塞；调用方持有返回的 Endpoint（drop 会关闭所有连接）。
+///
+/// **重要（T5 集成必读）**：quinn 只有在对入站连接调用 accept() 并 await 后才会推进
+/// 握手。调用方须在 quic_listen 返回后立即 `endpoint.accept().await` 拿到 Incoming 再
+/// `.await`（内部接受并驱动握手，得到服务端 Connection）。若一直不 accept，服务端不会
+/// 响应客户端，客户端会反复重传 Initial 直到握手超时。
 pub async fn quic_listen(
     sock: UdpSocket,
     cert: rustls_pki_types::CertificateDer<'static>,
@@ -124,10 +145,12 @@ pub async fn quic_listen(
 
 /// 客户端：用期望指纹建连（校验对端证书，防 MITM）。
 /// 返回 `(endpoint, conn)`：**endpoint 必须由调用方持有**——drop endpoint 会立刻关闭所有连接。
+/// `timeout` 为握手超时（quinn 自身的握手超时默认 30s，T5 建议传 10s），超时返回 Err。
 pub async fn quic_connect(
     sock: UdpSocket,
     peer: std::net::SocketAddr,
     expected_fp: String,
+    timeout: Duration,
 ) -> Result<(quinn::Endpoint, quinn::Connection), String> {
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -145,11 +168,19 @@ pub async fn quic_connect(
     let runtime = quinn::default_runtime().ok_or("quinn runtime unavailable")?;
     let endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, runtime)
         .map_err(|e| format!("client endpoint: {e}"))?;
-    let conn = endpoint
-        .connect_with(client_config, peer, "fan-files.local")
-        .map_err(|e| format!("connect: {e}"))?
-        .await
-        .map_err(|e| format!("handshake: {e}"))?;
+    // Connecting 在块外创建：endpoint 必须留在外层由调用方持有（进入块内会被提前 drop
+    // 而立刻关闭所有连接），块内只 await 握手。
+    let connecting = endpoint
+        .connect_with(client_config, peer, QUIC_SERVER_NAME)
+        .map_err(|e| format!("connect: {e}"))?;
+    let conn = futures_lite::future::or(
+        async { connecting.await.map_err(|e| format!("handshake: {e}")) },
+        async {
+            async_io::Timer::after(timeout).await;
+            Err(format!("handshake timeout after {}ms", timeout.as_millis()))
+        },
+    )
+    .await?;
     Ok((endpoint, conn))
 }
 
@@ -256,30 +287,25 @@ mod tests {
                 Err("server accept 10s 超时".to_string())
             },
         );
-        let cli = futures_lite::future::or(
-            async {
-                let (endpoint, conn) = quic_connect(client_sock, addr, fp).await?;
-                // 连接必须在 quic_connect 返回后仍存活（endpoint 被提前 drop 会立刻关闭）
-                let alive = futures_lite::future::or(
-                    async {
-                        conn.closed().await;
-                        false
-                    },
-                    async {
-                        async_io::Timer::after(Duration::from_millis(300)).await;
-                        true
-                    },
-                )
-                .await;
-                conn.close(0u32.into(), b"test done");
-                drop(endpoint);
-                Ok::<bool, String>(alive)
-            },
-            async {
-                async_io::Timer::after(Duration::from_secs(10)).await;
-                Err("client handshake 10s 超时".to_string())
-            },
-        );
+        let cli = async {
+            // 握手超时已内置在 quic_connect 的 timeout 参数里（10s）
+            let (endpoint, conn) = quic_connect(client_sock, addr, fp, Duration::from_secs(10)).await?;
+            // 连接必须在 quic_connect 返回后仍存活（endpoint 被提前 drop 会立刻关闭）
+            let alive = futures_lite::future::or(
+                async {
+                    conn.closed().await;
+                    false
+                },
+                async {
+                    async_io::Timer::after(Duration::from_millis(300)).await;
+                    true
+                },
+            )
+            .await;
+            conn.close(0u32.into(), b"test done");
+            drop(endpoint);
+            Ok::<bool, String>(alive)
+        };
         let (srv_res, cli_res) = futures_lite::future::zip(srv, cli).await;
         srv_res?;
         cli_res
@@ -315,13 +341,12 @@ mod tests {
                 async_io::Timer::after(Duration::from_secs(10)).await;
             },
         );
-        let cli = futures_lite::future::or(
-            async { quic_connect(client_sock, addr, wrong_fp(&fp)).await.map(|_| ()) },
-            async {
-                async_io::Timer::after(Duration::from_secs(10)).await;
-                Err("handshake timeout: 错误指纹未在 10s 内被拒绝".to_string())
-            },
-        );
+        let cli = async {
+            // 错误指纹应在握手阶段快速失败；握手超时内置在 quic_connect（10s）
+            quic_connect(client_sock, addr, wrong_fp(&fp), Duration::from_secs(10))
+                .await
+                .map(|_| ())
+        };
         let (_srv, cli_res) = futures_lite::future::zip(srv, cli).await;
         cli_res
     }
@@ -332,5 +357,130 @@ mod tests {
             .expect_err("错误指纹的握手必须失败");
         assert!(!err.contains("timeout"), "应是快速拒绝而不是超时: {err}");
         assert!(err.contains("handshake"), "应是握手阶段失败: {err}");
+    }
+
+    // ---------- T5 路径预验证：打洞→QUIC 无缝组合 + stream 数据回环 ----------
+
+    /// 打洞打通的两个 UDP socket 上直接建 QUIC：punch_establish（loopback 必成功）
+    /// 返回的 socket 立刻交给 quic_listen/quic_connect，握手应正常完成。
+    #[test]
+    fn punch_then_quic_handshake() {
+        // 双端 loopback 打洞（同机必打通）
+        let s1 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let s2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a1 = s1.local_addr().unwrap();
+        let a2 = s2.local_addr().unwrap();
+        drop(s1);
+        drop(s2);
+        let t1 = std::thread::spawn(move || {
+            crate::commands::udp_punch::punch_establish(a1, a2, 7, "peer-a".into(), Duration::from_secs(2))
+        });
+        std::thread::sleep(Duration::from_millis(100)); // 冗余保险：错开首拍
+        let t2 = std::thread::spawn(move || {
+            crate::commands::udp_punch::punch_establish(a2, a1, 7, "peer-b".into(), Duration::from_secs(2))
+        });
+        let sock_a = t1.join().unwrap().expect("peer-a 打洞应成功");
+        let sock_b = t2.join().unwrap().expect("peer-b 打洞应成功");
+        // 注：socket 接收缓冲区里残留的 punch 补发包对 quinn 无害——解析为短头未知连接
+        // 直接丢弃，无需 drain。
+
+        let (cert, key, fp) = gen_cert_with_fingerprint();
+        let result = async_std::task::block_on(async {
+            let server = quic_listen(sock_a, cert, key).await.expect("server endpoint");
+            let srv = futures_lite::future::or(
+                async {
+                    let incoming = server.accept().await.ok_or("server accept 超时")?;
+                    let conn = incoming
+                        .await
+                        .map_err(|e| format!("incoming handshake: {e}"))?;
+                    let _ = conn.closed().await;
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(10)).await;
+                    Err("server accept 10s 超时".to_string())
+                },
+            );
+            // 不 await：把 future 直接交给 zip 与 srv 并发驱动。客户端 sock_b（绑在 a2）
+            // 连服务端 sock_a 的地址 a1；握手完成后主动 close，服务端 conn.closed() 才会返回。
+            let cli = async {
+                let (endpoint, conn) = quic_connect(sock_b, a1, fp, Duration::from_secs(10)).await?;
+                conn.close(0u32.into(), b"punch-quic done");
+                drop(endpoint);
+                Ok::<(), String>(())
+            };
+            let (srv_res, cli_res) = futures_lite::future::zip(srv, cli).await;
+            srv_res?;
+            cli_res
+        });
+        assert!(result.is_ok(), "打洞打通后的 socket 上 QUIC 握手应成功: {result:?}");
+    }
+
+    /// 1 字节双向 stream 回环：客户端 open_bi 发送 0x2a，服务端 accept_bi 读出后
+    /// 回写 0x2b，客户端再读出——验证 QUIC 建连后数据传输链路（T5 传输路径）。
+    #[test]
+    fn quic_stream_roundtrip_one_byte() {
+        let (cert, key, fp) = gen_cert_with_fingerprint();
+        let (server_sock, addr) = bind_udp();
+        let (client_sock, _) = bind_udp();
+
+        let result = async_std::task::block_on(async {
+            let server = quic_listen(server_sock, cert, key).await.expect("server endpoint");
+            let srv = futures_lite::future::or(
+                async {
+                    let incoming = server.accept().await.ok_or("server accept 超时")?;
+                    let conn = incoming
+                        .await
+                        .map_err(|e| format!("incoming handshake: {e}"))?;
+                    let (mut send, mut recv) =
+                        conn.accept_bi().await.map_err(|e| format!("accept_bi: {e}"))?;
+                    let mut buf = [0u8; 4];
+                    let n = recv
+                        .read(&mut buf)
+                        .await
+                        .map_err(|e| format!("recv: {e}"))?
+                        .ok_or("对端 EOF")?;
+                    assert_eq!(n, 1);
+                    assert_eq!(buf[0], 0x2a, "服务端应收 0x2a");
+                    send.write_all(&[0x2b]).await.map_err(|e| format!("send: {e}"))?;
+                    send.finish().map_err(|e| format!("finish: {e}"))?;
+                    let _ = conn.closed().await;
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(10)).await;
+                    Err("server 侧 10s 超时".to_string())
+                },
+            );
+            let cli = futures_lite::future::or(
+                async {
+                    let (endpoint, conn) =
+                        quic_connect(client_sock, addr, fp, Duration::from_secs(10)).await?;
+                    let (mut send, mut recv) =
+                        conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+                    send.write_all(&[0x2a]).await.map_err(|e| format!("send: {e}"))?;
+                    send.finish().map_err(|e| format!("finish: {e}"))?;
+                    let mut buf = [0u8; 4];
+                    let n = recv
+                        .read(&mut buf)
+                        .await
+                        .map_err(|e| format!("recv: {e}"))?
+                        .ok_or("对端 EOF")?;
+                    assert_eq!(n, 1);
+                    assert_eq!(buf[0], 0x2b, "客户端应收 0x2b");
+                    conn.close(0u32.into(), b"test done");
+                    drop(endpoint);
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(10)).await;
+                    Err("client 侧 10s 超时".to_string())
+                },
+            );
+            let (srv_res, cli_res) = futures_lite::future::zip(srv, cli).await;
+            srv_res?;
+            cli_res
+        });
+        assert!(result.is_ok(), "1 字节双向 stream 回环应成功: {result:?}");
     }
 }
