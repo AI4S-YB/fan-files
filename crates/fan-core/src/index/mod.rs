@@ -73,7 +73,11 @@ pub fn open_index_for_layer(
     // Global layer is always read-only for non-root users
     let effective_mode = match layer {
         DataLayer::Global if matches!(mode, IndexMode::ReadWrite) => {
+            // geteuid is unix-only; Windows builds treat the caller as non-root.
+            #[cfg(unix)]
             let is_root = unsafe { libc::geteuid() == 0 };
+            #[cfg(not(unix))]
+            let is_root = false;
             if !is_root { IndexMode::ReadOnly } else { IndexMode::ReadWrite }
         }
         _ => mode,
