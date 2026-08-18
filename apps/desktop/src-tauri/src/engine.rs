@@ -25,13 +25,29 @@ impl Engine {
     }
 }
 
-/// sidecar 二进制定位：dev = workspace target/release；打包后 = 与主程序同目录的裸名。
+/// sidecar 二进制定位：
+/// 1. 打包运行 = 与主程序同目录的裸名（tauri externalBin 平铺到 Contents/MacOS）；
+/// 2. dev 运行 = workspace target/release；
+/// 3. 兜底 = PATH 上的裸名。
+///
+/// 打包运行必须优先用主程序同目录的 sidecar：打包后的应用是 LS 启动的 GUI 进程，
+/// 其子进程读取 workspace 路径（~/Desktop 下）的裸二进制会被 macOS TCC 拦截
+/// （dyld open 阻塞数秒后失败，实测见 T16 运行时验证），而同 bundle 内的
+/// sidecar 天然随应用授权。
 pub fn sidecar_bin(name: &str) -> PathBuf {
     let exe = if cfg!(windows) {
         format!("{name}.exe")
     } else {
         name.to_string()
     };
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            let beside = dir.join(&exe);
+            if beside.exists() {
+                return beside;
+            }
+        }
+    }
     let dev = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../target/release")
         .join(&exe);

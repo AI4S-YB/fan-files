@@ -111,17 +111,26 @@ pub(crate) fn get_share_port() -> u16 {
 }
 
 /// banner 重试：重新拉起 share 并健康检查。成功清空错误状态并返回端口。
+/// 失败时把错误持久化到 EngineStatus——否则前端 5 秒轮询 engine_error
+/// 会读到旧值（None），把 banner 上的重试错误清掉。
 #[tauri::command]
 pub(crate) async fn retry_engine(
     engine: tauri::State<'_, Engine>,
     status: tauri::State<'_, EngineStatus>,
 ) -> Result<u16, String> {
-    let port = start_share(&engine)?;
+    let port = match start_share(&engine) {
+        Ok(port) => port,
+        Err(e) => {
+            *status.0.lock().unwrap() = Some(e.clone());
+            return Err(e);
+        }
+    };
     if wait_healthy(port).await {
         *status.0.lock().unwrap() = None;
         Ok(port)
     } else {
         kill_share(&engine);
+        *status.0.lock().unwrap() = Some("引擎健康检查失败".to_string());
         Err("引擎健康检查失败".into())
     }
 }

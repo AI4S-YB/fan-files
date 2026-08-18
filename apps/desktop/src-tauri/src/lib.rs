@@ -10,6 +10,8 @@ mod engine;
 
 use std::sync::Mutex;
 
+use tauri::Manager;
+
 pub use config::FanConfig;
 
 /// 引擎错误信息（None = 健康）。setup 异步启动 share 的结果与前端 retry 都写入这里，
@@ -18,7 +20,7 @@ pub struct EngineStatus(pub Mutex<Option<String>>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -96,6 +98,14 @@ pub fn run() {
                 let _ = (window, api);
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    // 退出时回收 share 子进程，避免孤儿进程残留占住端口
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(engine) = app_handle.try_state::<engine::Engine>() {
+                engine::kill_share(&engine);
+            }
+        }
+    });
 }
