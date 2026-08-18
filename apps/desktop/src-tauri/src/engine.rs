@@ -136,6 +136,28 @@ pub async fn wait_healthy(port: u16) -> bool {
     false
 }
 
+/// 探测 /readyz 的 HTTP 状态码（0 = 请求失败，按无错误处理）。
+///
+/// /healthz 只代表进程活着；旧 schema 的库 healthz 仍 200，但 /readyz 会 503
+/// （readiness 校验 supported_schema_versions），/stats 等接口 500。
+/// 启动检查在 wait_healthy 之后补这一探，区分"进程健康但索引格式过旧"。
+pub async fn readiness_status(port: u16) -> u16 {
+    match reqwest::get(format!("http://127.0.0.1:{port}/readyz")).await {
+        Ok(r) => r.status().as_u16(),
+        Err(_) => 0,
+    }
+}
+
+/// 把 /readyz 状态码映射为引擎错误文案。503 = schema 版本不被 share 支持
+/// （旧索引库），其余状态沿用既有行为（不额外报错）。
+pub fn readiness_error(status: u16) -> Option<&'static str> {
+    if status == 503 {
+        Some("索引格式过旧——请点击首页「重新扫描」升级")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,4 +174,15 @@ mod tests {
         assert!((20000..35000).contains(&port));
     }
 
+    #[test]
+    fn readiness_error_flags_outdated_schema_only() {
+        assert_eq!(
+            readiness_error(503),
+            Some("索引格式过旧——请点击首页「重新扫描」升级")
+        );
+        // 健康、内部错误、请求失败均沿用旧行为（不额外报错）
+        assert_eq!(readiness_error(200), None);
+        assert_eq!(readiness_error(500), None);
+        assert_eq!(readiness_error(0), None);
+    }
 }

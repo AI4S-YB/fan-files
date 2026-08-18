@@ -83,6 +83,12 @@ pub fn run() {
                             engine::kill_share(&engine);
                             *handle.state::<EngineStatus>().0.lock().unwrap() =
                                 Some("引擎未运行".into());
+                        } else if let Some(msg) =
+                            engine::readiness_error(engine::readiness_status(port).await)
+                        {
+                            // /healthz 200 但 /readyz 503：旧 schema 库（如 v2），
+                            // /stats 等接口会 500。引导用户重新扫描升级索引。
+                            *handle.state::<EngineStatus>().0.lock().unwrap() = Some(msg.into());
                         }
                     }
                     Err(e) => *handle.state::<EngineStatus>().0.lock().unwrap() = Some(e),
