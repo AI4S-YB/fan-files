@@ -26,7 +26,7 @@ export function Sidebar({
           <span>{it.icon}</span> {it.label}
         </button>
       ))}
-      <div className="sidebar-version">v0.2.0</div>
+      <div className="sidebar-version">v0.1.0</div>
     </nav>
   );
 }

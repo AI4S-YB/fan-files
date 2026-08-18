@@ -4,6 +4,9 @@ import DatasetsPage from "./DatasetsPage";
 import * as api from "../api";
 
 vi.mock("../api");
+// T13: 打开目录走 Tauri open_path 命令
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+import { invoke } from "@tauri-apps/api/core";
 
 const mockedApi = vi.mocked(api);
 
@@ -107,10 +110,29 @@ describe("DatasetsPage", () => {
     const share = screen.getByRole("button", { name: /共享/ });
     expect(share).toBeDisabled();
     expect(share).toHaveAttribute("title", "即将推出");
-    // T13 接入前"打开目录"同样禁用占位，不留可点但无响应的按钮
+    // T13 接入后：详情带本地路径时"打开目录"可用
     const openDir = screen.getByRole("button", { name: /打开目录/ });
-    expect(openDir).toBeDisabled();
-    expect(openDir).toHaveAttribute("title", "即将接入");
+    expect(openDir).toBeEnabled();
+  });
+
+  it("opens the dataset directory via open_path from the detail modal", async () => {
+    vi.mocked(invoke).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
+    await screen.findByText("资产");
+    const openDir = screen.getByRole("button", { name: /打开目录/ });
+    fireEvent.click(openDir);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("open_path", { path: "/data/orders/rice" })
+    );
+  });
+
+  it("keeps 打开目录 disabled when the dataset has no local path", async () => {
+    mockedApi.fetchDatasetDetail.mockResolvedValue({ ...detailFixture, path: null });
+    render(<DatasetsPage />);
+    fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
+    await screen.findByText("资产");
+    expect(screen.getByRole("button", { name: /打开目录/ })).toBeDisabled();
   });
 
   it("disables type chips while a page request is in flight", async () => {

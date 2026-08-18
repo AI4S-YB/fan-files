@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   fetchDatasets,
   fetchDatasetDetail,
@@ -130,8 +131,15 @@ export default function DatasetsPage() {
               <button disabled title="即将推出">
                 📤 共享
               </button>
-              {/* Task 13 接 invoke("open_path", { path: detail.path })，接入前禁用占位 */}
-              <button disabled title="即将接入">
+              {/* T13: 系统文件管理器打开数据集目录；无本地路径时保持禁用 */}
+              <button
+                disabled={!detail.path}
+                title={detail.path ? undefined : "无本地路径"}
+                onClick={() =>
+                  detail.path &&
+                  invoke("open_path", { path: detail.path }).catch(console.error)
+                }
+              >
                 📂 打开目录
               </button>
             </div>

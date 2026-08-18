@@ -163,11 +163,81 @@ fn fan_home() -> Result<String, String> {
         .to_string())
 }
 
+/// 原生目录选择器（阻塞式）。用户取消返回 Ok(None)，其余为 Err。
+/// 命令保持私有 fn（见上文 T5/T12 的 E0255 说明）。
+#[tauri::command]
+fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app.dialog().file().blocking_pick_folder();
+    Ok(picked.map(|p| p.to_string()))
+}
+
+/// 用当前 GUI 表单里的 LLM 配置发一个最小请求，验证连通性。
+/// 只按 HTTP 状态码判断成功（2xx），非 2xx 返回 Ok(false) 而非 Err，
+/// 让前端能区分"连通但认证失败"与"请求本身出错"。
+#[tauri::command]
+async fn test_connection(cfg: FanConfig) -> Result<bool, String> {
+    let body = serde_json::json!({
+        "model": cfg.model,
+        "messages": [{"role": "user", "content": "reply OK"}],
+        "max_tokens": 10
+    });
+    let resp = reqwest::Client::new()
+        .post(&cfg.endpoint)
+        .header("Authorization", format!("Bearer {}", cfg.api_key))
+        .header("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resp.status().is_success())
+}
+
+/// 用系统文件管理器打开目录（macOS Finder / Windows Explorer / Linux xdg-open）。
+#[tauri::command]
+async fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// 运行 `fan-files update` 并返回其 stdout。
+///
+/// TODO(T16): 临时实现——从 PATH 里找 fan-files。Task 16 的 engine 模块
+/// 会改为定位打包 sidecar 二进制（安装目录/捆绑二进制），届时替换此处。
+#[tauri::command]
+async fn check_update() -> Result<String, String> {
+    let out = tokio::process::Command::new("fan-files")
+        .arg("update")
+        .output()
+        .await
+        .map_err(|_| "无法找到 fan-files 可执行文件，或执行失败".to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "fan-files update 失败（退出码 {}）：{}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![read_config, write_config, fan_home])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            read_config,
+            write_config,
+            fan_home,
+            pick_directory,
+            test_connection,
+            open_path,
+            check_update
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

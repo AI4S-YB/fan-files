@@ -18,6 +18,11 @@ export default function SettingsPage() {
   const [cfg, setCfg] = useState<FanConfig>(EMPTY);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorLabel, setErrorLabel] = useState("保存失败");
+  const [testResult, setTestResult] = useState<{ ok: boolean; ms: number } | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
+  const [testRunning, setTestRunning] = useState(false);
+  const [updateText, setUpdateText] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<FanConfig>("read_config")
@@ -53,8 +58,51 @@ export default function SettingsPage() {
       })
       .catch((e) => {
         setSaved(false);
+        setErrorLabel("保存失败");
         setError(String(e));
       });
+  };
+
+  // T13: 原生目录选择器 pick_directory；取消（null）或重复目录不改变 include
+  const addDirectory = async () => {
+    try {
+      const dir = await invoke<string | null>("pick_directory");
+      if (!dir) return;
+      setCfg((c) => (c.include.includes(dir) ? c : { ...c, include: [...c.include, dir] }));
+      setSaved(false);
+      setError(null);
+    } catch (e) {
+      setErrorLabel("添加目录失败");
+      setError(String(e));
+    }
+  };
+
+  // T13: 后端 test_connection(cfg: FanConfig) → 按参数名传 { cfg }
+  const testConnection = async () => {
+    setTestRunning(true);
+    setTestResult(null);
+    setTestError(null);
+    const t0 = performance.now();
+    try {
+      const ok = await invoke<boolean>("test_connection", { cfg });
+      setTestResult({ ok, ms: Math.round(performance.now() - t0) });
+    } catch (e) {
+      setTestResult({ ok: false, ms: Math.round(performance.now() - t0) });
+      setTestError(String(e));
+    } finally {
+      setTestRunning(false);
+    }
+  };
+
+  // T13: 后端 check_update 返回 CLI 输出文本，直接展示（T16 sidecar 定位前为 PATH 临时实现）
+  const checkUpdate = async () => {
+    setUpdateText(null);
+    try {
+      const out = await invoke<string>("check_update");
+      setUpdateText(out);
+    } catch (e) {
+      setUpdateText(`检查更新失败：${String(e)}`);
+    }
   };
 
   return (
@@ -82,8 +130,9 @@ export default function SettingsPage() {
             ))}
           </ul>
         )}
-        {/* TODO(T13): 打开原生目录选择器（dialog 命令） */}
-        <button className="secondary">📁 添加目录</button>
+        <button className="secondary" onClick={addDirectory}>
+          📁 添加目录
+        </button>
       </section>
 
       <section className="settings-section">
@@ -105,8 +154,17 @@ export default function SettingsPage() {
           <span>模型名称</span>
           <input id="model" value={cfg.model} onChange={(e) => patch("model", e.target.value)} />
         </label>
-        {/* TODO(T13): 调用后端 test_connection 命令并展示耗时/结果 */}
-        <button className="secondary">测试连接</button>
+        <button className="secondary" onClick={testConnection} disabled={testRunning}>
+          {testRunning ? "测试中…" : "测试连接"}
+        </button>
+        {testResult &&
+          (testResult.ok ? (
+            <span className="feedback-ok">连接成功 ✓（{testResult.ms}ms）</span>
+          ) : (
+            <span className="feedback-err">
+              连接失败（{testResult.ms}ms）{testError ? `：${testError}` : ""}
+            </span>
+          ))}
       </section>
 
       <section className="settings-section">
@@ -118,8 +176,10 @@ export default function SettingsPage() {
         <h3>关于</h3>
         {/* 版本与 package.json / src-tauri/tauri.conf.json 同步 */}
         <p className="settings-hint">fan-files desktop v0.1.0</p>
-        {/* TODO(T13): 检查新版本并提示更新 */}
-        <button className="secondary">检查更新</button>
+        <button className="secondary" onClick={checkUpdate}>
+          检查更新
+        </button>
+        {updateText && <span className="settings-hint update-feedback">{updateText}</span>}
       </section>
 
       <div className="settings-actions">
@@ -127,7 +187,7 @@ export default function SettingsPage() {
           保存配置
         </button>
         {saved && <span className="feedback-ok">已保存 ✓</span>}
-        {error && <span className="feedback-err">保存失败：{error}</span>}
+        {error && <span className="feedback-err">{errorLabel}：{error}</span>}
       </div>
     </div>
   );
