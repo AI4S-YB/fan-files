@@ -13,6 +13,9 @@ fn main() {
     let extension = if target_os == "windows" { ".exe" } else { "" };
     for name in ["fan-files", "fan-files-share"] {
         let src = workspace_target.join(format!("{name}{extension}"));
+        // Re-run this build script whenever the workspace sidecar binary changes,
+        // otherwise cargo caches the copy and the bundle ships a stale sidecar.
+        println!("cargo:rerun-if-changed={}", src.display());
         // tauri-utils resolves externalBin entries as `{entry}-{target_triple}{extension}`
         // (extension comes AFTER the triple), so the copy must match that layout.
         let dst = out.join(format!("{name}-{target_triple}{extension}"));
