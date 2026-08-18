@@ -163,13 +163,23 @@ fn fan_home() -> Result<String, String> {
         .to_string())
 }
 
-/// 原生目录选择器（阻塞式）。用户取消返回 Ok(None)，其余为 Err。
+/// 原生目录选择器。用户取消返回 Ok(None)，其余为 Err。
+///
+/// 必须是 async 命令：blocking_pick_folder 内部是 sync_channel(0) + rx.recv()，
+/// 若在同步命令（主线程）里调用，recv 阻塞主线程 run loop，macOS 模态 sheet
+/// 的回调（同样在主线程）永远无法触发 → 死锁。异步命令跑在 async runtime 线程
+/// 上，这里用非阻塞 pick_folder 回调 + oneshot 桥接为 await
+/// （tauri-plugin-dialog 2.7.2 没有 async pick_folder API）。
 /// 命令保持私有 fn（见上文 T5/T12 的 E0255 说明）。
 #[tauri::command]
-fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
+async fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = app.dialog().file().blocking_pick_folder();
-    Ok(picked.map(|p| p.to_string()))
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |p| {
+        let _ = tx.send(p.map(|f| f.to_string()));
+    });
+    rx.await
+        .map_err(|_| "目录选择对话框未返回结果".to_string())
 }
 
 /// 用当前 GUI 表单里的 LLM 配置发一个最小请求，验证连通性。

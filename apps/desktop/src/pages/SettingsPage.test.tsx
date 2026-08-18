@@ -68,12 +68,15 @@ describe("SettingsPage", () => {
     expect(screen.queryByText(/已保存/)).not.toBeInTheDocument();
   });
   // T13: 添加目录走原生目录选择器 pick_directory 命令
-  it("invokes pick_directory when adding a directory", async () => {
+  it("invokes pick_directory when adding a directory, cancel keeps list unchanged", async () => {
     // 第一次调用是挂载时的 read_config，第二次是点击后的 pick_directory（用户取消 → null）
     vi.mocked(invoke).mockResolvedValueOnce(DEFAULT_CFG).mockResolvedValueOnce(null);
     render(<SettingsPage />);
     fireEvent.click(screen.getByRole("button", { name: /添加目录/ }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("pick_directory"));
+    // 用户取消（null）：include 列表保持不变——空列表提示仍在，且没有目录输入行
+    expect(screen.getByText(/还没有添加数据目录/)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/目录 \d+/)).not.toBeInTheDocument();
   });
   it("appends the picked directory to the include list", async () => {
     vi.mocked(invoke).mockResolvedValueOnce(DEFAULT_CFG).mockResolvedValueOnce("/a");
