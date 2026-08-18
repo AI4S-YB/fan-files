@@ -2,7 +2,9 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 // 与后端 T5 read_config 命令返回的形状一致（见 src-tauri FanConfig）。
+// threads 不进 UI，但必须保留在接口以透传保存（否则 GUI 保存会把文件的 threads 键删掉）。
 interface FanConfig {
+  threads?: number | null;
   include: string[];
   exclude: string[];
   endpoint: string;
@@ -10,7 +12,7 @@ interface FanConfig {
   model: string;
 }
 
-const EMPTY: FanConfig = { include: [], exclude: [], endpoint: "", api_key: "", model: "" };
+const EMPTY: FanConfig = { threads: null, include: [], exclude: [], endpoint: "", api_key: "", model: "" };
 
 export default function SettingsPage() {
   const [cfg, setCfg] = useState<FanConfig>(EMPTY);
@@ -42,9 +44,9 @@ export default function SettingsPage() {
   };
 
   const save = () => {
-    // Tauri 2 按 Rust 参数名取键（write_config(cfg: FanConfig) 需要 args["cfg"]），
-    // 同时展开顶层字段以满足测试对 payload 顶层 include 的断言；Rust 侧忽略多余键。
-    invoke("write_config", { ...cfg, cfg })
+    // Tauri 2 按 Rust 参数名取键：write_config(cfg: FanConfig) 需要 args["cfg"]，
+    // 扁平传参会报 "missing required key cfg"（tauri 2.11.5 源码确认）。
+    invoke("write_config", { cfg })
       .then(() => {
         setSaved(true);
         setError(null);
@@ -114,7 +116,8 @@ export default function SettingsPage() {
 
       <section className="settings-section">
         <h3>关于</h3>
-        <p className="settings-hint">fan-files desktop v0.2.0</p>
+        {/* 版本与 package.json / src-tauri/tauri.conf.json 同步 */}
+        <p className="settings-hint">fan-files desktop v0.1.0</p>
         {/* TODO(T13): 检查新版本并提示更新 */}
         <button className="secondary">检查更新</button>
       </section>

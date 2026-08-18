@@ -85,7 +85,10 @@ fn write_config_at(path: &Path, cfg: FanConfig) -> Result<(), String> {
             Ok(toml::Value::Table(t)) => t,
             _ => toml::map::Map::new(), // unparseable → start fresh
         },
-        Err(_) => toml::map::Map::new(),
+        // 文件不存在 → 空表起步（GUI 首次保存场景）；其他 IO 错误 → 返回 Err，
+        // 不得覆盖不可读的既有文件。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::map::Map::new(),
+        Err(e) => return Err(e.to_string()),
     };
     // only touch the keys the GUI owns
     match cfg.threads {
@@ -290,6 +293,32 @@ model = "old-model"
         assert!(!raw.contains("threads"), "threads=None 应删除既有键:\n{raw}");
         assert!(raw.contains("[servers.foo]"), "未知节应保留:\n{raw}");
         assert_eq!(read_config_at(&p).unwrap(), dto);
+        cleanup(&p);
+    }
+
+    /// 既有文件不可读（非 NotFound）时必须返回 Err，不得静默重建覆盖。
+    /// 用 0o200（只写不可读）制造 read 失败但 write 可行的场景：
+    /// 若实现吞掉读取错误从空表起步，fs::write 会成功并抹掉原内容。
+    #[cfg(unix)]
+    #[test]
+    fn write_config_read_error_does_not_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = temp_config_path("unreadable");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let original = "threads = 2\n[servers.foo]\nurl = \"http://x\"\n";
+        std::fs::write(&p, original).unwrap();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o200);
+        std::fs::set_permissions(&p, perms).unwrap();
+        let result = write_config_at(&p, sample_config());
+        // 恢复权限以便断言与清理
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&p, perms).unwrap();
+        assert!(result.is_err(), "不可读的既有文件应返回 Err 而非覆盖");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(raw, original, "不可读的既有文件内容不得被改动");
         cleanup(&p);
     }
 

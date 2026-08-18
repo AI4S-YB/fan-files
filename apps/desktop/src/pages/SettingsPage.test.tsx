@@ -22,7 +22,12 @@ describe("SettingsPage", () => {
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByRole("button", { name: "保存配置" })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("write_config", expect.objectContaining({ include: [] })));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "write_config",
+        expect.objectContaining({ cfg: expect.objectContaining({ include: [] }) })
+      )
+    );
   });
   it("falls back to empty defaults when read_config fails", async () => {
     vi.mocked(invoke).mockRejectedValue(new Error("io error"));
@@ -31,14 +36,17 @@ describe("SettingsPage", () => {
     expect(screen.getByLabelText("Endpoint")).toHaveValue("");
     expect(screen.getByText(/还没有添加数据目录/)).toBeInTheDocument();
   });
-  it("removes a directory from the list before saving", async () => {
-    vi.mocked(invoke).mockResolvedValue({ include: ["/data/x", "/data/y"], exclude: [], endpoint: "", api_key: "", model: "" });
+  it("removes a directory from the list before saving, keeps threads passthrough", async () => {
+    vi.mocked(invoke).mockResolvedValue({ threads: 8, include: ["/data/x", "/data/y"], exclude: [], endpoint: "", api_key: "", model: "" });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getAllByDisplayValue(/^\/data\//)).toHaveLength(2));
     fireEvent.click(screen.getAllByRole("button", { name: "移除" })[0]);
     fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
     await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("write_config", expect.objectContaining({ include: ["/data/y"] }))
+      expect(invoke).toHaveBeenCalledWith(
+        "write_config",
+        expect.objectContaining({ cfg: expect.objectContaining({ include: ["/data/y"], threads: 8 }) })
+      )
     );
   });
   it("shows in-page feedback after a successful save", async () => {
