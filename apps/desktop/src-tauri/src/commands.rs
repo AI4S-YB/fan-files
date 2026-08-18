@@ -8,8 +8,11 @@
 //! 与 Rust 可见性无关。
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 use crate::config::{config_path, read_config_at, write_config_at, FanConfig};
+use crate::engine::{kill_share, start_share, wait_healthy, Engine, SHARE_PORT};
+use crate::EngineStatus;
 
 #[tauri::command]
 pub(crate) fn read_config() -> Result<FanConfig, String> {
@@ -81,17 +84,16 @@ pub(crate) async fn open_path(app: tauri::AppHandle, path: String) -> Result<(),
 
 /// 运行 `fan-files update` 并返回其 stdout。
 ///
-/// TODO(T16): 临时实现——从 PATH 里找 fan-files。Task 16 的 engine 模块
-/// 会改为定位打包 sidecar 二进制（安装目录/捆绑二进制），届时替换此处。
-/// PATH 限制：macOS GUI 应用从 Finder 启动时 PATH 不含 /usr/local/bin（Homebrew
-/// 安装的 fan-files 所在目录），因此 T16 sidecar 替换前，打包环境的检查更新不可用。
+/// 二进制定位走 engine::sidecar_bin：dev 用 workspace target/release，
+/// 打包后与主程序同目录（避免 macOS GUI 应用 PATH 不含 Homebrew 目录的问题）。
 #[tauri::command]
 pub(crate) async fn check_update() -> Result<String, String> {
-    let out = tokio::process::Command::new("fan-files")
+    let bin = crate::engine::sidecar_bin("fan-files");
+    let out = tokio::process::Command::new(&bin)
         .arg("update")
         .output()
         .await
-        .map_err(|_| "无法找到 fan-files 可执行文件，或执行失败".to_string())?;
+        .map_err(|_| format!("无法找到 {}，或执行失败", bin.display()))?;
     if !out.status.success() {
         return Err(format!(
             "fan-files update 失败（退出码 {}）：{}",
@@ -100,4 +102,32 @@ pub(crate) async fn check_update() -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// share 实际监听端口（可能因冲突回退，前端用它动态设置 API base）。
+#[tauri::command]
+pub(crate) fn get_share_port() -> u16 {
+    SHARE_PORT.load(Ordering::SeqCst)
+}
+
+/// banner 重试：重新拉起 share 并健康检查。成功清空错误状态并返回端口。
+#[tauri::command]
+pub(crate) async fn retry_engine(
+    engine: tauri::State<'_, Engine>,
+    status: tauri::State<'_, EngineStatus>,
+) -> Result<u16, String> {
+    let port = start_share(&engine)?;
+    if wait_healthy(port).await {
+        *status.0.lock().unwrap() = None;
+        Ok(port)
+    } else {
+        kill_share(&engine);
+        Err("引擎健康检查失败".into())
+    }
+}
+
+/// 引擎错误信息（None = 健康）。前端挂载时读取并每 5 秒轮询同步。
+#[tauri::command]
+pub(crate) fn engine_error(status: tauri::State<'_, EngineStatus>) -> Option<String> {
+    status.0.lock().unwrap().clone()
 }

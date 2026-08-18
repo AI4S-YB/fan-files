@@ -1,4 +1,9 @@
-const BASE = "http://127.0.0.1:17951"; // Task 16 换成后端提供的实际端口
+// share 实际端口由后端（get_share_port）提供——冲突时可能回退，故模块级可变。
+let base = "http://127.0.0.1:17951";
+
+export function setApiBase(port: number) {
+  base = `http://127.0.0.1:${port}`;
+}
 
 // 形状以 crates/fan-files-share/src/models.rs 为准（serde 序列化后的 JSON 键名）。
 
@@ -95,7 +100,7 @@ function toParams(q: DatasetQuery): string {
 
 // Envelope 包装：{ data: T }
 async function get<T>(path: string): Promise<T> {
-  const r = await fetch(`${BASE}${path}`);
+  const r = await fetch(`${base}${path}`);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const body = await r.json();
   return body.data as T;
@@ -103,7 +108,7 @@ async function get<T>(path: string): Promise<T> {
 
 // 分页 Envelope：{ data: T[], meta: PageMeta }
 async function getPage<T>(path: string): Promise<PageEnvelope<T>> {
-  const r = await fetch(`${BASE}${path}`);
+  const r = await fetch(`${base}${path}`);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()) as PageEnvelope<T>;
 }

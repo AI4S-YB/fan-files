@@ -1,12 +1,20 @@
 //! fan-files desktop shell（Tauri 2）。
 //!
-//! 结构：config.rs（FanConfig 与 config.toml 读写）、commands.rs（前端 invoke 命令层）、
-//! 本文件只做模块声明与 Tauri 应用组装（含托盘常驻，见 run() 的 setup）。
+//! 结构：config.rs（FanConfig 与 config.toml 读写）、engine.rs（sidecar 生命周期管理）、
+//! commands.rs（前端 invoke 命令层）、本文件只做模块声明与 Tauri 应用组装
+//! （含托盘常驻与 share 启动，见 run() 的 setup）。
 
 mod commands;
 mod config;
+mod engine;
+
+use std::sync::Mutex;
 
 pub use config::FanConfig;
+
+/// 引擎错误信息（None = 健康）。setup 异步启动 share 的结果与前端 retry 都写入这里，
+/// 前端通过 engine_error 命令读取。
+pub struct EngineStatus(pub Mutex<Option<String>>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -20,7 +28,10 @@ pub fn run() {
             commands::pick_directory,
             commands::test_connection,
             commands::open_path,
-            commands::check_update
+            commands::check_update,
+            commands::get_share_port,
+            commands::retry_engine,
+            commands::engine_error
         ])
         .setup(|app| {
             use tauri::{
@@ -53,6 +64,24 @@ pub fn run() {
                 tray = tray.icon(icon);
             }
             tray.build(app)?;
+
+            // sidecar 生命周期：异步拉起 share（不阻塞窗口），结果写入 EngineStatus
+            app.manage(engine::Engine::new());
+            app.manage(EngineStatus(Mutex::new(None)));
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let engine = handle.state::<engine::Engine>();
+                match engine::start_share(&engine) {
+                    Ok(port) => {
+                        if !engine::wait_healthy(port).await {
+                            engine::kill_share(&engine);
+                            *handle.state::<EngineStatus>().0.lock().unwrap() =
+                                Some("引擎未运行".into());
+                        }
+                    }
+                    Err(e) => *handle.state::<EngineStatus>().0.lock().unwrap() = Some(e),
+                }
+            });
             Ok(())
         })
         // Windows 关闭按钮收托盘；macOS/Linux 保持默认关闭行为

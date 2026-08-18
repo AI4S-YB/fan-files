@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { fetchStats, fetchDatasets, searchDatasets, fetchDatasetDetail, fetchFiles } from "./api";
+import { fetchStats, fetchDatasets, searchDatasets, fetchDatasetDetail, fetchFiles, setApiBase } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -132,5 +132,14 @@ describe("api client", () => {
     const m = vi.fn().mockResolvedValue({ ok: false, status: 503 });
     vi.stubGlobal("fetch", m);
     await expect(fetchStats()).rejects.toThrow("HTTP 503");
+  });
+
+  it("setApiBase switches the base port for subsequent calls", async () => {
+    setApiBase(20217);
+    const m = vi.fn().mockResolvedValue({ ok: true, json: async () => statsBody });
+    vi.stubGlobal("fetch", m);
+    await fetchStats();
+    expect(m.mock.calls[0][0]).toBe("http://127.0.0.1:20217/api/v1/stats");
+    setApiBase(17951); // 复位默认，避免影响其他测试
   });
 });
