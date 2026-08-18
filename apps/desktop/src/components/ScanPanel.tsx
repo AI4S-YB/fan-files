@@ -15,15 +15,18 @@ export default function ScanPanel({ onDone }: { onDone?: () => void }) {
       if (!cancelled) setRunning(s);
     });
     const un1 = listen<string>("scan://progress", (e) =>
-      setLines((ls) => [...ls.slice(-500), e.payload])
+      setLines((ls) => [...ls, e.payload].slice(-500))
     );
     const un2 = listen<number>("scan://done", (e) => {
       setRunning(false);
       if (e.payload === 0 && onDone) onDone();
     });
-    const un3 = listen<string>("scan://error", (e) =>
-      setLines((ls) => [...ls, `扫描失败: ${e.payload}`])
-    );
+    const un3 = listen<string>("scan://error", (e) => {
+      // spawn 失败时后端复位互斥并推 error 事件，这里必须同步复位 running，
+      // 否则按钮永远停在"扫描中…"禁用态
+      setRunning(false);
+      setLines((ls) => [...ls, `扫描失败: ${e.payload}`]);
+    });
     return () => {
       cancelled = true;
       un1.then((u) => u());

@@ -185,9 +185,10 @@ pub(crate) async fn scan_now(app: tauri::AppHandle) -> Result<(), String> {
             }
         }
         let status = child.wait().await;
+        // 信号终止时无退出码：-1 而非 0——0 会让前端误判成功并刷新统计卡
         let _ = handle.emit(
             "scan://done",
-            status.map(|s| s.code().unwrap_or(0)).unwrap_or(-1),
+            status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1),
         );
         SCANNING.store(false, Ordering::SeqCst);
     });

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchStats, type Stats } from "../api";
 import ScanPanel from "../components/ScanPanel";
@@ -25,11 +25,13 @@ export default function HomePage() {
   const [configured, setConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
 
-  const refreshStats = () => {
+  // useCallback：身份稳定，避免每次重渲染都换 onDone 引用导致 ScanPanel
+  // 反复退订/重订阅 scan:// 事件
+  const refreshStats = useCallback(() => {
     fetchStats()
       .then(setStats)
       .catch(() => setStats(null));
-  };
+  }, []);
 
   useEffect(() => {
     invoke<FanConfig>("read_config")

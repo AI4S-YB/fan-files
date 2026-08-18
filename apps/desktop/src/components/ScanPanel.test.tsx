@@ -96,6 +96,33 @@ describe("ScanPanel", () => {
     ).toBeInTheDocument();
   });
 
+  it("error event re-enables the button (spawn failure must not leave it stuck)", async () => {
+    render(<ScanPanel />);
+    // 先让挂载时的 scan_state 轮询落地，避免其延迟的 setRunning(false)
+    // 在点击后冲掉 running=true、掩盖缺少的 error 处理
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByRole("button")).toBeDisabled();
+    emit("scan://error", "spawn failed");
+    expect(
+      await screen.findByText("扫描失败: spawn failed")
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button")).toBeEnabled();
+  });
+
+  it("caps the progress log at exactly 500 lines", () => {
+    render(<ScanPanel />);
+    for (let i = 1; i <= 505; i++) emit("scan://progress", `line ${i}`);
+    const log = document.querySelector("pre.scan-log");
+    expect(log).not.toBeNull();
+    const logLines = log!.textContent!.split("\n");
+    expect(logLines.length).toBe(500);
+    expect(logLines[0]).toBe("line 6");
+    expect(logLines[499]).toBe("line 505");
+  });
+
   it("invoke rejection (e.g. already scanning) shows error and re-enables button", async () => {
     vi.mocked(invoke).mockImplementation((cmd: string) => {
       if (cmd === "scan_state") return Promise.resolve(false);
