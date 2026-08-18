@@ -1,25 +1,44 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
-interface ScanPanelProps {
-  // 扫描成功后回调，用于刷新统计卡（Task 17 接入 scan_now 后生效）。
-  onDone?: () => void;
-}
-
-export default function ScanPanel({ onDone }: ScanPanelProps) {
+// T17 事件流模式：invoke("scan_now") 只负责触发（立即返回），扫描进度/结束
+// 由后端通过 scan://progress / scan://done / scan://error 事件推送。
+// 挂载时轮询一次 scan_state 同步互斥标志（如托盘菜单已发起扫描）。
+export default function ScanPanel({ onDone }: { onDone?: () => void }) {
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<boolean>("scan_state").then((s) => {
+      if (!cancelled) setRunning(s);
+    });
+    const un1 = listen<string>("scan://progress", (e) =>
+      setLines((ls) => [...ls.slice(-500), e.payload])
+    );
+    const un2 = listen<number>("scan://done", (e) => {
+      setRunning(false);
+      if (e.payload === 0 && onDone) onDone();
+    });
+    const un3 = listen<string>("scan://error", (e) =>
+      setLines((ls) => [...ls, `扫描失败: ${e.payload}`])
+    );
+    return () => {
+      cancelled = true;
+      un1.then((u) => u());
+      un2.then((u) => u());
+      un3.then((u) => u());
+    };
+  }, [onDone]);
 
   async function scan() {
     setRunning(true);
     setLines([]);
     try {
-      // Task 17 注册 scan_now 后端命令并推送进度事件；当前会 reject
       await invoke("scan_now");
-      onDone?.();
     } catch (e) {
       setLines([`扫描失败: ${String(e)}`]);
-    } finally {
       setRunning(false);
     }
   }

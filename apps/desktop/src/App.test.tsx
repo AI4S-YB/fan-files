@@ -5,6 +5,11 @@ import * as api from "./api";
 
 vi.mock("./api");
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// T17：App 挂载 HomePage → ScanPanel 订阅 scan:// 事件，jsdom 无 Tauri IPC，
+// 必须 mock 掉。
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(() => Promise.resolve(() => {})),
+}));
 
 import { invoke } from "@tauri-apps/api/core";
 
@@ -28,6 +33,8 @@ function mockInvoke(overrides: Record<string, unknown> = {}) {
         return Promise.resolve(17951);
       case "retry_engine":
         return Promise.resolve(17951);
+      case "scan_state":
+        return Promise.resolve(false);
       default:
         return Promise.resolve(undefined);
     }

@@ -8,11 +8,18 @@
 //! 与 Rust 可见性无关。
 
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tauri::Emitter;
 
 use crate::config::{config_path, read_config_at, write_config_at, FanConfig};
 use crate::engine::{kill_share, start_share, wait_healthy, Engine, SHARE_PORT};
 use crate::EngineStatus;
+
+/// 扫描互斥标志（true = discover 子进程正在运行）。
+/// scan_now（前端命令 + 托盘菜单）与 lib.rs 的定时循环共用。
+pub(crate) static SCANNING: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 pub(crate) fn read_config() -> Result<FanConfig, String> {
@@ -139,4 +146,56 @@ pub(crate) async fn retry_engine(
 #[tauri::command]
 pub(crate) fn engine_error(status: tauri::State<'_, EngineStatus>) -> Option<String> {
     status.0.lock().unwrap().clone()
+}
+
+/// 触发一次后台扫描（`fan-files discover`）。
+///
+/// 编排契约（T17）：
+/// - SCANNING 做互斥，重复触发立即 Err("already scanning")；
+/// - discover 的进度走 stderr（CLI 用 eprintln!），逐行转为 `scan://progress` 事件；
+/// - 结束时发 `scan://done`（载荷为退出码，0 = 成功），前端只在 code==0 时刷新统计卡；
+/// - spawn 失败发 `scan://error` 并复位互斥。
+/// 命令本身立即返回，扫描在 async runtime 上跑，前端靠事件流更新 UI。
+#[tauri::command]
+pub(crate) async fn scan_now(app: tauri::AppHandle) -> Result<(), String> {
+    if SCANNING.swap(true, Ordering::SeqCst) {
+        return Err("already scanning".into());
+    }
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut child = match tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"))
+            .env("FAN_JSON_FORMAT", "1")
+            .arg("discover")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = handle.emit("scan://error", e.to_string());
+                SCANNING.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        use tokio::io::AsyncBufReadExt;
+        if let Some(stderr) = child.stderr.take() {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = handle.emit("scan://progress", &line);
+            }
+        }
+        let status = child.wait().await;
+        let _ = handle.emit(
+            "scan://done",
+            status.map(|s| s.code().unwrap_or(0)).unwrap_or(-1),
+        );
+        SCANNING.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// 扫描互斥标志的读取端（前端挂载时同步一次，托盘发起的扫描也能反映到 UI）。
+#[tauri::command]
+pub(crate) fn scan_state() -> bool {
+    SCANNING.load(Ordering::SeqCst)
 }
