@@ -31,9 +31,12 @@ impl PunchPacket {
 /// 打洞参数（规格 §四）：100ms 一发，最多 30 次 = 3 秒
 pub const PUNCH_INTERVAL: Duration = Duration::from_millis(100);
 pub const PUNCH_MAX_ATTEMPTS: u32 = 30;
+/// 收到对方回包后再补发的拍数：先成功方立即停发会让对端一包收不到而超时，
+/// 补发几拍保证对端也收到至少一拍（每 PUNCH_INTERVAL 一拍）。
+pub const PUNCH_TRAILING_BEATS: u32 = 3;
 
 /// 绑一个 UDP socket，向 peer_addr 发打洞包并监听回包。
-/// 返回 Some(socket) = 收到对方打洞包（打洞成功）；None = 超时。
+/// 返回 Some(socket) = 收到对方打洞包（打洞成功）；None = 超时或达到 PUNCH_MAX_ATTEMPTS。
 pub fn punch_establish(
     bind: SocketAddr,
     peer: SocketAddr,
@@ -46,7 +49,13 @@ pub fn punch_establish(
     let pkt = PunchPacket { nonce, from: who }.encode();
     let deadline = std::time::Instant::now() + timeout;
     let mut buf = [0u8; 256];
+    let mut attempts = 0u32;
     loop {
+        attempts += 1;
+        // 双上限：attempts 封顶（规格 §四：最多 30 次）+ timeout 截止
+        if attempts > PUNCH_MAX_ATTEMPTS || std::time::Instant::now() >= deadline {
+            return None;
+        }
         // 发打洞包
         let _ = sock.send_to(&pkt, peer);
         // 读回包
@@ -54,15 +63,17 @@ pub fn punch_establish(
             Ok((n, _from)) => {
                 if let Ok(p) = PunchPacket::decode(&buf[..n]) {
                     if p.nonce == nonce {
+                        // 打洞成功：再补发几拍（每 100ms），保证对端也收到至少一拍
+                        for _ in 0..PUNCH_TRAILING_BEATS {
+                            std::thread::sleep(PUNCH_INTERVAL);
+                            let _ = sock.send_to(&pkt, peer);
+                        }
                         return Some(sock);
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return None,
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
         }
         std::thread::sleep(PUNCH_INTERVAL);
     }
@@ -86,11 +97,9 @@ mod tests {
         drop(s2);
 
         // punch_establish 是阻塞函数，用 std::thread::spawn 双线程模拟双端。
-        // 注意：先启动端的第一发打洞包可能在后启动端 bind 之前发出而被丢弃，
-        // 且成功方立即停止发送——若两端同时启动，先成功的一方停发后，
-        // 后启动方只能收到“成功前”发出的包，必有一侧超时。
-        // 错开 100ms 启动：后启动端 bind 时先启动端正处于 100ms 重发休眠，
-        // 重发循环吸收微秒级竞态，两端必然都收到对方的打洞包。
+        // 机器层面已用 PUNCH_TRAILING_BEATS 补发解决“先成功方停发致对端超时”的竞态；
+        // 这里再错开 100ms 启动作为冗余保险：先启动端首拍可能丢包时，
+        // 重发循环 + 补发仍保证两端都收到对方至少一拍。
         let t1 = std::thread::spawn(move || {
             punch_establish(a1, a2, 42, "peer-a".into(), Duration::from_secs(2)).is_some()
         });
