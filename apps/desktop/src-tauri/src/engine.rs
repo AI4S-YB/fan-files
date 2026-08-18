@@ -104,6 +104,9 @@ pub fn start_share(engine: &Engine) -> Result<u16, String> {
         .arg(&db)
         // 桌面壳的路径列/打开目录依赖绝对路径（share 默认不暴露）
         .arg("--expose-absolute-paths")
+        // 扫描完成后统计卡需要立刻刷新，5 秒缓存兼顾性能与新鲜度
+        .arg("--stats-cache-seconds")
+        .arg("5")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

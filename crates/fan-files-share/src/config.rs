@@ -14,6 +14,9 @@ pub struct Args {
     /// 暴露数据集的绝对路径（默认关闭；桌面壳需要路径列与"打开目录"）
     #[arg(long)]
     pub expose_absolute_paths: bool,
+    /// /stats 与 /facets 的缓存 TTL（秒）。缺省用配置文件或内置默认值 60
+    #[arg(long)]
+    pub stats_cache_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -64,6 +67,9 @@ impl Settings {
         if args.expose_absolute_paths {
             value.expose_absolute_paths = true;
         }
+        if let Some(ttl) = args.stats_cache_seconds {
+            value.stats_cache_seconds = ttl;
+        }
         // The sidecar may be started from an arbitrary working directory
         // (e.g. the desktop shell), so make the database path absolute;
         // the tantivy index dir is derived from its parent.
@@ -91,6 +97,15 @@ mod tests {
     }
 
     #[test]
+    fn args_parse_stats_cache_seconds_flag() {
+        let args =
+            Args::try_parse_from(["fan-files-share", "--stats-cache-seconds", "5"]).unwrap();
+        assert_eq!(args.stats_cache_seconds, Some(5));
+        let args = Args::try_parse_from(["fan-files-share"]).unwrap();
+        assert_eq!(args.stats_cache_seconds, None);
+    }
+
+    #[test]
     fn settings_load_applies_expose_flag_and_keeps_default_false() {
         let args = Args::try_parse_from(["fan-files-share", "--expose-absolute-paths"]).unwrap();
         let settings = Settings::load(args).unwrap();
@@ -101,4 +116,15 @@ mod tests {
         assert!(!settings.expose_absolute_paths);
     }
 
+    #[test]
+    fn settings_load_applies_stats_cache_flag_and_keeps_default_60() {
+        let args =
+            Args::try_parse_from(["fan-files-share", "--stats-cache-seconds", "5"]).unwrap();
+        let settings = Settings::load(args).unwrap();
+        assert_eq!(settings.stats_cache_seconds, 5);
+        // 未传 flag：内置默认 60 不变
+        let args = Args::try_parse_from(["fan-files-share"]).unwrap();
+        let settings = Settings::load(args).unwrap();
+        assert_eq!(settings.stats_cache_seconds, 60);
+    }
 }
