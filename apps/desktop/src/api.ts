@@ -82,14 +82,15 @@ export interface FileSummary {
 }
 
 // 对应后端 DatasetQuery：q/species/type/cursor/limit/sort/order。
-// sort 仅 "id" | "relevance"（relevance 需要 q），order 仅 "asc"（服务端校验）。
+// sort：id 默认；relevance（需 q）；name/file_count（GUI-T4 数据集页排序下拉）。
+// order 仅 "asc"（服务端校验；order 缺省也按 asc）。
 export interface DatasetQuery {
   q?: string;
   species?: string;
   type?: string;
   cursor?: number;
   limit?: number;
-  sort?: "id" | "relevance";
+  sort?: "id" | "relevance" | "name" | "file_count";
   order?: "asc";
 }
 

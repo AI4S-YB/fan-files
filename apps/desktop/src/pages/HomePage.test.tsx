@@ -79,6 +79,9 @@ describe("HomePage", () => {
     render(<HomePage onGoSettings={onGoSettings} />);
     expect(await screen.findByText("1,453")).toBeInTheDocument();
     expect(screen.getByText("109,796")).toBeInTheDocument();
+    // GUI-T4: 统计卡补全 assets 数
+    expect(screen.getByText("5,000")).toBeInTheDocument();
+    expect(screen.getByText("资产")).toBeInTheDocument();
   });
 
   it("does not re-subscribe ScanPanel when stats refresh re-renders (stable onDone)", async () => {

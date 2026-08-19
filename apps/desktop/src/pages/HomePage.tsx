@@ -60,6 +60,11 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
               <b>{stats ? stats.datasets_upper_bound.toLocaleString() : "—"}</b>
               <span>数据集</span>
             </div>
+            {/* GUI-T4: 统计卡补全资产数（Stats.assets_upper_bound 由后端聚合） */}
+            <div className="stat-card">
+              <b>{stats ? stats.assets_upper_bound.toLocaleString() : "—"}</b>
+              <span>资产</span>
+            </div>
             <div className="stat-card">
               <b>{stats ? stats.files_upper_bound.toLocaleString() : "—"}</b>
               <span>文件</span>

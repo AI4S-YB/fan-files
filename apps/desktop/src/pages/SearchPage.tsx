@@ -1,6 +1,14 @@
 import { useRef, useState, type FormEvent } from "react";
-import { searchDatasets, type DatasetSummary } from "../api";
+import {
+  searchDatasets,
+  fetchDatasetDetail,
+  fetchFiles,
+  type DatasetSummary,
+  type DatasetDetail,
+  type FileSummary,
+} from "../api";
 import DataTable from "../components/DataTable";
+import DatasetDetailModal from "../components/DatasetDetailModal";
 
 export default function SearchPage() {
   const [q, setQ] = useState("");
@@ -9,6 +17,9 @@ export default function SearchPage() {
   const [error, setError] = useState<string | null>(null);
   // 请求序号（last-write-wins）：连发两次搜索时，旧响应返回后不覆盖新结果
   const seq = useRef(0);
+  // GUI-T4: 结果详情弹层（复用 DatasetDetailModal）
+  const [detail, setDetail] = useState<DatasetDetail | null>(null);
+  const [files, setFiles] = useState<FileSummary[]>([]);
 
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -25,6 +36,21 @@ export default function SearchPage() {
       // 失败时不清空已有结果，仅显示错误行（T15 全局横幅前的最小反馈）
       setError("搜索失败，请检查引擎状态");
     }
+  }
+
+  // 打开结果详情：与数据集页同构（详情失败静默返回；文件列表失败静默为空）
+  async function openDetail(r: DatasetSummary) {
+    setFiles([]);
+    let d: DatasetDetail;
+    try {
+      d = await fetchDatasetDetail(r.id);
+    } catch {
+      return;
+    }
+    setDetail(d);
+    fetchFiles(r.id)
+      .then((page) => setFiles(page.data))
+      .catch(() => setFiles([]));
   }
 
   return (
@@ -46,10 +72,13 @@ export default function SearchPage() {
       ) : (
         <DataTable
           rows={rows}
-          // 详情弹层复用留待 T11.5/T12（抽公共组件后再接，避免复制 DatasetsPage 的 modal 逻辑）
-          onSelect={() => {}}
+          // GUI-T4: 结果行可点详情（复用 DatasetDetailModal，含共享按钮）
+          onSelect={openDetail}
           emptyText="没有找到匹配的数据集 — 试试换关键词（如：水稻基因组）"
         />
+      )}
+      {detail && (
+        <DatasetDetailModal detail={detail} files={files} onClose={() => setDetail(null)} />
       )}
     </div>
   );

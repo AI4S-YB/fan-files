@@ -57,12 +57,12 @@ async fn datasets(
     ))
 }
 fn validate_dataset_order(query: &DatasetQuery) -> Result<(), AppError> {
-    if query
-        .sort
-        .as_deref()
-        .is_some_and(|value| value != "id" && value != "relevance")
-    {
-        return Err(AppError::BadRequest("sort must be id or relevance".into()));
+    // GUI-T4: 数据集页排序下拉支持 name（名称）/ file_count（文件数）排序。
+    const SORTS: &[&str] = &["id", "relevance", "name", "file_count"];
+    if query.sort.as_deref().is_some_and(|value| !SORTS.contains(&value)) {
+        return Err(AppError::BadRequest(
+            "sort must be id, relevance, name or file_count".into(),
+        ));
     }
     if query.sort.as_deref() == Some("relevance")
         && query
@@ -238,12 +238,32 @@ mod tests {
     #[test]
     fn rejects_unknown_sort_and_oversized_page() {
         let invalid = DatasetQuery {
-            sort: Some("name".into()),
+            sort: Some("size".into()),
             ..Default::default()
         };
         assert!(validate_dataset_order(&invalid).is_err());
         assert!(page_limit(Some(201), 200).is_err());
         assert_eq!(page_limit(None, 200).unwrap(), 50);
+    }
+
+    // GUI-T4: name/file_count 排序无需 q 即可用（与 relevance 不同）
+    #[test]
+    fn accepts_name_and_file_count_sort_without_query() {
+        for sort in ["name", "file_count"] {
+            let valid = DatasetQuery {
+                sort: Some(sort.into()),
+                ..Default::default()
+            };
+            assert!(
+                validate_dataset_order(&valid).is_ok(),
+                "sort={sort} should be accepted without q"
+            );
+        }
+        let id_sort = DatasetQuery {
+            sort: Some("id".into()),
+            ..Default::default()
+        };
+        assert!(validate_dataset_order(&id_sort).is_ok());
     }
 
     fn api_fixture(db_path: &std::path::Path) -> Settings {

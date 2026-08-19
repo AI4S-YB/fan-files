@@ -11,12 +11,13 @@ import {
   type Facet,
 } from "../api";
 import DataTable from "../components/DataTable";
+import DatasetDetailModal from "../components/DatasetDetailModal";
 import TransferPanel, { type TransferEvent } from "../components/TransferPanel";
 
 // meta.type_counts 缺失时（老后端/空库）回退到固定类型集
 const FALLBACK_TYPES = ["genome", "transcriptome", "variant", "other"];
 
-// 解析引擎 JSONL 事件行；非 JSON 行（人类输出/配对码）返回 null（进原始日志）
+// 解析引擎 JSONL 事件行（接收侧）；非 JSON 行（人类输出）返回 null（进原始日志）
 function parseTransferLine(line: string): TransferEvent | null {
   try {
     const obj = JSON.parse(line) as TransferEvent;
@@ -27,20 +28,13 @@ function parseTransferLine(line: string): TransferEvent | null {
   return null;
 }
 
-// 共享状态：idle=未共享，code=已生成码等待接收，running=传输中，
-// done=完成/失败，cancelled=用户取消（后端 done(-1) 已由取消流程消费，忽略）
-type ShareState =
-  | { status: "idle" }
-  | { status: "running" }
-  | { status: "code"; code: string }
-  | { status: "done"; ok: boolean }
-  | { status: "cancelled" };
+// 数据集页排序下拉选项（sort 参数值；order 恒为 asc —— 服务端仅支持 asc）
+type SortValue = "id" | "name" | "file_count";
 
 type ReceiveStatus = "idle" | "running" | "done-ok" | "done-err" | "cancelled";
 
-// 续传确认弹窗内容（resume 事件触发）
+// 续传确认弹窗内容（receive://progress 的 resume 事件触发；共享侧的在 DatasetDetailModal）
 interface ResumeAsk {
-  side: "share" | "receive";
   done: number;
   total: number;
 }
@@ -50,23 +44,16 @@ export default function DatasetsPage() {
   const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [type, setType] = useState<string | undefined>(undefined);
   const [typeCounts, setTypeCounts] = useState<Facet[]>([]);
+  // GUI-T4: 搜索（提交后生效的 q，与类型筛选共存）+ 排序下拉
+  const [q, setQ] = useState("");
+  const [submittedQ, setSubmittedQ] = useState<string | undefined>(undefined);
+  const [sort, setSort] = useState<SortValue>("id");
   const [detail, setDetail] = useState<DatasetDetail | null>(null);
   const [files, setFiles] = useState<FileSummary[]>([]);
   // 已访问页使用的 cursor 栈：next 时 push 当前 nextCursor，prev 时 pop 并 load 新栈顶（栈空即回第一页）
   const [history, setHistory] = useState<number[]>([]);
   // 翻页 loading guard：请求在途时禁用上一页/下一页，防连点双请求
   const [loading, setLoading] = useState(false);
-  // 数据集共享（P2P）状态
-  const [share, setShare] = useState<ShareState>({ status: "idle" });
-  // ref 镜像：事件监听闭包需读"当前"状态（取消后忽略后续 done(-1)，避免覆盖 cancelled 态）
-  const shareStatusRef = useRef<ShareState>({ status: "idle" });
-  const setShareState = (s: ShareState) => {
-    shareStatusRef.current = s;
-    setShare(s);
-  };
-  // 共享面板：解析后的事件（驱动面板）+ 原始行（折叠日志）
-  const [shareEvents, setShareEvents] = useState<TransferEvent[]>([]);
-  const [shareRaw, setShareRaw] = useState<string[]>([]);
   // 接收（P2P）状态
   const [receiveCode, setReceiveCode] = useState("");
   const [receiveStatus, setReceiveStatus] = useState<ReceiveStatus>("idle");
@@ -79,7 +66,7 @@ export default function DatasetsPage() {
   const [receiveRaw, setReceiveRaw] = useState<string[]>([]);
   // 最近一次接收的目标目录（"打开接收目录"用；来自 receive_dataset 返回的实际路径）
   const [receiveDir, setReceiveDir] = useState<string | null>(null);
-  // 续传确认弹窗（resume 事件触发）
+  // 续传确认弹窗（接收侧 resume 事件触发）
   const [resumeAsk, setResumeAsk] = useState<ResumeAsk | null>(null);
   // 续传弹窗超时（规格 §九：用户不响应默认继续——引擎已自动续传，不阻塞传输）
   const RESUME_AUTO_CLOSE_MS = 60_000;
@@ -100,8 +87,6 @@ export default function DatasetsPage() {
     },
     []
   );
-  // 配对码复制反馈
-  const [copied, setCopied] = useState(false);
   // 传输历史
   const [transferHistory, setTransferHistory] = useState<HistoryEntry[]>([]);
 
@@ -124,49 +109,22 @@ export default function DatasetsPage() {
     }
   }
 
-  // 挂载时加载历史；收发完成后刷新
+  // 挂载时加载历史；接收完成后刷新（共享完成的刷新在弹层内）
   useEffect(() => {
     void loadHistory();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [receiveStatus === "done-ok", share.status === "done"]);
+  }, [receiveStatus === "done-ok"]);
 
-  // 监听共享事件流（share://code / progress / done / error）与接收事件流
-  // （receive://progress / done / error）。progress 为 JSONL 行：JSON.parse
-  // 成功 → 分发到面板；失败（人类输出等）→ 仅进原始日志。
+  // 监听接收事件流（receive://progress / done / error）。progress 为 JSONL 行：
+  // JSON.parse 成功 → 分发到面板；失败（人类输出等）→ 仅进原始日志。
   useEffect(() => {
-    const unCode = listen<string>("share://code", (e) => {
-      setShareState({ status: "code", code: e.payload });
-      setShareRaw((l) => [...l.slice(-200), `配对码: ${e.payload}`]);
-    });
-    const unProgress = listen<string>("share://progress", (e) => {
-      setShareRaw((l) => [...l.slice(-200), e.payload]);
-      const ev = parseTransferLine(e.payload);
-      if (!ev) return;
-      setShareEvents((es) => [...es.slice(-200), ev]);
-      if (ev.type === "resume") {
-        showResumeAsk({ side: "share", done: ev.done, total: ev.total });
-      }
-    });
-    const unDone = listen<number>("share://done", (e) => {
-      const s = shareStatusRef.current;
-      if (s.status === "cancelled" || s.status === "idle") return;
-      setShareState({ status: "done", ok: e.payload === 0 });
-      setShareRaw((l) => [
-        ...l.slice(-200),
-        e.payload === 0 ? "共享完成" : `共享失败（退出码 ${e.payload}）`,
-      ]);
-    });
-    const unError = listen<string>("share://error", (e) => {
-      setShareState({ status: "done", ok: false });
-      setShareRaw((l) => [...l.slice(-200), `共享错误: ${e.payload}`]);
-    });
     const unRProgress = listen<string>("receive://progress", (e) => {
       setReceiveRaw((l) => [...l.slice(-200), e.payload]);
       const ev = parseTransferLine(e.payload);
       if (!ev) return;
       setReceiveEvents((es) => [...es.slice(-200), ev]);
       if (ev.type === "resume") {
-        showResumeAsk({ side: "receive", done: ev.done, total: ev.total });
+        showResumeAsk({ done: ev.done, total: ev.total });
       }
     });
     const unRDone = listen<number>("receive://done", (e) => {
@@ -183,27 +141,11 @@ export default function DatasetsPage() {
       setReceiveRaw((l) => [...l.slice(-200), `接收错误: ${e.payload}`]);
     });
     return () => {
-      unCode.then((u) => u());
-      unProgress.then((u) => u());
-      unDone.then((u) => u());
-      unError.then((u) => u());
       unRProgress.then((u) => u());
       unRDone.then((u) => u());
       unRError.then((u) => u());
     };
   }, []);
-
-  async function startShare(path: string) {
-    setShareState({ status: "running" });
-    setShareEvents([]);
-    setShareRaw([]);
-    try {
-      await invoke("share_dataset", { path });
-    } catch (e) {
-      setShareState({ status: "done", ok: false });
-      setShareRaw((l) => [...l, `共享启动失败: ${String(e)}`]);
-    }
-  }
 
   async function startReceive() {
     const code = receiveCode.trim();
@@ -219,24 +161,6 @@ export default function DatasetsPage() {
     } catch (e) {
       setReceiveState("done-err");
       setReceiveRaw((l) => [...l, `接收启动失败: ${String(e)}`]);
-    }
-  }
-
-  // 取消共享：面板推进到终态（合成 done 事件 → 取消按钮禁用），后端杀子进程；
-  // 后端随后发的 done(-1) 由监听闭包按 cancelled 态忽略
-  async function cancelShare() {
-    const s = shareStatusRef.current;
-    if (s.status === "idle" || s.status === "cancelled") return;
-    setShareState({ status: "cancelled" });
-    setShareEvents((es) => [
-      ...es.slice(-200),
-      { type: "done", ok: false, bytes: 0, elapsed_secs: 0 },
-    ]);
-    setShareRaw((l) => [...l.slice(-200), "已取消"]);
-    try {
-      await invoke("cancel_transfer");
-    } catch {
-      /* 取消失败不影响面板终态 */
     }
   }
 
@@ -256,7 +180,7 @@ export default function DatasetsPage() {
     }
   }
 
-  // 续传确认：继续 → 仅关闭弹窗（引擎已自动续传缺失块）；放弃 → 取消对应方向
+  // 续传确认：继续 → 仅关闭弹窗（引擎已自动续传缺失块）；放弃 → 取消接收
   function continueResume() {
     if (resumeTimerRef.current) window.clearTimeout(resumeTimerRef.current);
     resumeTimerRef.current = null;
@@ -264,22 +188,8 @@ export default function DatasetsPage() {
   }
 
   function rejectResume() {
-    const ask = resumeAsk;
     continueResume();
-    if (ask?.side === "share") void cancelShare();
-    else if (ask?.side === "receive") void cancelReceive();
-  }
-
-  // 复制配对码到剪贴板（navigator.clipboard；非安全上下文等失败静默）
-  async function copyCode() {
-    if (share.status !== "code") return;
-    try {
-      await navigator.clipboard.writeText(share.code);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* 剪贴板不可用时静默 */
-    }
+    void cancelReceive();
   }
 
   function openReceiveDir() {
@@ -290,10 +200,23 @@ export default function DatasetsPage() {
 
   // 游标分页：next_cursor 非空则"下一页"可用（cursor 即上一页最后一条的 id）。
   // 错误在内部消化（不向外 reject），失败时清空行/游标/历史栈。
-  async function load(cursor?: number, selectedType?: string) {
+  // GUI-T4: 带上搜索词与排序键（sort=id 时省略 sort/order，服务端默认 id 升序）。
+  async function load(
+    cursor?: number,
+    selectedType?: string,
+    query?: string,
+    sortValue: SortValue = "id"
+  ) {
     setLoading(true);
     try {
-      const page = await fetchDatasets({ cursor, limit: 50, type: selectedType });
+      const page = await fetchDatasets({
+        cursor,
+        limit: 50,
+        type: selectedType,
+        q: query,
+        sort: sortValue === "id" ? undefined : sortValue,
+        order: sortValue === "id" ? undefined : "asc",
+      });
       setRows(page.data);
       setNextCursor(page.meta.next_cursor);
       if (page.meta.type_counts) setTypeCounts(page.meta.type_counts);
@@ -306,15 +229,22 @@ export default function DatasetsPage() {
     }
   }
 
+  // 搜索词/排序/类型筛选任一变化：清历史栈回第一页重新加载（防竞态：cursor 回开头）
   useEffect(() => {
-    setHistory([]); // 类型筛选变化时清空历史栈
-    void load(undefined, type);
-  }, [type]);
+    setHistory([]);
+    void load(undefined, type, submittedQ, sort);
+  }, [type, submittedQ, sort]);
+
+  // 提交搜索：空白词视作"无过滤"（q 省略）；与已提交词相同则跳过重复请求
+  function submitSearch() {
+    const next = q.trim() || undefined;
+    if (next !== submittedQ) setSubmittedQ(next);
+  }
 
   function goNext() {
     if (loading || !nextCursor) return;
     setHistory((h) => [...h, nextCursor]);
-    void load(nextCursor, type);
+    void load(nextCursor, type, submittedQ, sort);
   }
 
   function goPrev() {
@@ -322,7 +252,7 @@ export default function DatasetsPage() {
     // pop 栈顶（当前页的 cursor），load 新栈顶即上一页的 cursor；栈空为 undefined 回第一页
     const prevTop = history.length > 1 ? history[history.length - 2] : undefined;
     setHistory((h) => h.slice(0, -1));
-    void load(prevTop, type);
+    void load(prevTop, type, submittedQ, sort);
   }
 
   async function openDetail(r: DatasetSummary) {
@@ -420,6 +350,33 @@ export default function DatasetsPage() {
           </table>
         </details>
       )}
+      {/* GUI-T4: 搜索框（q 参数，名称/关键词过滤）+ 排序下拉（name/file_count） */}
+      <div className="dataset-toolbar">
+        <div className="dataset-search">
+          <input
+            className="search-box"
+            placeholder="搜索名称/关键词…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && submitSearch()}
+            aria-label="搜索数据集"
+          />
+          <button className="primary" disabled={loading} onClick={submitSearch}>
+            搜索
+          </button>
+        </div>
+        <select
+          className="sort-select"
+          aria-label="排序方式"
+          value={sort}
+          disabled={loading}
+          onChange={(e) => setSort(e.target.value as SortValue)}
+        >
+          <option value="id">默认排序</option>
+          <option value="name">按名称</option>
+          <option value="file_count">按文件数</option>
+        </select>
+      </div>
       <div className="filters">
         {chips.map((t) => (
           <button
@@ -442,80 +399,11 @@ export default function DatasetsPage() {
           下一页
         </button>
       </div>
+      {/* GUI-T4: 详情弹层提取为共享组件（详情+资产+文件+共享按钮，share:// 逻辑自持） */}
       {detail && (
-        <div className="modal" onClick={() => setDetail(null)}>
-          <div className="modal-body" onClick={(e) => e.stopPropagation()}>
-            <h3>{detail.name}</h3>
-            <p>
-              物种: {detail.species ?? "—"} · 路径: {detail.path ?? "—"}
-            </p>
-            <h4>资产</h4>
-            <ul>
-              {detail.assets.map((a) => (
-                <li key={a.id}>
-                  {a.name ?? "—"}（{a.type ?? "—"}）· {a.file_count} 文件
-                </li>
-              ))}
-            </ul>
-            <h4>文件</h4>
-            <ul className="file-list">
-              {files.slice(0, 20).map((f) => (
-                <li key={f.id}>{f.path ?? f.name}</li>
-              ))}
-            </ul>
-            <div className="modal-actions">
-              <button
-                disabled={!detail.path || share.status === "running"}
-                title={detail.path ? "生成配对码，对方凭码接收" : "无本地路径"}
-                onClick={() => detail.path && startShare(detail.path)}
-              >
-                📤 共享
-              </button>
-              {/* T13: 系统文件管理器打开数据集目录；无本地路径时保持禁用 */}
-              <button
-                disabled={!detail.path}
-                title={detail.path ? undefined : "无本地路径"}
-                onClick={() =>
-                  detail.path &&
-                  invoke("open_path", { path: detail.path }).catch(console.error)
-                }
-              >
-                📂 打开目录
-              </button>
-            </div>
-            {share.status !== "idle" && (
-              <div className="share-panel">
-                {share.status === "code" && (
-                  <div className="share-code">
-                    <div className="share-code-label">把下面的配对码发给对方，对方执行：</div>
-                    <div className="share-code-row">
-                      <code className="share-code-value">{share.code}</code>
-                      <button className="secondary copy-btn" onClick={copyCode}>
-                        {copied ? "已复制 ✓" : "📋 复制"}
-                      </button>
-                    </div>
-                    <div className="share-code-cmd">
-                      fan-files transfer get {share.code}
-                    </div>
-                    {/* Minor-4 已知偏差（不改）："24 小时内有效"为硬编码，
-                        与引擎配对码默认有效期 24h 一致（transfer.rs CODE_TTL）；
-                        引擎若改默认需同步此处文案 */}
-                    <div className="share-code-tip">⏳ 配对码 24 小时内有效</div>
-                  </div>
-                )}
-                {/* 共享传输面板（进度/徽标/续传/取消 + 折叠原始日志） */}
-                <TransferPanel
-                  name={detail?.name ?? "共享"}
-                  events={shareEvents}
-                  log={shareRaw}
-                  onCancel={() => void cancelShare()}
-                />
-              </div>
-            )}
-          </div>
-        </div>
+        <DatasetDetailModal detail={detail} files={files} onClose={() => setDetail(null)} />
       )}
-      {/* 续传确认弹窗（resume 事件触发；继续=关弹窗，引擎已自动续传） */}
+      {/* 续传确认弹窗（接收侧 resume 事件触发；继续=关弹窗，引擎已自动续传） */}
       {resumeAsk && (
         <div className="modal" onClick={continueResume}>
           <div className="modal-body" onClick={(e) => e.stopPropagation()}>
