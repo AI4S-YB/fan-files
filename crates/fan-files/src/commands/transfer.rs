@@ -494,69 +494,139 @@ async fn udp_send_path(
     }
 }
 
-/// UDP 直连接收（接收方 = QUIC 客户端）：STUN → 收 hello → ack → 打洞 → quic_connect → 传数据
+/// IPv4 同网段判断（/24）
+fn same_subnet_v4(a: std::net::Ipv4Addr, b: std::net::Ipv4Addr, prefix: u32) -> bool {
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    (u32::from(a) & mask) == (u32::from(b) & mask)
+}
+
+/// UDP 直连接收（接收方 = QUIC 客户端，ICE-lite 多候选顺序尝试）：
+/// 收集自己的 host + srflx 候选 → 回 ack（完整候选列表）→ 按优先级顺序尝试对方候选：
+/// host（同网段免打洞，2s 握手）→ srflx（打洞 3s + QUIC 握手 10s）；
+/// 全部失败 → Err("punch-fail")，调用方降级 relay。
+/// **注意**：指纹不匹配是安全事件（对端证书被篡改/中间人），立即中止返回——
+/// 发送方全程用同一张证书，一个候选不匹配则全部不匹配，降级 relay 即绕过校验。
 async fn udp_get_path(
     wormhole: &mut Wormhole,
     hello: &UdpMsg,
     who: &str,
     output: &Option<String>,
 ) -> Result<(String, u64), String> {
-    // ① 绑 socket + STUN（同 socket）→ 回 udp-ack
-    //    注意：STUN 失败也要回 ack（占位 0.0.0.0:0）——发送方在等 ack，
-    //    不回会让它等满 15s 才降级（浪费时间）。占位地址让双方立即降级。
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind udp: {e}"))?;
-    sock.set_nonblocking(true).map_err(|e| format!("set nonblocking: {e}"))?;
-    let my_addr = local_public_addr(&sock);
-    if my_addr.is_none() {
-        eprintln!("  ⚠ UDP STUN 失败，降级 relay");
+    // ① 收集自己的候选（与发送方对称）：
+    //    - host：每个本地 IPv4 接口绑一个 socket（ip:0 随机端口），同网段对端免打洞直连
+    //    - srflx：0.0.0.0:0 + UDP STUN（同 socket 保证端口映射一致）
+    //    注意：STUN 失败也要回 ack（仅 host 候选）——发送方在等 ack，不回会让它
+    //    等满 15s 才降级（浪费时间）。空候选让双方立即降级。
+    let mut host_socks: Vec<std::net::UdpSocket> = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for ip in local_ipv4_addrs() {
+        if let Ok(s) = std::net::UdpSocket::bind((ip, 0)) {
+            if let Ok(addr) = s.local_addr() {
+                candidates.push(Candidate { kind: "host".into(), addr: addr.to_string(), prio: 30000 });
+            }
+            host_socks.push(s);
+        }
     }
+    let srflx_sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind udp: {e}"))?;
+    srflx_sock.set_nonblocking(true).ok();
+    if let Some(a) = local_public_addr(&srflx_sock) {
+        candidates.push(Candidate { kind: "srflx".into(), addr: a.to_string(), prio: 20000 });
+    }
+    sort_candidates(&mut candidates);
     let nonce = match hello {
         UdpMsg::Hello { nonce, .. } => *nonce,
         _ => return Err("收到意外的 UDP 握手消息".into()),
     };
-    // 占位候选列表：先用 STUN 结果作临时 srflx（Task 4 做完整收集 host+srflx）
-    let ack_candidates: Vec<Candidate> = my_addr
-        .map(|a| vec![Candidate { kind: "srflx".into(), addr: a.to_string(), prio: 20000 }])
-        .unwrap_or_default();
-    wormhole
-        .send_json(&UdpMsg::Ack {
-            candidates: ack_candidates,
-            nonce,
-        })
-        .await
-        .map_err(|e| format!("send udp-ack: {e}"))?;
-    let _ = my_addr; // 占位/真实地址均已随 ack 发出
-    // ② 打洞（复用 STUN 的同一 socket——NAT 端口映射绑定在 socket 上）
-    let direct = match punch_on_socket(sock, hello, who) {
-        Some(d) => d,
-        None => {
-            eprintln!("  ⚠ UDP 打洞失败，降级 relay");
-            return Err("punch-fail".into());
-        }
-    };
-    // ③ QUIC 客户端：连发送方打洞后的真实地址（对称 NAT 下 ≠ 通告地址）
     let expected_fp = match hello {
         UdpMsg::Hello { fingerprint, .. } => fingerprint.clone(),
+        _ => return Err("收到意外的 UDP 握手消息".into()),
+    };
+    wormhole
+        .send_json(&UdpMsg::Ack { candidates, nonce })
+        .await
+        .map_err(|e| format!("send udp-ack: {e}"))?;
+
+    // ② 按优先级顺序尝试对方候选（host 优先直连，srflx 打洞兜底）
+    let peer_cands = match hello {
+        UdpMsg::Hello { candidates, .. } => candidates.clone(),
         _ => unreachable!(),
     };
-    let (endpoint, conn) = crate::commands::quic_link::quic_connect(
-        direct.sock,
-        direct.peer,
-        expected_fp,
-        Duration::from_secs(10),
-    )
-    .await
-    .map_err(|e| format!("quic connect: {e}"))?;
-    // ④ 接收：先读头（含文件名）→ 解析目标路径 → 写文件（与 v1 的 accept 一致）
-    let (filename, received) = quic_recv_file(&conn, output, |done, total| {
-        if total > 0 {
-            eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
+    let mut sorted = peer_cands.clone();
+    sort_candidates(&mut sorted);
+    let local_ips = local_ipv4_addrs();
+
+    for cand in &sorted {
+        match cand.kind.as_str() {
+            // host 直连（免打洞）：同网段预筛 + 逐个 host socket 尝试（2s 握手）
+            "host" => {
+                let peer_ip = cand.addr.split(':').next().unwrap_or("").parse::<std::net::IpAddr>().ok();
+                let same = peer_ip
+                    .map(|p| match p {
+                        std::net::IpAddr::V4(p4) => local_ips.iter().any(|l| same_subnet_v4(*l, p4, 24)),
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                if !same {
+                    eprintln!("  ⚠ host 候选 {} 不同网段，跳过", cand.addr);
+                    continue;
+                }
+                let addr: std::net::SocketAddr = cand.addr.parse().map_err(|_| format!("坏 host 地址: {}", cand.addr))?;
+                for s in &host_socks {
+                    // quic_connect 消费 socket 所有权 → 每个尝试 try_clone 独立 socket
+                    let sock = s.try_clone().map_err(|e| format!("clone: {e}"))?;
+                    eprintln!("  🔗 尝试 host 直连 {} → {}", sock.local_addr().map(|a| a.to_string()).unwrap_or_default(), addr);
+                    match crate::commands::quic_link::quic_connect(sock, addr, expected_fp.clone(), Duration::from_secs(2)).await {
+                        Ok((ep, conn)) => {
+                            let r = quic_recv_file(&conn, output, |d, t| {
+                                if t > 0 { eprintln!("\r  进度: {}/{} ({:.0}%)", d, t, d as f64 / t as f64 * 100.0); }
+                            }).await;
+                            conn.close(0u32.into(), b"done");
+                            drop(ep);
+                            match r {
+                                Ok(v) => {
+                                    eprintln!("  ✅ host 直连成功");
+                                    return Ok(v);
+                                }
+                                Err(e) => eprintln!("  ⚠ host 直连收文件失败: {e}"),
+                            }
+                        }
+                        Err(e) if e.contains("fingerprint") => return Err(e), // 安全事件：中止，绝不降级 relay
+                        Err(e) => { eprintln!("  ⚠ host 直连失败: {e}"); }
+                    }
+                }
+            }
+            // srflx 打洞（最后手段）：打洞 3s + QUIC 握手 10s
+            "srflx" => {
+                let peer_msg = UdpMsg::Hello { candidates: peer_cands.clone(), fingerprint: expected_fp.clone(), nonce };
+                eprintln!("  🔗 尝试 srflx 打洞 {}", cand.addr);
+                match punch_on_socket(srflx_sock.try_clone().map_err(|e| format!("clone: {e}"))?, &peer_msg, who) {
+                    Some(direct) => {
+                        match crate::commands::quic_link::quic_connect(direct.sock, direct.peer, expected_fp.clone(), Duration::from_secs(10)).await {
+                            Ok((ep, conn)) => {
+                                let r = quic_recv_file(&conn, output, |d, t| {
+                                    if t > 0 { eprintln!("\r  进度: {}/{} ({:.0}%)", d, t, d as f64 / t as f64 * 100.0); }
+                                }).await;
+                                conn.close(0u32.into(), b"done");
+                                drop(ep);
+                                match r {
+                                    Ok(v) => {
+                                        eprintln!("  ✅ srflx 打洞直连成功");
+                                        return Ok(v);
+                                    }
+                                    Err(e) => eprintln!("  ⚠ srflx 直连收文件失败: {e}"),
+                                }
+                            }
+                            Err(e) if e.contains("fingerprint") => return Err(e), // 安全事件：中止，绝不降级 relay
+                            Err(e) => { eprintln!("  ⚠ quic_connect 失败: {e}"); }
+                        }
+                    }
+                    None => { eprintln!("  ⚠ srflx 打洞失败"); }
+                }
+            }
+            _ => { /* host6/srflx6 预留 */ }
         }
-    })
-    .await?;
-    conn.close(0u32.into(), b"done");
-    drop(endpoint);
-    Ok((filename, received))
+    }
+    Err("punch-fail".into()) // 全部失败 → 调用方降级 relay
 }
 
 /// 审计日志表
@@ -1015,6 +1085,15 @@ mod tests {
         ];
         sort_candidates(&mut v);
         assert_eq!(v[0].kind, "host", "host 应优先于 srflx");
+    }
+
+    #[test]
+    fn same_subnet_v4_detects_subnet() {
+        let a: std::net::Ipv4Addr = "10.98.103.5".parse().unwrap();
+        let b: std::net::Ipv4Addr = "10.98.103.200".parse().unwrap();
+        let c: std::net::Ipv4Addr = "10.99.0.1".parse().unwrap();
+        assert!(same_subnet_v4(a, b, 24));
+        assert!(!same_subnet_v4(a, c, 24));
     }
 
     #[test]
