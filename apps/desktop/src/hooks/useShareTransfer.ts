@@ -47,6 +47,9 @@ export function useShareTransfer(options?: { onDone?: (ok: boolean) => void }) {
   const [shareRaw, setShareRaw] = useState<string[]>([]);
   // 发起共享的数据集名（TransferPanel 标题；弹层关闭后仍指向原数据集）
   const [shareName, setShareName] = useState("");
+  // 发起共享时的配对码有效期（小时，默认 168 = 7 天，引擎默认）。
+  // 在 startShare 时固化——SharePanel 提示文案用实际选择值（弹层关闭后仍准确）。
+  const [shareTtl, setShareTtl] = useState(168);
   // 续传确认弹窗（resume 事件触发）
   const [shareResume, setShareResume] = useState<ShareResumeAsk | null>(null);
   // 续传弹窗超时（规格 §九：用户不响应默认继续——引擎已自动续传，不阻塞传输）
@@ -115,13 +118,16 @@ export function useShareTransfer(options?: { onDone?: (ok: boolean) => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function startShare(path: string, name: string) {
+  // NR-T5: ttlHours 来自共享弹层有效期选择（缺省 168 = 引擎默认 7 天），
+  // 传给后端 share_dataset 命令 → spawn `--ttl-hours`。
+  async function startShare(path: string, name: string, ttlHours: number = 168) {
     setShareName(name);
+    setShareTtl(ttlHours);
     setShareState({ status: "running" });
     setShareEvents([]);
     setShareRaw([]);
     try {
-      await invoke("share_dataset", { path });
+      await invoke("share_dataset", { path, ttlHours });
     } catch (e) {
       setShareState({ status: "done", ok: false });
       setShareRaw((l) => [...l, `共享启动失败: ${String(e)}`]);
@@ -160,6 +166,7 @@ export function useShareTransfer(options?: { onDone?: (ok: boolean) => void }) {
 
   return {
     share,
+    shareTtl,
     shareEvents,
     shareRaw,
     shareName,

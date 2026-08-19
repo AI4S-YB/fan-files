@@ -81,6 +81,23 @@ export interface FileSummary {
   path: string | null;
 }
 
+// 对话搜索（NR-T5）：messages 为多轮上下文，question 为当前问题
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+// LLM 生成的结构化查询（响应中原样返回，前端可展开展示）
+export interface ChatQuery {
+  keywords: string[];
+  type?: string | null;
+}
+
+export interface ChatSearchResp {
+  query: ChatQuery;
+  results: DatasetSummary[];
+}
+
 // 对应后端 DatasetQuery：q/species/type/cursor/limit/sort/order。
 // sort：id 默认；relevance（需 q）；name/file_count（GUI-T4 数据集页排序下拉）。
 // order 仅 "asc"（服务端校验；order 缺省也按 asc）。
@@ -119,6 +136,18 @@ async function getPage<T>(path: string): Promise<PageEnvelope<T>> {
   return (await r.json()) as PageEnvelope<T>;
 }
 
+// POST + Envelope 包装：{ data: T }（chat-search 等写/语义端点）
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const r = await fetch(`${base}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const data = await r.json();
+  return data.data as T;
+}
+
 export const fetchStats = () => get<Stats>("/api/v1/stats");
 export const fetchDatasets = (q: DatasetQuery = {}) => {
   const params = toParams(q);
@@ -126,6 +155,10 @@ export const fetchDatasets = (q: DatasetQuery = {}) => {
 };
 export const searchDatasets = (q: string) =>
   get<DatasetSummary[]>(`/api/v1/search?q=${encodeURIComponent(q)}`);
+// 对话搜索（NR-T5）：多轮上下文 + 当前问题 → LLM 结构化查询 + 结果。
+// LLM 未配置/失败 → 503（code llm_unavailable），调用方降级基础搜索。
+export const chatSearch = (messages: ChatMessage[], question: string) =>
+  post<ChatSearchResp>("/api/v1/chat-search", { messages, question });
 export const fetchDatasetDetail = (id: number) => get<DatasetDetail>(`/api/v1/datasets/${id}`);
 // 文件分页（详情弹层只取第一页；FileQuery: asset_id/cursor/limit）
 export const fetchFiles = (id: number, cursor?: number) =>

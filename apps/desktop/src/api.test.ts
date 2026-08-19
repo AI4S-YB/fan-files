@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { fetchStats, fetchDatasets, searchDatasets, fetchDatasetDetail, fetchFiles, setApiBase, getApiBase } from "./api";
+import { fetchStats, fetchDatasets, searchDatasets, fetchDatasetDetail, fetchFiles, chatSearch, setApiBase, getApiBase } from "./api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -132,6 +132,37 @@ describe("api client", () => {
     const m = vi.fn().mockResolvedValue({ ok: false, status: 503 });
     vi.stubGlobal("fetch", m);
     await expect(fetchStats()).rejects.toThrow("HTTP 503");
+  });
+
+  // NR-T5: chat-search 为 POST + data envelope（与 fetchDatasets 一致的解包方式）
+  it("chatSearch posts messages and question, unwraps data envelope", async () => {
+    const m = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          query: { keywords: ["水稻", "基因组"], type: "genome" },
+          results: [summary],
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", m);
+    const resp = await chatSearch([{ role: "user", content: "找水稻基因组" }], "再找转录组");
+    const [url, init] = m.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/api/v1/chat-search");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      messages: [{ role: "user", content: "找水稻基因组" }],
+      question: "再找转录组",
+    });
+    expect(resp.query.keywords).toEqual(["水稻", "基因组"]);
+    expect(resp.query.type).toBe("genome");
+    expect(resp.results[0].name).toBe("Oryza_sativa_v1");
+  });
+
+  it("chatSearch throws on 503 (llm unavailable) for fallback", async () => {
+    const m = vi.fn().mockResolvedValue({ ok: false, status: 503 });
+    vi.stubGlobal("fetch", m);
+    await expect(chatSearch([], "水稻")).rejects.toThrow("HTTP 503");
   });
 
   it("setApiBase switches the base port for subsequent calls", async () => {

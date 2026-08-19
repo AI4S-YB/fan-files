@@ -566,4 +566,60 @@ describe("DatasetsPage", () => {
       vi.useRealTimers();
     }
   });
+
+  // NR-T5: 历史面板状态列（码状态机三态：已发码 / 已被使用 (时间) / 已传输完成 (时间)）
+  it("renders the code status column in transfer history (three states)", async () => {
+    const entries = [
+      // 都空 → 已发码
+      { direction: "send", dataset: "A", code: "1-aaa-bbb-ccc", status: "ok", bytes_sent: 1, bytes_received: 0, time: 1787000000, code_used_at: null, completed_at: null },
+      // 仅 code_used_at → 已被使用
+      { direction: "send", dataset: "B", code: "2-aaa-bbb-ccc", status: "ok", bytes_sent: 1, bytes_received: 0, time: 1787000000, code_used_at: 1787100000, completed_at: null },
+      // completed_at（含 code_used_at）→ 已传输完成（终态优先）
+      { direction: "send", dataset: "C", code: "3-aaa-bbb-ccc", status: "ok", bytes_sent: 1, bytes_received: 0, time: 1787000000, code_used_at: 1787100000, completed_at: 1787200000 },
+    ];
+    vi.mocked(invoke).mockResolvedValueOnce(entries).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    expect(await screen.findByText(/传输历史（3）/)).toBeInTheDocument();
+    expect(screen.getByText("已发码")).toBeInTheDocument();
+    expect(screen.getByText(/已被使用 \(/)).toBeInTheDocument();
+    expect(screen.getByText(/已传输完成 \(/)).toBeInTheDocument();
+    // 状态列与传输结果列并存（结果列仍是成功/失败）
+    expect(screen.getAllByText("✓ 成功").length).toBe(3);
+  });
+
+  // NR-T5: 共享弹层有效期选择 → share_dataset 带 ttl_hours（默认 7 天 = 168）
+  it("shares with the selected ttl hours from the modal picker", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce([]).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.click(screen.getByText("Oryza_sativa_v1"));
+    const select = await screen.findByRole("combobox", { name: "共享有效期" });
+    expect(select).toHaveValue("168"); // 默认 7 天
+    fireEvent.change(select, { target: { value: "24" } });
+    fireEvent.click(await screen.findByRole("button", { name: /共享/ }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("share_dataset", {
+        path: "/data/orders/rice",
+        ttlHours: 24,
+      })
+    );
+  });
+
+  it("shares with custom ttl hours entered in the picker", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce([]).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.click(screen.getByText("Oryza_sativa_v1"));
+    const select = await screen.findByRole("combobox", { name: "共享有效期" });
+    fireEvent.change(select, { target: { value: "custom" } });
+    const hours = await screen.findByRole("spinbutton", { name: /自定义有效期/ });
+    fireEvent.change(hours, { target: { value: "10" } });
+    fireEvent.click(await screen.findByRole("button", { name: /共享/ }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("share_dataset", {
+        path: "/data/orders/rice",
+        ttlHours: 10,
+      })
+    );
+  });
 });

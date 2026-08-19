@@ -167,10 +167,101 @@ describe("SearchPage", () => {
     fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
     fireEvent.click(await screen.findByRole("button", { name: /共享/ }));
     await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("share_dataset", { path: "/a/v1" })
+      expect(invoke).toHaveBeenCalledWith("share_dataset", { path: "/a/v1", ttlHours: 168 })
     );
     eventMock.emit("share://code", "8-purple-hammer");
     expect(await screen.findByText("8-purple-hammer")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /取消传输/ })).toBeInTheDocument();
+  });
+
+  // ---------- NR-T5: 对话搜索（有模型 → 对话模式；无模型 → 基础模式；LLM 失败 → 降级） ----------
+
+  // read_config 返回形状（与后端 FanConfig 同构）；api_key 非空 = 已配置模型
+  const llmCfg = {
+    threads: null,
+    include: [],
+    exclude: [],
+    endpoint: "https://api.example.com/v1",
+    api_key: "sk-test",
+    model: "gpt-4o-mini",
+    api_type: "openai",
+  };
+  const result1 = {
+    id: 1,
+    name: "Oryza_sativa_v1",
+    type: "genome",
+    species: "Oryza sativa",
+    path: "/a/v1",
+    file_count: 3,
+    asset_count: 2,
+    summary: null,
+    updated_at: 1787000000,
+  };
+
+  it("renders the conversation UI when llm is configured", async () => {
+    vi.mocked(invoke).mockResolvedValue(llmCfg);
+    render(<SearchPage />);
+    expect(await screen.findByPlaceholderText(/用自然语言描述/)).toBeInTheDocument();
+    // 对话模式无基础搜索框、无"未配置模型"提示
+    expect(screen.queryByPlaceholderText(/搜索你的数据/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/未配置模型/)).not.toBeInTheDocument();
+  });
+
+  it("asks via chatSearch and renders results + expandable llm query", async () => {
+    vi.mocked(invoke).mockResolvedValue(llmCfg);
+    mockedApi.chatSearch.mockResolvedValue({
+      query: { keywords: ["水稻", "基因组"], type: "genome" },
+      results: [result1],
+    });
+    render(<SearchPage />);
+    const input = await screen.findByPlaceholderText(/用自然语言描述/);
+    fireEvent.change(input, { target: { value: "帮我找水稻基因组" } });
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    // 首轮：历史为空
+    await waitFor(() =>
+      expect(mockedApi.chatSearch).toHaveBeenCalledWith([], "帮我找水稻基因组")
+    );
+    expect(await screen.findByText("Oryza_sativa_v1")).toBeInTheDocument();
+    // LLM 查询可展开展示（关键词 + 类型）
+    expect(screen.getByText(/水稻、基因组/)).toBeInTheDocument();
+    // 追问：第二轮带上历史消息（user 问题 + assistant 摘要）
+    fireEvent.change(input, { target: { value: "再找转录组" } });
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() =>
+      expect(mockedApi.chatSearch).toHaveBeenLastCalledWith(
+        [
+          { role: "user", content: "帮我找水稻基因组" },
+          { role: "assistant", content: "找到 1 个数据集" },
+        ],
+        "再找转录组"
+      )
+    );
+  });
+
+  it("renders basic search with hint when llm is not configured", async () => {
+    vi.mocked(invoke).mockResolvedValue({ ...llmCfg, api_key: "" });
+    render(<SearchPage />);
+    expect(await screen.findByPlaceholderText(/搜索你的数据/)).toBeInTheDocument();
+    expect(screen.getByText(/未配置模型，使用基础搜索/)).toBeInTheDocument();
+    // 基础搜索仍可用
+    mockedApi.searchDatasets.mockResolvedValue([result1]);
+    fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), {
+      target: { value: "水稻" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
+    expect(await screen.findByText("Oryza_sativa_v1")).toBeInTheDocument();
+  });
+
+  it("falls back to basic search with a hint when the llm call fails", async () => {
+    vi.mocked(invoke).mockResolvedValue(llmCfg);
+    mockedApi.chatSearch.mockRejectedValue(new Error("HTTP 503"));
+    mockedApi.searchDatasets.mockResolvedValue([result1]);
+    render(<SearchPage />);
+    const input = await screen.findByPlaceholderText(/用自然语言描述/);
+    fireEvent.change(input, { target: { value: "水稻" } });
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    expect(await screen.findByText(/模型调用失败，已切换基础搜索/)).toBeInTheDocument();
+    expect(mockedApi.searchDatasets).toHaveBeenCalledWith("水稻");
+    expect(screen.getByText("Oryza_sativa_v1")).toBeInTheDocument();
   });
 });

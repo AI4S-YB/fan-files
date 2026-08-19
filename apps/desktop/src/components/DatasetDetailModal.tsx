@@ -17,6 +17,9 @@ export default function DatasetDetailModal({
   shareName,
   onShareStart,
   onShareCancel,
+  // NR-T5: 有效期选择（页面级状态，默认 168 = 引擎默认 7 天）
+  ttlHours = 168,
+  onTtlChange,
 }: {
   detail: DatasetDetail;
   files: FileSummary[];
@@ -27,7 +30,11 @@ export default function DatasetDetailModal({
   shareName: string;
   onShareStart: (path: string) => void;
   onShareCancel: () => void;
+  ttlHours?: number;
+  onTtlChange?: (h: number) => void;
 }) {
+  // 下拉值：24 / 168 直选；其他值视为自定义（渲染小时输入框）
+  const customTtl = ttlHours !== 24 && ttlHours !== 168;
   return (
     <div className="modal" onClick={onClose}>
       <div className="modal-body" onClick={(e) => e.stopPropagation()}>
@@ -49,6 +56,38 @@ export default function DatasetDetailModal({
             <li key={f.id}>{f.path ?? f.name}</li>
           ))}
         </ul>
+        {/* NR-T5: 共享有效期选择（24 小时 / 7 天 / 自定义小时），默认 7 天。
+            共享进行中锁定（与共享按钮的 disabled 同步）。 */}
+        <div className="share-ttl">
+          <label htmlFor="share-ttl">有效期</label>
+          <select
+            id="share-ttl"
+            aria-label="共享有效期"
+            value={customTtl ? "custom" : String(ttlHours)}
+            disabled={share.status === "running"}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (onTtlChange) onTtlChange(v === "custom" ? 72 : Number(v));
+            }}
+          >
+            <option value="24">24 小时</option>
+            <option value="168">7 天</option>
+            <option value="custom">自定义</option>
+          </select>
+          {customTtl && (
+            <input
+              type="number"
+              min={1}
+              aria-label="自定义有效期（小时）"
+              defaultValue={ttlHours}
+              disabled={share.status === "running"}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (onTtlChange) onTtlChange(Number.isFinite(v) && v > 0 ? Math.floor(v) : 1);
+              }}
+            />
+          )}
+        </div>
         <div className="modal-actions">
           <button
             disabled={!detail.path || share.status === "running"}
@@ -77,6 +116,7 @@ export default function DatasetDetailModal({
             events={shareEvents}
             log={shareRaw}
             onCancel={onShareCancel}
+            ttlHours={ttlHours}
           />
         )}
       </div>

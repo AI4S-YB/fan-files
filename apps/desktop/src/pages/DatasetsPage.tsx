@@ -42,6 +42,32 @@ interface ResumeAsk {
   total: number;
 }
 
+// 传输历史（transfer log --json 的行；NR-T3 后含码状态机的两态字段）
+interface HistoryEntry {
+  direction: string;
+  dataset: string;
+  code: string;
+  status: string;
+  bytes_sent: number;
+  bytes_received: number;
+  time: number;
+  code_used_at: number | null; // 码被对方使用（配对完成）
+  completed_at: number | null; // 发送方数据发完
+}
+
+// 时间列格式化（秒级时间戳 → 本地时间串；状态列的时间复用）
+function fmtTs(ts: number): string {
+  return new Date(ts * 1000).toLocaleString();
+}
+
+// 配对码状态（Task 3 状态机）：传输完成 > 码被使用 > 已发码。
+// completed_at 优先——完成必然伴随码被使用，展示终态最有信息量。
+function codeStatus(h: HistoryEntry): string {
+  if (h.completed_at) return `已传输完成 (${fmtTs(h.completed_at)})`;
+  if (h.code_used_at) return `已被使用 (${fmtTs(h.code_used_at)})`;
+  return "已发码";
+}
+
 export default function DatasetsPage() {
   const [rows, setRows] = useState<DatasetSummary[]>([]);
   const [nextCursor, setNextCursor] = useState<number | null>(null);
@@ -92,16 +118,8 @@ export default function DatasetsPage() {
   );
   // 传输历史
   const [transferHistory, setTransferHistory] = useState<HistoryEntry[]>([]);
-
-  interface HistoryEntry {
-    direction: string;
-    dataset: string;
-    code: string;
-    status: string;
-    bytes_sent: number;
-    bytes_received: number;
-    time: number;
-  }
+  // NR-T5: 共享有效期（小时），默认 168 = 引擎默认 7 天；弹层选择后随共享传递
+  const [ttlHours, setTtlHours] = useState(168);
 
   async function loadHistory() {
     try {
@@ -123,6 +141,7 @@ export default function DatasetsPage() {
   // onDone → 刷新传输历史，与接收完成对称（修复 [回归 1]）。
   const {
     share,
+    shareTtl,
     shareEvents,
     shareRaw,
     shareName,
@@ -345,6 +364,7 @@ export default function DatasetsPage() {
           events={shareEvents}
           log={shareRaw}
           onCancel={() => void cancelShare()}
+          ttlHours={shareTtl}
         />
       )}
       {/* P2P 传输历史 */}
@@ -358,15 +378,18 @@ export default function DatasetsPage() {
                 <th>方向</th>
                 <th>数据集/码</th>
                 <th>状态</th>
+                <th>结果</th>
                 <th>字节</th>
               </tr>
             </thead>
             <tbody>
               {transferHistory.map((h, i) => (
                 <tr key={i}>
-                  <td className="mono">{new Date(h.time * 1000).toLocaleString()}</td>
+                  <td className="mono">{fmtTs(h.time)}</td>
                   <td>{h.direction === "send" ? "📤 发送" : "📥 接收"}</td>
                   <td className="mono">{h.dataset}</td>
+                  {/* NR-T3: 配对码状态列（已发码 → 已被使用 → 已传输完成） */}
+                  <td>{codeStatus(h)}</td>
                   <td>
                     <span className={h.status === "ok" ? "badge badge-other" : "feedback-err"}>
                       {h.status === "ok" ? "✓ 成功" : "✗ 失败"}
@@ -439,7 +462,9 @@ export default function DatasetsPage() {
           shareEvents={shareEvents}
           shareRaw={shareRaw}
           shareName={shareName}
-          onShareStart={(path) => void startShare(path, detail.name)}
+          ttlHours={ttlHours}
+          onTtlChange={setTtlHours}
+          onShareStart={(path) => void startShare(path, detail.name, ttlHours)}
           onShareCancel={() => void cancelShare()}
         />
       )}

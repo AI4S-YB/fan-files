@@ -328,7 +328,13 @@ fn udp_envs(udp_enabled: bool) -> Vec<(&'static str, &'static str)> {
 /// 命令立即返回，传输在 async runtime 上跑。子进程句柄存入 CURRENT_TRANSFER，
 /// 前端可随时 cancel_transfer。
 #[tauri::command]
-pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result<(), String> {
+pub(crate) async fn share_dataset(
+    app: tauri::AppHandle,
+    path: String,
+    // NR-T5: 配对码有效期（小时），来自 GUI 共享弹层的有效期选择（24h/7天/自定义）。
+    // None（旧前端）→ 不传 --ttl-hours，引擎用默认 168h（7 天）。
+    ttl_hours: Option<u64>,
+) -> Result<(), String> {
     // config [transfer] → --chunk-size(字节)/--concurrency（缺省 4MB/4）+ udp_enabled
     let (chunk_bytes, concurrency, udp_enabled) = transfer_cli_params();
     let handle = app.clone();
@@ -341,18 +347,18 @@ pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result
         for (k, v) in udp_envs(udp_enabled) {
             cmd.env(k, v);
         }
-        let mut child = match cmd
-            .arg("transfer")
+        cmd.arg("transfer")
             .arg("send")
             .arg(&path)
             .arg("--chunk-size")
             .arg(chunk_bytes.to_string())
             .arg("--concurrency")
-            .arg(concurrency.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .arg(concurrency.to_string());
+        // NR-T5: 共享弹层选择的有效期 → --ttl-hours（引擎 transfer send 的码有效期）
+        if let Some(ttl) = ttl_hours {
+            cmd.arg("--ttl-hours").arg(ttl.to_string());
+        }
+        let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
             Ok(c) => c,
             Err(e) => {
                 let _ = handle.emit("share://error", e.to_string());
