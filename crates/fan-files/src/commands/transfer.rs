@@ -70,6 +70,10 @@ enum UdpMsg {
         candidates: Vec<Candidate>,
         nonce: u64,
     },
+    /// 接收方 → 发送方：所有候选尝试失败，放弃 UDP 直连。
+    /// 发送方收到后立即降级 relay（不等 accept 超时 15s）。
+    /// 相位对称：双方各多收发 1 条消息，v1 降级仍对齐。
+    Abort,
 }
 
 /// 一条直连候选（ICE-lite 风格）
@@ -171,11 +175,13 @@ fn punch_on_socket(
     // 从对方候选列表里找 srflx（打洞目标 = 公网反射地址）
     let cands = match peer_msg {
         UdpMsg::Hello { candidates, .. } | UdpMsg::Ack { candidates, .. } => candidates,
+        UdpMsg::Abort => return None,
     };
     let srflx = cands.iter().find(|c| c.kind == "srflx")?;
     let peer_addr: std::net::SocketAddr = srflx.addr.parse().ok()?;
     let nonce = match peer_msg {
         UdpMsg::Hello { nonce, .. } | UdpMsg::Ack { nonce, .. } => *nonce,
+        UdpMsg::Abort => return None,
     };
     // 对方 STUN 失败时会通告空候选 → 立即降级
     if peer_addr.ip().is_unspecified() {
@@ -443,34 +449,61 @@ async fn udp_send_path(
         }
     };
 
-    // ③ 多端监听：host sockets 直接 listen（同网段免打洞）+ srflx socket 打洞后 listen
+    // ③ 多端监听：host sockets 直接 listen（同网段免打洞）+ srflx socket 打洞后 listen。
     //    cert/key 需 clone 给多个 quic_listen；endpoint 持有各自 socket 所有权。
+    //    关键：打洞（阻塞 ≤3s）放进后台线程，accept 循环立即开始——否则 host 端握手
+    //    在打洞期间无人驱动（quinn 不 poll accept 就不推进握手），接收方 2s 超时内
+    //    连入的 host 连接会被饿死（实测竞态：第一候选失败、第二候选才成功）。
     let mut endpoints: Vec<quinn::Endpoint> = Vec::new();
     for s in host_socks {
         if let Ok(ep) = crate::commands::quic_link::quic_listen(s, cert.clone(), key.clone_key()).await {
             endpoints.push(ep);
         }
     }
-    if my_public.is_some() {
+    // srflx 打洞在后台线程执行（需要 'static：srflx_sock/cert/key 移入线程，
+    // ack_msg 所需数据克隆）。打洞成功后的 endpoint 经 std channel 送进 accept 循环。
+    let (srflx_tx, srflx_rx) = std::sync::mpsc::channel::<quinn::Endpoint>();
+    let punch_ready = my_public.is_some();
+    if punch_ready {
+        let tx = srflx_tx.clone();
         let ack_msg = UdpMsg::Ack { candidates: peer_cands.clone(), nonce };
-        // 复用 STUN 的同一 socket 打洞——NAT 端口映射绑定在 socket 上，换 socket 端口映射就变了
-        if let Some(direct) = punch_on_socket(srflx_sock, &ack_msg, who) {
-            if let Ok(ep) = crate::commands::quic_link::quic_listen(direct.sock, cert, key).await {
-                endpoints.push(ep);
+        let who = who.to_string();
+        std::thread::spawn(move || {
+            // 复用 STUN 的同一 socket 打洞——NAT 端口映射绑定在 socket 上
+            if let Some(direct) = punch_on_socket(srflx_sock, &ack_msg, &who) {
+                let ep_fut = crate::commands::quic_link::quic_listen(direct.sock, cert, key);
+                // quic_listen 是 async fn，需要小型 executor 驱动；用 async_io 的
+                // block_on 跑完再 send（打洞线程本来就是阻塞线程，可接受）
+                let ep = async_io::block_on(ep_fut);
+                if let Ok(ep) = ep {
+                    let _ = tx.send(ep);
+                }
             }
-        }
+        });
     }
-    if endpoints.is_empty() {
+    if endpoints.is_empty() && !punch_ready {
         eprintln!("  ⚠ 无可监听端点，降级 relay");
         return Err("no-endpoints".into());
     }
 
-    // ④ accept 循环（15s 超时）：轮询各 endpoint 的非阻塞 accept，任一成功即用
-    //    quinn::Incoming 不可 Clone，每次拿到新的 Incoming 直接 await 驱动握手；
-    //    握手失败（坏连接/指纹不匹配）继续轮询下一个，容忍。
-    //    （quinn 0.11 的 accept() 返回 Accept future 而非 Option，用 poll_once 非阻塞轮询）
+    // ④ accept 循环（15s 超时）：轮询各 endpoint 的非阻塞 accept + srflx channel，
+    //    任一成功即用。quinn::Incoming 不可 Clone，每次拿到新的 Incoming 直接
+    //    await 驱动握手；握手失败（坏连接/指纹不匹配）继续轮询下一个，容忍。
+    //    同时非阻塞监听 wormhole：对方发 Abort（候选全失败）→ 立即降级，不等超时。
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
+        // 先收打洞线程送来的 srflx endpoint（非阻塞）
+        if let Ok(ep) = srflx_rx.try_recv() {
+            eprintln!("  🔗 srflx 打洞成功，加入监听");
+            endpoints.push(ep);
+        }
+        // 非阻塞检查对方是否放弃 UDP（Abort）
+        // 安全：接收方仅在全部候选失败时发 Abort（成功则走 QUIC 连接，不发任何消息），
+        // 相位对齐不受影响（各端计数独立，见 UdpMsg 注释）。
+        if let Some(Ok(Ok(UdpMsg::Abort))) = futures_lite::future::poll_once(wormhole.receive_json::<UdpMsg>()).await {
+            eprintln!("  ⚠ 对方放弃 UDP 直连，降级 relay");
+            return Err("peer-abort".into());
+        }
         for ep in &endpoints {
             if let Some(Some(incoming)) = futures_lite::future::poll_once(ep.accept()).await {
                 match incoming.await {
@@ -631,6 +664,9 @@ async fn udp_get_path(
             _ => { /* host6/srflx6 预留 */ }
         }
     }
+    // 全部失败：通知发送方放弃 UDP（它收到 Abort 立即降级，不必等 accept 超时 15s）。
+    // 相位对称：双方各多收发 1 条消息，v1 降级仍对齐（见 UdpMsg 注释）。
+    let _ = wormhole.send_json(&UdpMsg::Abort).await;
     Err("punch-fail".into()) // 全部失败 → 调用方降级 relay
 }
 
