@@ -126,7 +126,9 @@ fn app_config() -> magic_wormhole::AppConfig<serde_json::Value> {
     // 而本方直接走 v1 发 transit，对端消费掉 transit 后 v1 死锁。
     let mut abilities = vec!["transfer-v1"];
     if !udp_disabled() {
-        abilities.push("udp-hole-punch");
+        // 能力名带协议版本：UdpMsg v2（候选列表）与 v1（单 addr）互不兼容，
+        // 用不同能力名让新旧端在协商层即区分，避免 hello 解析失败 + 相位错乱
+        abilities.push("udp-hole-punch-v2");
     }
     magic_wormhole::AppConfig {
         id: APP_CONFIG.id.clone(),
@@ -139,17 +141,20 @@ fn app_config() -> magic_wormhole::AppConfig<serde_json::Value> {
     }
 }
 
-/// 对端是否声明支持 UDP 打洞（版本消息在 wormhole connect 时已交换，无需额外消息）
+/// 对端是否声明支持 UDP 打洞 v2（候选列表协议）
+/// 版本消息在 wormhole connect 时已交换，无需额外消息。
+/// **能力名带版本**：v1（单 addr）与 v2（candidates）互不兼容，必须精确匹配
+/// "udp-hole-punch-v2"——否则新版发 hello 给旧版会被解析失败并导致相位错乱。
 fn peer_supports_udp(wormhole: &Wormhole) -> bool {
     let v = wormhole.peer_version();
     // 新版：{"app-version": {"abilities": [...]}}
     let app = v.get("app-version");
     if let Some(a) = app.and_then(|a| a.get("abilities")).and_then(|a| a.as_array()) {
-        return a.iter().any(|s| s.as_str() == Some("udp-hole-punch"));
+        return a.iter().any(|s| s.as_str() == Some("udp-hole-punch-v2"));
     }
     // 旧版 fan-files：直接就是 transfer::AppVersion 序列化（abilities 数组）
     if let Some(a) = v.get("abilities").and_then(|a| a.as_array()) {
-        return a.iter().any(|s| s.as_str() == Some("udp-hole-punch"));
+        return a.iter().any(|s| s.as_str() == Some("udp-hole-punch-v2"));
     }
     false
 }
