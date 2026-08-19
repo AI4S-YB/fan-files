@@ -1,3 +1,4 @@
+pub mod chunked;
 pub mod daemon;
 pub mod datasets;
 pub mod discover;
