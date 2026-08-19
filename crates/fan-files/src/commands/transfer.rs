@@ -10,15 +10,15 @@
 //!
 //! ## UDP 打洞握手（自定义协议，经 Wormhole 通道）
 //!
-//! 发送方先发 `udp-hello`（含本方公网地址 + QUIC 证书指纹），接收方先收 2 秒：
-//! 收到 `udp-hello` → 回 `udp-ack`（本方地址 + 指纹）→ 双方打洞 → QUIC 直连；
+//! 发送方先发 `udp-hello`（候选列表 + QUIC 证书指纹），接收方先收 2 秒：
+//! 收到 `udp-hello` → 回 `udp-ack`（候选列表）→ 双方打洞 → QUIC 直连；
 //! 收到 `transit`（旧版发送方）或超时 → 自动降级 v1 relay 路径（兼容旧版）。
 //! 方向约定：**发送方 = QUIC 服务端**（quic_listen），**接收方 = QUIC 客户端**
 //! （quic_connect，连发送方打洞后的真实地址）。
 //!
-//! 对称 NAT 支持：各端用打洞 socket 做 UDP STUN 取公网地址通告；收到对端打洞包
-//! 即学到对端真实源地址（对称 NAT 下与通告地址不同）。指纹不匹配 → 中止报错，
-//! 绝不降级 relay（安全问题，见规格 §七）。
+//! 对称 NAT 支持：各端用打洞 socket 做 UDP STUN 取公网地址，作为 srflx 候选通告；
+//! 收到对端打洞包即学到对端真实源地址（对称 NAT 下与通告地址不同）。指纹不匹配
+//! → 中止报错，绝不降级 relay（安全问题，见规格 §七）。
 //! 环境开关 `FAN_NO_UDP=1` 禁用打洞，直接走 relay。
 
 use fan_core::config::{dirs_fan, DataLayer, Config};
@@ -59,15 +59,15 @@ fn udp_disabled() -> bool {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 enum UdpMsg {
-    /// 发送方 → 接收方：本方公网地址 + QUIC 证书指纹
+    /// 发送方 → 接收方：候选列表 + QUIC 证书指纹
     Hello {
-        addr: String,
+        candidates: Vec<Candidate>,
         fingerprint: String,
         nonce: u64,
     },
-    /// 接收方 → 发送方：本方公网地址（回执）
+    /// 接收方 → 发送方：候选列表（回执）
     Ack {
-        addr: String,
+        candidates: Vec<Candidate>,
         nonce: u64,
     },
 }
@@ -163,13 +163,16 @@ fn punch_on_socket(
     peer_msg: &UdpMsg,
     who: &str,
 ) -> Option<UdpDirect> {
-    let (peer_addr, nonce) = match peer_msg {
-        UdpMsg::Hello { addr, nonce, .. } | UdpMsg::Ack { addr, nonce } => {
-            let addr: std::net::SocketAddr = addr.parse().ok()?;
-            (addr, *nonce)
-        }
+    // 从对方候选列表里找 srflx（打洞目标 = 公网反射地址）
+    let cands = match peer_msg {
+        UdpMsg::Hello { candidates, .. } | UdpMsg::Ack { candidates, .. } => candidates,
     };
-    // 对方 STUN 失败时会通告 0.0.0.0:0（占位）→ 无需打洞，立即降级
+    let srflx = cands.iter().find(|c| c.kind == "srflx")?;
+    let peer_addr: std::net::SocketAddr = srflx.addr.parse().ok()?;
+    let nonce = match peer_msg {
+        UdpMsg::Hello { nonce, .. } | UdpMsg::Ack { nonce, .. } => *nonce,
+    };
+    // 对方 STUN 失败时会通告空候选 → 立即降级
     if peer_addr.ip().is_unspecified() {
         return None;
     }
@@ -396,9 +399,13 @@ async fn udp_send_path(
     if my_addr.is_none() {
         eprintln!("  ⚠ UDP STUN 失败，降级 relay");
     }
+    // 占位候选列表：先用 STUN 结果作临时 srflx（Task 3 做完整收集 host+srflx）
+    let hello_candidates: Vec<Candidate> = my_addr
+        .map(|a| vec![Candidate { kind: "srflx".into(), addr: a.to_string(), prio: 20000 }])
+        .unwrap_or_default();
     wormhole
         .send_json(&UdpMsg::Hello {
-            addr: my_addr.map(|a| a.to_string()).unwrap_or_else(|| "0.0.0.0:0".into()),
+            candidates: hello_candidates,
             fingerprint: fp,
             nonce,
         })
@@ -417,7 +424,10 @@ async fn udp_send_path(
         }
     };
     let peer_hello = match &peer_msg {
-        UdpMsg::Ack { .. } => peer_msg,
+        UdpMsg::Ack { candidates, .. } => {
+            eprintln!("  ✅ 收到 udp-ack（{} 个候选）", candidates.len());
+            peer_msg
+        }
         UdpMsg::Hello { .. } => return Err("收到意外的 UDP 握手消息".into()),
     };
     let _ = my_addr; // 公网地址已随 hello 发出，这里仅用于 STUN 成功判定
@@ -473,9 +483,13 @@ async fn udp_get_path(
         UdpMsg::Hello { nonce, .. } => *nonce,
         _ => return Err("收到意外的 UDP 握手消息".into()),
     };
+    // 占位候选列表：先用 STUN 结果作临时 srflx（Task 4 做完整收集 host+srflx）
+    let ack_candidates: Vec<Candidate> = my_addr
+        .map(|a| vec![Candidate { kind: "srflx".into(), addr: a.to_string(), prio: 20000 }])
+        .unwrap_or_default();
     wormhole
         .send_json(&UdpMsg::Ack {
-            addr: my_addr.map(|a| a.to_string()).unwrap_or_else(|| "0.0.0.0:0".into()),
+            candidates: ack_candidates,
             nonce,
         })
         .await
@@ -970,5 +984,28 @@ mod tests {
         ];
         sort_candidates(&mut v);
         assert_eq!(v[0].kind, "host", "host 应优先于 srflx");
+    }
+
+    #[test]
+    fn udp_msg_candidates_roundtrip() {
+        let m = UdpMsg::Hello {
+            candidates: vec![
+                Candidate { kind: "host".into(), addr: "10.0.0.5:3000".into(), prio: 30000 },
+                Candidate { kind: "srflx".into(), addr: "1.2.3.4:4000".into(), prio: 20000 },
+            ],
+            fingerprint: "f".repeat(64),
+            nonce: 42,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: UdpMsg = serde_json::from_str(&json).unwrap();
+        match back {
+            UdpMsg::Hello { candidates, fingerprint, nonce } => {
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].kind, "host");
+                assert_eq!(fingerprint.len(), 64);
+                assert_eq!(nonce, 42);
+            }
+            _ => panic!("应为 Hello"),
+        }
     }
 }
