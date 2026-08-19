@@ -41,7 +41,8 @@ pub fn run() {
             commands::share_dataset,
             commands::receive_dataset,
             commands::cancel_transfer,
-            commands::transfer_history
+            commands::transfer_history,
+            commands::read_cc_switch
         ])
         .setup(|app| {
             use tauri::{

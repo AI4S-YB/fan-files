@@ -25,7 +25,7 @@ describe("SharePanel", () => {
       />
     );
     expect(screen.getByText("8-purple-hammer")).toBeInTheDocument();
-    expect(screen.getByText(/24 小时内有效/)).toBeInTheDocument();
+    expect(screen.getByText(/7 天内有效/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /复制/ }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("8-purple-hammer"));
     expect(await screen.findByText("已复制 ✓")).toBeInTheDocument();

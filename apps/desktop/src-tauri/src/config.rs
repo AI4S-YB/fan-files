@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// GUI 视角的 ~/.fan-files/config.toml（与 CLI 共享同一文件）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FanConfig {
     pub threads: Option<usize>,
     pub include: Vec<String>,
@@ -10,6 +10,28 @@ pub struct FanConfig {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
+    /// "openai"（默认，OpenAI 兼容）| "anthropic"——与引擎 LlmConfig.api_type 同键
+    #[serde(default = "default_api_type")]
+    pub api_type: String,
+}
+
+/// 与引擎默认一致：旧 config.toml 无 llm.api_type → openai
+fn default_api_type() -> String {
+    "openai".into()
+}
+
+impl Default for FanConfig {
+    fn default() -> Self {
+        Self {
+            threads: None,
+            include: vec![],
+            exclude: vec![],
+            endpoint: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            api_type: default_api_type(),
+        }
+    }
 }
 
 pub(crate) fn config_path() -> PathBuf {
@@ -70,6 +92,12 @@ pub(crate) fn read_config_at(path: &Path) -> Result<FanConfig, String> {
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .into(),
+        api_type: v
+            .get("llm")
+            .and_then(|l| l.get("api_type"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(default_api_type),
     })
 }
 
@@ -131,6 +159,7 @@ pub(crate) fn write_config_at(path: &Path, cfg: FanConfig) -> Result<(), String>
             llm.insert("endpoint".into(), toml::Value::String(cfg.endpoint.clone()));
             llm.insert("api_key".into(), toml::Value::String(cfg.api_key.clone()));
             llm.insert("model".into(), toml::Value::String(cfg.model.clone()));
+            llm.insert("api_type".into(), toml::Value::String(cfg.api_type.clone()));
             llm
         }),
     );
@@ -326,6 +355,7 @@ mod tests {
             endpoint: "http://182.92.166.143:3200/v1/chat/completions".into(),
             api_key: "sk-test".into(),
             model: "DSv4-flash".into(),
+            api_type: "openai".into(),
         }
     }
 
@@ -493,6 +523,37 @@ model = "DSv4-flash"
         assert_eq!(cfg.endpoint, "http://182.92.166.143:3200/v1/chat/completions");
         assert_eq!(cfg.api_key, "sk-jgv6-example");
         assert_eq!(cfg.model, "DSv4-flash");
+        cleanup(&p);
+    }
+
+    /// 旧 config.toml 无 llm.api_type → 默认 openai（与引擎 LlmConfig 默认一致）
+    #[test]
+    fn read_config_missing_api_type_defaults_to_openai() {
+        let p = temp_config_path("legacy-api-type");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            "[llm]\nendpoint = \"http://x\"\napi_key = \"\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = read_config_at(&p).unwrap();
+        assert_eq!(cfg.api_type, "openai");
+        cleanup(&p);
+    }
+
+    /// api_type roundtrip：anthropic 写入后读回保留（GUI 设置页下拉与引擎 [llm].api_type 对齐）
+    #[test]
+    fn write_config_roundtrips_api_type() {
+        let p = temp_config_path("api-type-roundtrip");
+        cleanup(&p);
+        let mut dto = sample_config();
+        dto.api_type = "anthropic".into();
+        write_config_at(&p, dto.clone()).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("api_type = \"anthropic\""), "llm.api_type 应写入:\n{raw}");
+        let back = read_config_at(&p).unwrap();
+        assert_eq!(back.api_type, "anthropic");
         cleanup(&p);
     }
 

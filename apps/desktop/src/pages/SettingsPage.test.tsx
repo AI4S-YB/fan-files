@@ -203,4 +203,69 @@ describe("SettingsPage", () => {
     fireEvent.click(await screen.findByRole("button", { name: /选择目录/ }));
     await waitFor(() => expect(screen.getByDisplayValue("/data/received")).toBeInTheDocument());
   });
+
+  // NR-T4: 从 CC Switch 接管 → read_cc_switch → 填充 endpoint/api_key/model/api_type
+  it("takes over CC Switch config and fills the model form", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValueOnce({
+        api_type: "anthropic",
+        base_url: "http://10.33.105.218:3200",
+        api_key: "sk-cc",
+        model: "claude-sonnet-4-8",
+      });
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "从 CC Switch 接管" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("read_cc_switch"));
+    expect(screen.getByLabelText("Endpoint")).toHaveValue("http://10.33.105.218:3200");
+    expect(screen.getByLabelText("API Key")).toHaveValue("sk-cc");
+    expect(screen.getByLabelText("模型名称")).toHaveValue("claude-sonnet-4-8");
+    expect(screen.getByLabelText("API 类型")).toHaveValue("anthropic");
+    expect(screen.getByText(/已从 CC Switch 接管：Anthropic/)).toBeInTheDocument();
+  });
+
+  // NR-T4: 无 CC Switch 配置 → 显示错误提示（read_cc_switch 的 Err 原样展示）
+  it("shows error when CC Switch config is not found", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockRejectedValueOnce(new Error("未找到 CC Switch 配置"));
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "从 CC Switch 接管" }));
+    await waitFor(() =>
+      expect(screen.getByText(/未找到 CC Switch 配置/)).toBeInTheDocument()
+    );
+    expect(screen.getByLabelText("Endpoint")).toHaveValue("");
+  });
+
+  // NR-T4: API 类型下拉切换后保存 → write_config 的 cfg 含 api_type
+  it("saves api_type with the config when the dropdown changes", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce({ ...DEFAULT_CFG, api_type: "openai" })
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValue(undefined);
+    render(<SettingsPage />);
+    const select = await screen.findByLabelText("API 类型");
+    expect(select).toHaveValue("openai");
+    fireEvent.change(select, { target: { value: "anthropic" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "write_config",
+        expect.objectContaining({
+          cfg: expect.objectContaining({ api_type: "anthropic" }),
+        })
+      )
+    );
+  });
+
+  // NR-T4: 账号与崖州湾试用占位区已删除
+  it("does not render the account/placeholder section", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(DEFAULT_CFG).mockResolvedValueOnce(TRANSFER_CFG);
+    render(<SettingsPage />);
+    await screen.findByRole("button", { name: "保存配置" });
+    expect(screen.queryByText(/账号与崖州湾试用/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/即将上线/)).not.toBeInTheDocument();
+  });
 });

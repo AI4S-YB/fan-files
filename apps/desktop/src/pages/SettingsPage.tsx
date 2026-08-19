@@ -10,9 +10,26 @@ interface FanConfig {
   endpoint: string;
   api_key: string;
   model: string;
+  api_type: string; // "openai"（OpenAI 兼容）| "anthropic"，与引擎 [llm].api_type 同键
 }
 
-const EMPTY: FanConfig = { threads: null, include: [], exclude: [], endpoint: "", api_key: "", model: "" };
+// CC Switch 端点（fan-core LlmEndpoint 形状，`fan-files config cc-switch` 输出）
+interface CcEndpoint {
+  api_type: string;
+  base_url: string;
+  api_key: string;
+  model: string;
+}
+
+const EMPTY: FanConfig = {
+  threads: null,
+  include: [],
+  exclude: [],
+  endpoint: "",
+  api_key: "",
+  model: "",
+  api_type: "openai",
+};
 
 // [transfer] 段（与后端 read_transfer_config 返回形状一致：chunk_size_mb/concurrency/
 // receive_dir/udp_enabled；缺失键回退默认）
@@ -39,6 +56,10 @@ export default function SettingsPage() {
   const [testError, setTestError] = useState<string | null>(null);
   const [testRunning, setTestRunning] = useState(false);
   const [updateText, setUpdateText] = useState<string | null>(null);
+  // CC Switch 接管（read_cc_switch → 填充模型配置表单）
+  const [ccRunning, setCcRunning] = useState(false);
+  const [ccSource, setCcSource] = useState<string | null>(null);
+  const [ccError, setCcError] = useState<string | null>(null);
   // 传输参数（[transfer] 段，独立加载/保存）
   const [transfer, setTransfer] = useState<TransferCfg>(DEFAULT_TRANSFER);
   const [transferSaved, setTransferSaved] = useState(false);
@@ -128,6 +149,31 @@ export default function SettingsPage() {
       setUpdateText(out);
     } catch (e) {
       setUpdateText(`检查更新失败：${String(e)}`);
+    }
+  };
+
+  // NR-T4: 从 CC Switch 接管——读取当前激活 profile 的 LLM 端点并填充表单
+  // （api_type/endpoint/api_key/model 一并带入；来源提示显示协议类型）
+  const takeoverCcSwitch = async () => {
+    setCcRunning(true);
+    setCcError(null);
+    setCcSource(null);
+    try {
+      const ep = await invoke<CcEndpoint>("read_cc_switch");
+      setCfg((c) => ({
+        ...c,
+        endpoint: ep.base_url,
+        api_key: ep.api_key,
+        model: ep.model,
+        api_type: ep.api_type === "anthropic" ? "anthropic" : "openai",
+      }));
+      setSaved(false);
+      setError(null);
+      setCcSource(ep.api_type === "anthropic" ? "Anthropic" : "OpenAI 兼容");
+    } catch (e) {
+      setCcError(String(e));
+    } finally {
+      setCcRunning(false);
     }
   };
 
@@ -277,6 +323,32 @@ export default function SettingsPage() {
 
       <section className="settings-section">
         <h3>模型配置</h3>
+        {/* NR-T4: 从 CC Switch 接管——读取当前激活 profile 并填充下方表单 */}
+        <div className="field cc-switch-row">
+          <span>CC Switch 配置</span>
+          <button
+            className="secondary"
+            onClick={takeoverCcSwitch}
+            disabled={ccRunning}
+          >
+            {ccRunning ? "读取中…" : "从 CC Switch 接管"}
+          </button>
+          {ccSource && (
+            <span className="feedback-ok">已从 CC Switch 接管：{ccSource}</span>
+          )}
+          {ccError && <span className="feedback-err">{ccError}</span>}
+        </div>
+        <label className="field" htmlFor="api-type">
+          <span>API 类型</span>
+          <select
+            id="api-type"
+            value={cfg.api_type}
+            onChange={(e) => patch("api_type", e.target.value)}
+          >
+            <option value="openai">OpenAI 兼容</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+        </label>
         <label className="field" htmlFor="endpoint">
           <span>Endpoint</span>
           <input id="endpoint" value={cfg.endpoint} onChange={(e) => patch("endpoint", e.target.value)} />
@@ -305,11 +377,6 @@ export default function SettingsPage() {
               连接失败（{testResult.ms}ms）{testError ? `：${testError}` : ""}
             </span>
           ))}
-      </section>
-
-      <section className="settings-section">
-        <h3>账号与崖州湾试用</h3>
-        <p className="settings-hint">账号管理与崖州湾试用功能即将上线，敬请期待。</p>
       </section>
 
       <section className="settings-section">

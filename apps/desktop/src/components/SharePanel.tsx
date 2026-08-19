@@ -41,10 +41,9 @@ export default function SharePanel({ name, code, events, log, onCancel }: Props)
           <div className="share-code-cmd">
             fan-files transfer get {code}
           </div>
-          {/* Minor-4 已知偏差（不改）："24 小时内有效"为硬编码，
-              与引擎配对码默认有效期 24h 一致（transfer.rs CODE_TTL）；
+          {/* NR-T4 文案同步：配对码默认有效期 7 天（引擎 transfer.rs CODE_TTL=168h）；
               引擎若改默认需同步此处文案 */}
-          <div className="share-code-tip">⏳ 配对码 24 小时内有效</div>
+          <div className="share-code-tip">⏳ 配对码 7 天内有效</div>
         </div>
       )}
       {/* 共享传输面板（进度/徽标/续传/取消 + 折叠原始日志） */}

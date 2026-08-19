@@ -141,6 +141,23 @@ pub(crate) async fn check_update() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// 读取 CC Switch 当前激活 profile 的 LLM 端点（spawn `fan-files config cc-switch`）。
+/// 返回 {"api_type","base_url","api_key","model"}；未找到配置（引擎退出码 1）→
+/// Err("未找到 CC Switch 配置")，前端显示在"从 CC Switch 接管"按钮旁。
+/// 二进制定位走 engine::sidecar_bin（与 check_update 同模式）。
+#[tauri::command]
+pub(crate) fn read_cc_switch() -> Result<serde_json::Value, String> {
+    let out = std::process::Command::new(crate::engine::sidecar_bin("fan-files"))
+        .args(["config", "cc-switch"])
+        .output()
+        .map_err(|e| format!("读取 CC Switch 配置失败: {e}"))?;
+    if !out.status.success() {
+        return Err("未找到 CC Switch 配置".into());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).map_err(|e| format!("解析 CC Switch 配置失败: {e}"))
+}
+
 /// share 实际监听端口（可能因冲突回退，前端用它动态设置 API base）。
 #[tauri::command]
 pub(crate) fn get_share_port() -> u16 {
