@@ -52,7 +52,9 @@
 //!   注意：release profile 为 `panic = "abort"`，catch_unwind 仅在 debug 构建
 //!   生效——release 下该 panic 仍会终止进程（库层无法拦截，见 CR 记录）。
 //! - 每码超时：接收方 `request_file` 30s（弃置码不永久挂起）、`accept` 300s；
-//!   主通道 600s 整体超时；槽位等待与收尾等待均有 deadline，超时放弃 detach
+//!   发送方每块 `send_file` 60s（cancel 定时器 + flag 区分真假成功——库层把取消
+//!   映射为 Ok(())，接收方崩溃/不 get 时不再永久挂起）；主通道 600s 整体超时
+//!   （发送方与接收方对称）；槽位等待与收尾等待均有 deadline，超时放弃 detach
 //!   的 worker 线程（清单保留可续传），不无条件 join。
 
 use crate::commands::chunked;
@@ -782,41 +784,71 @@ impl futures_lite::io::AsyncWrite for OffsetWriter {
 /// code_tx 交主任务转发 RelayChunk → transfer::send_file 传块数据。
 /// 块数据为内存缓冲（4MB 级）——send_file 接受任意 AsyncRead，无需临时文件；
 /// 块级 SHA-256 由 magic-wormhole v1 协议自带（offer 内 digest 校验）。
+///
+/// **每块 60s 整体超时**（与接收方对称）：整个会话（建连 + 配对 + 发送）受 60s
+/// deadline 约束；send_file 的 cancel 定时器到点触发库层优雅取消（向对端发错误
+/// 消息 + 关会话）。此前 cancel=pending——接收方崩溃/不 get 时 worker 在 send_file
+/// 永久挂起、发送方永不退出（实测复现），现在 ≤60s 判失败 → 重试 ≤3 次 → 整体退出。
+/// 注意库层把"取消"映射为 send_file 返回 Ok(())（handle_run_result 的 Cancelled
+/// 分支），必须用 flag 区分定时器已触发与真实成功，否则超时会被误判为块已送达。
 async fn relay_send_one_chunk(
     code_tx: &std::sync::mpsc::Sender<RelayCodeMsg>,
     hints: &[transit::RelayHint],
     buf: &[u8],
     index: u32,
 ) -> Result<(), String> {
-    let mailbox = MailboxConnection::create(app_config(), 3)
-        .await
-        .map_err(|e| format!("创建 relay 会话: {e}"))?;
-    let code = mailbox.code().to_string();
-    code_tx
-        .send(RelayCodeMsg::Relay { index, code })
-        .map_err(|_| "主通道已关闭".to_string())?;
-    let wormhole = Wormhole::connect(mailbox)
-        .await
-        .map_err(|e| format!("Wormhole 连接: {e}"))?;
-    let mut cursor = async_std::io::Cursor::new(buf.to_vec());
-    transfer::send_file(
-        wormhole,
-        hints.to_vec(),
-        &mut cursor,
-        format!("chunk-{index}"),
-        buf.len() as u64,
-        transit::Abilities::ALL,
-        |_| {},       // relay 路径连接类型不展示
-        |_, _| {},    // 块粒度进度由 relay_send_chunks 聚合（与 quic_send_chunks 一致）
-        std::future::pending::<()>(),
+    // 超时标志：cancel 定时器到点置位（库层取消后 send_file 返回 Ok(())，靠它
+    // 区分真假成功）。外层 race 兜底建连/配对阶段（cancel 只覆盖 send_file 内部）。
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = timed_out.clone();
+    let res = futures_lite::future::or(
+        async {
+            let mailbox = MailboxConnection::create(app_config(), 3)
+                .await
+                .map_err(|e| format!("创建 relay 会话: {e}"))?;
+            let code = mailbox.code().to_string();
+            code_tx
+                .send(RelayCodeMsg::Relay { index, code })
+                .map_err(|_| "主通道已关闭".to_string())?;
+            let wormhole = Wormhole::connect(mailbox)
+                .await
+                .map_err(|e| format!("Wormhole 连接: {e}"))?;
+            let mut cursor = async_std::io::Cursor::new(buf.to_vec());
+            let cancel = async move {
+                async_io::Timer::after(Duration::from_secs(60)).await;
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            };
+            transfer::send_file(
+                wormhole,
+                hints.to_vec(),
+                &mut cursor,
+                format!("chunk-{index}"),
+                buf.len() as u64,
+                transit::Abilities::ALL,
+                |_| {},       // relay 路径连接类型不展示
+                |_, _| {},    // 块粒度进度由 relay_send_chunks 聚合（与 quic_send_chunks 一致）
+                cancel,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        },
+        async {
+            async_io::Timer::after(Duration::from_secs(60)).await;
+            Err(format!("块 {index} 发送 60s 超时（对端未收/已死），放弃该码"))
+        },
     )
-    .await
-    .map_err(|e| e.to_string())
+    .await;
+    if timed_out.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(format!("块 {index} 发送 60s 超时（对端未收/已死），放弃该码"));
+    }
+    res
 }
 
 /// relay 分块发送：每个缺失块一个独立 wormhole 会话（配对码经主通道 RelayChunk
 /// 告知接收方），`concurrency` 个 worker 并行。worker 取队列块 → 读块数据 →
 /// 建会话 → 交主任务转发配对码 → send_file 传块；失败重试 ≤3 次（新会话 + 新码）。
+/// 每块会话有 60s 整体超时（relay_send_one_chunk 的 cancel 定时器），主通道转发
+/// 与收尾等待有 600s 整体 deadline——接收方崩溃时发送方保证退出（不永久挂起）。
 /// 主通道消息流：N × RelayChunk（发送方顺序，与接收方 get 一一对应）。
 /// 返回已传字节总数（= 缺失块字节和）。
 async fn relay_send_chunks(
@@ -929,14 +961,32 @@ async fn relay_send_chunks(
     }
     // 主任务：边转发 RelayChunk 码边等 worker 收尾（std mpsc try_recv 轮询，
     // 不阻塞 executor）。转发失败 = 主通道断裂 → 整体报错（worker 线程随进程退出）。
+    // 整体 deadline 600s（与接收方 relay_recv_chunks 对称）：worker 已由每块 60s
+    // 超时界定，但主通道转发本身也可能停滞（对端死/断网）——deadline 到点即放弃
+    // 所有 worker（detach，线程随进程退出），返回 Err 不无限等待（清单保留可续传）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
     let mut remaining = n;
     while remaining > 0 {
+        if std::time::Instant::now() >= deadline {
+            return Err("relay 块传输整体超时（600s 上限），worker 已放弃，清单保留可续传".into());
+        }
         match code_rx.try_recv() {
             Ok(RelayCodeMsg::Relay { index, code }) => {
-                main_wormhole
-                    .send_json(&UdpMsg::RelayChunk { code, index })
-                    .await
-                    .map_err(|e| format!("send relay-chunk: {e}"))?;
+                // 转发本身也受 deadline 约束：主通道停滞时不能挂死在 send_json
+                let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                futures_lite::future::or(
+                    async {
+                        main_wormhole
+                            .send_json(&UdpMsg::RelayChunk { code, index })
+                            .await
+                            .map_err(|e| format!("send relay-chunk: {e}"))
+                    },
+                    async {
+                        async_io::Timer::after(remain).await;
+                        Err("relay 块传输整体超时（600s 上限），worker 已放弃，清单保留可续传".to_string())
+                    },
+                )
+                .await?;
             }
             Ok(RelayCodeMsg::Done) => remaining -= 1,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
