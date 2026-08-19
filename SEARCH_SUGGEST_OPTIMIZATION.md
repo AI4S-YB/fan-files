@@ -1,7 +1,7 @@
 # fan-files Search、Suggest 与索引优化说明
 
-日期：2026-08-13  
-PR 分支：`fix/search-suggest-production`  
+日期：2026-08-13
+PR 分支：`fix/search-suggest-production`
 原始优化提交：`8e330d1 fix: bound search and suggest at production scale`
 
 ## 1. 优化背景
@@ -164,4 +164,3 @@ Tantivy 没有收录的内容不再通过昂贵的 SQLite 模糊查询兜底。�
 生产切换需要明确授权。推荐上线顺序为：安装用户级修复二进制、保留旧索引为
 带时间戳的回滚目录、原子切换新索引、执行预热与 search/suggest 验收；任一验收
 失败时立即恢复旧二进制和旧索引。
-
