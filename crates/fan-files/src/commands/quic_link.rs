@@ -379,8 +379,8 @@ mod tests {
         let t2 = std::thread::spawn(move || {
             crate::commands::udp_punch::punch_establish(a2, a1, 7, "peer-b".into(), Duration::from_secs(2))
         });
-        let sock_a = t1.join().unwrap().expect("peer-a 打洞应成功");
-        let sock_b = t2.join().unwrap().expect("peer-b 打洞应成功");
+        let sock_a = t1.join().unwrap().expect("peer-a 打洞应成功").sock;
+        let sock_b = t2.join().unwrap().expect("peer-b 打洞应成功").sock;
         // 注：socket 接收缓冲区里残留的 punch 补发包对 quinn 无害——解析为短头未知连接
         // 直接丢弃，无需 drain。
 
