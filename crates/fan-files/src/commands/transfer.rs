@@ -72,6 +72,27 @@ enum UdpMsg {
     },
 }
 
+/// 一条直连候选（ICE-lite 风格）
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Candidate {
+    kind: String, // "host" | "srflx" | "host6" | "srflx6"
+    addr: String, // ip:port
+    prio: u32,    // 越大越优先
+}
+
+/// 按优先级降序排序候选（大优先在前）
+fn sort_candidates(v: &mut [Candidate]) {
+    v.sort_by(|a, b| b.prio.cmp(&a.prio));
+}
+
+/// 本机非 loopback、非隧道接口的 IPv4 地址列表（host 候选与同网段判断共用）
+fn local_ipv4_addrs() -> Vec<std::net::Ipv4Addr> {
+    if_addrs::get_if_addrs().unwrap_or_default().iter()
+        .filter(|i| !i.is_loopback() && !i.name.starts_with("utun"))
+        .filter_map(|i| match &i.addr { if_addrs::IfAddr::V4(v4) => Some(v4.ip), _ => None })
+        .collect()
+}
+
 /// 打洞成功后的直连结果（QUIC 侧用）
 struct UdpDirect {
     /// 打洞 socket（交给 quinn 的 Endpoint 持有）
@@ -928,4 +949,26 @@ pub enum TransferAction {
     Send { dataset: String, ttl_hours: u64 },
     Get { code: String, output: Option<String> },
     Log { json: bool },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_ipv4_addrs_lists_lan_ips() {
+        let addrs = local_ipv4_addrs();
+        assert!(!addrs.is_empty(), "应至少收集到一个 IPv4 地址");
+        assert!(addrs.iter().all(|a| !a.is_loopback()), "不应包含 loopback");
+    }
+
+    #[test]
+    fn candidates_sorted_by_priority() {
+        let mut v = vec![
+            Candidate { kind: "srflx".into(), addr: "1.2.3.4:1000".into(), prio: 20000 },
+            Candidate { kind: "host".into(), addr: "10.0.0.5:1000".into(), prio: 30000 },
+        ];
+        sort_candidates(&mut v);
+        assert_eq!(v[0].kind, "host", "host 应优先于 srflx");
+    }
 }

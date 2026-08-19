@@ -119,3 +119,35 @@ UdpPuncher 超时/失败 → 自动降级现有 magic-wormhole relay 传输
 - `tokio`（现有）— 运行时
 - `rustls`（quinn 自带）— TLS
 - magic-wormhole（现有）— 配对/relay 兜底
+
+## 十一、实测结果（2026-08-19，feat/desktop-app @ b632a89）
+
+### NAT 类型实测（UDP STUN 探测）
+
+| 机器 | 出口 IP | NAT 类型 | 判定依据 |
+|------|---------|---------|---------|
+| Mac mini | 183.255.39.33 | **Symmetric**（端口随目标变） | 同 socket 经两个 STUN 服务器 → 38855 / 37127；增量无规律（1115/3076） |
+| bioinfo7 | 124.127.106.55 | **Cone（端口保留）** | 本地端口 40733 → 公网端口 40733，跨服务器一致 |
+
+### 打洞实测：失败（预期内）
+
+双方同时互发 120 个打洞包（各向对方通告地址），**谁也没收到任何包**。
+- Mac 侧：symmetric NAT 拒绝一切入站（即使已向对端发包建立映射）
+- bioinfo7 侧：restricted cone 只接受"曾向之发包的地址"的入站，但 Mac 的通告地址
+  对 bioinfo7 无效（symmetric NAT 只为 STUN 服务器建映射，不是为 bioinfo7）
+- 结论：**strict symmetric ↔ restricted cone 组合下 UDP 打洞不适用**——
+  正是规格 §一"学校级对称 NAT 打洞失败"的预期场景
+
+### 降级路径实测：100MB 完整通过 ✅
+
+- 双机 100MB（Mac mini → bioinfo7）：双方识别 UDP 能力 → 握手 → 打洞失败 →
+  **自动降级 relay** → SHA-256 校验通过，数据完整
+- 同机 50MB 冒烟：FAN_NO_UDP=1 纯 relay 路径 ✅；默认路径（打洞失败降级）✅
+- 消息相位对齐验证：UDP 握手失败后 v1 transit 正常完成（双方各发 hello/ack 各 1 条
+  后降级，phase 密钥由信封 side+count 派生，与对端计数无关）
+
+### 打洞失败的实现教训
+
+**NAT 端口映射绑定在 socket 上**：STUN 通告的端口只对查询 socket 有效。早期实现
+打洞时另绑新 socket，导致通告端口"死地址"——双方都向对方的死端口打洞。已修复：
+`punch_on_socket` 复用 STUN 的同一 socket（b632a89）。

@@ -28,6 +28,7 @@ futures-lite = "2"
 async-fs = "2"
 quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-async-std"] }
 rcgen = "0.14.9"
+if-addrs = "0.13" # ICE-lite 多候选：枚举本机接口
 sha2 = "0.10"
 rustls-pki-types = "1.15.1"
 # 指纹固定 verifier 需要 rustls 的 dangerous API（ring provider，与 quinn 的 rustls-ring 一致）
