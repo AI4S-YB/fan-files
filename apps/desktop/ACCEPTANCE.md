@@ -41,3 +41,33 @@
 - check_update 在打包环境的网络路径实测
 - DMG 美化步骤在本机 agent shell 失败（Finder 自动化权限），需真实终端跑一次完整 `tauri build`
 - 本地 Mac db 为 schema v2（`/stats` 500），跑一次 `fan-files discover` 升级到 v4
+
+## GUI-T5 修复验收（2026-08-20，分支 feat/desktop-app @ 7525cb5）
+
+### 修复内容（GUI-T4 审查 3 项回归 + 1 项规格遗漏）
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 1 | 共享完成不刷新传输历史 | 共享状态提升到页面级 `useShareTransfer`，`share://done` → `loadHistory()`（与接收完成对称） |
+| 2 | 共享传输中关弹层丢跟踪 | 共享状态 + share:// 监听移到页面级，弹层改纯展示（props 注入）；弹层关闭后页面级共享面板接管进度/取消入口 |
+| 3 | 搜索框 Enter 提交无 loading 防护 | `onKeyDown` Enter 时 `!loading` 才提交（按钮 disabled 拦不住键盘路径） |
+| 4 | 统计卡 approximate 无标记 | `Stats.approximate` 为真时三个计数卡加 `~` 前缀 + title 提示 |
+
+新增组件：`hooks/useShareTransfer.ts`、`components/SharePanel.tsx`、`components/ResumeDialog.tsx`（接收/共享续传弹窗统一）。
+
+### 自动化验证
+
+- 引擎全量（bioinfo7，rustup 1.96.1）：`cargo test -p fan-files` = **36 单测 + 7 CLI 集成全绿**；`cargo test -p fan-files-share` = **23 全绿**
+- 前端全量（Mac mini Node v24）：**`npm test` 12 文件 104 用例全绿**（基线 96 + 新增 8）；`npm run build`（tsc + vite）通过
+- bioinfo7 Node v18 无法跑前端测试（jsdom ESM 依赖不兼容），前端测试以 Mac mini 为准
+
+### 双机实测（引擎级 JSONL，GUI 手动操作受 macOS TCC 限制无法自动化——见上文 ✋ 标注说明）
+
+| 方向 | 结果 |
+|------|------|
+| Mac mini 发 → bioinfo7 收（码 `7-penetrate-payday-direction`） | relay 降级传输成功，SHA-256 文件级校验通过（3/3 文件哈希一致），双方 `transfer log --json` 均落审计记录 |
+| bioinfo7 发 → Mac mini 收（码 `6-finicky-watchword-certify`） | relay 降级传输成功，SHA-256 校验通过（3/3 一致） |
+| JSONL 事件流（FAN_JSON_PROGRESS=1，GUI 传输面板输入契约） | 双方 stdout 均输出 `{"type":"conn"}`(punching→relay) → `{"type":"progress"}`(0→100%) → `{"type":"done","ok":true,...}`，与前端 TransferPanel 解析逻辑一致 |
+
+> 双机跨网（家庭宽带 ↔ 阿里云）UDP 打洞均失败降级 relay——与历史实测一致（ICE/CR 轮），非本次回归。
+> 前端共享/接收面板 UI 交互（弹层关闭后页面级面板接管、历史自动刷新、Enter 防护、~ 标记）由 104 个前端测试覆盖。
