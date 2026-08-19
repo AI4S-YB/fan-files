@@ -132,12 +132,15 @@ Tantivy 没有收录的内容不再通过昂贵的 SQLite 模糊查询兜底。�
 - 修复前生产 Tantivy 文档数：12,654,401；
 - 修复后 Tantivy 文档数：6,499,378；
 - Tantivy 删除标记：0；
-- 核心集成测试：9/9 通过；
-- Tantivy 去重测试：1/1 通过；
-- suggest 排序测试：1/1 通过；
+- PR 1 独立 `fan-core` 复测：31/31 通过，其中单元测试 6 项、集成测试
+  10 项、解释器测试 11 项、LLM 解析测试 4 项；
+- Tantivy 去重和 suggest 排序测试均通过；
 - CLI 测试：7/7 通过；
-- release 构建 SHA-256：
-  `b07412b90f15a61d5e89b611a653958a4e741413ac06b58a8290b668d39e9d41`。
+- 58 隔离端到端测试：扫描 3 个文件后立即停止 daemon，`status`、`search`、
+  `info` 均可读取 WAL 中的新数据；
+- 原子重建测试：3 个 SQLite 有效文件生成 3 个唯一 Tantivy 文档，重建后查询正常；
+- 最终 release 构建 SHA-256：
+  `c43c9d75e3c7e9e9dfc0b535c84254fccaa274905db83b58ba84be45f66244e5`。
 
 查询热缓存验收结果：
 
