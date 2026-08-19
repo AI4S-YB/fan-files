@@ -10,16 +10,32 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use tauri::Emitter;
 
-use crate::config::{config_path, read_config_at, write_config_at, FanConfig};
+use crate::config::{
+    config_path, configured_receive_dir, default_receive_dir, read_config_at,
+    read_transfer_config_at, transfer_cli_params, write_config_at, write_transfer_config_at,
+    FanConfig,
+};
 use crate::engine::{kill_share, start_share, wait_healthy, Engine, SHARE_PORT};
 use crate::EngineStatus;
 
 /// 扫描互斥标志（true = discover 子进程正在运行）。
 /// scan_now（前端命令 + 托盘菜单）与 lib.rs 的定时循环共用。
 pub(crate) static SCANNING: AtomicBool = AtomicBool::new(false);
+
+/// 当前传输子进程（取消用）。
+/// event_prefix = "share" / "receive"，cancel_transfer 按它决定发哪个方向的 done 事件。
+/// 只保存"最新"的一个传输：新传输启动会 replace 掉旧的（并回收其子进程），
+/// 各传输任务结束时凭 child.id()（PID）确认句柄仍是自己的才取回 wait。
+struct ActiveTransfer {
+    child: tokio::process::Child,
+    event_prefix: &'static str,
+}
+
+static CURRENT_TRANSFER: Mutex<Option<ActiveTransfer>> = Mutex::new(None);
 
 #[tauri::command]
 pub(crate) fn read_config() -> Result<FanConfig, String> {
@@ -29,6 +45,20 @@ pub(crate) fn read_config() -> Result<FanConfig, String> {
 #[tauri::command]
 pub(crate) fn write_config(cfg: FanConfig) -> Result<(), String> {
     write_config_at(&config_path(), cfg)
+}
+
+/// 读取 config.toml 的 [transfer] 段（缺失字段填默认：chunk_size_mb=4 /
+/// concurrency=4 / receive_dir=null / udp_enabled=true）。
+#[tauri::command]
+pub(crate) fn read_transfer_config() -> Result<serde_json::Value, String> {
+    read_transfer_config_at(&config_path())
+}
+
+/// 写 config.toml 的 [transfer] 段（read-modify-write，保留其他节；
+/// 只合并提供的键，null 值删除对应键）。
+#[tauri::command]
+pub(crate) fn write_transfer_config(cfg: serde_json::Value) -> Result<(), String> {
+    write_transfer_config_at(&config_path(), &cfg)
 }
 
 #[tauri::command]
@@ -207,19 +237,30 @@ pub(crate) fn scan_state() -> bool {
 /// 数据集共享（P2P）：spawn `fan-files transfer send <path>`，把配对码和进度
 /// 以事件流推给前端。事件契约：
 /// - `share://code`     载荷 = 配对码（如 8-purple-hammer）
-/// - `share://progress` 载荷 = stderr 原始行
-/// - `share://done`     载荷 = 退出码（0 成功）
+/// - `share://progress` 载荷 = stdout JSONL 事件行（{"type":"conn"|"progress"|"resume"|"done"|"error",...}），
+///   前端 JSON.parse 后按 type 字段分发
+/// - `share://done`     载荷 = 退出码（0 成功，-1 = 信号终止/取消）
 /// - `share://error`    载荷 = 错误信息（spawn 失败时）
-/// 命令立即返回，传输在 async runtime 上跑。
+/// 命令立即返回，传输在 async runtime 上跑。子进程句柄存入 CURRENT_TRANSFER，
+/// 前端可随时 cancel_transfer。
 #[tauri::command]
 pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    // config [transfer] → --chunk-size(字节)/--concurrency（缺省 4MB/4）
+    let (chunk_bytes, concurrency) = transfer_cli_params();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut child = match tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"))
+            // FAN_JSON_PROGRESS=1：stdout 纯 JSONL 事件（conn/progress/resume/done/error），
+            // 人类可读输出（含配对码）走 stderr
+            .env("FAN_JSON_PROGRESS", "1")
             .arg("transfer")
             .arg("send")
             .arg(&path)
-            .stdout(Stdio::null())
+            .arg("--chunk-size")
+            .arg(chunk_bytes.to_string())
+            .arg("--concurrency")
+            .arg(concurrency.to_string())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
         {
@@ -229,50 +270,108 @@ pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result
                 return;
             }
         };
+        // 管道句柄留在本地读流；Child 本体存入全局供 cancel_transfer 取消
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let my_id = child.id();
+        // 新传输取代旧传输（重复触发）时，先回收旧子进程，避免句柄被覆盖后成孤儿。
+        // 先取回（guard 随即释放）再 await kill，避免 MutexGuard 跨 await。
+        let old = CURRENT_TRANSFER
+            .lock()
+            .unwrap()
+            .replace(ActiveTransfer { child, event_prefix: "share" });
+        if let Some(mut old) = old {
+            let _ = old.child.kill().await;
+        }
         use tokio::io::AsyncBufReadExt;
-        if let Some(stderr) = child.stderr.take() {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // 从 stderr 输出中提取配对码（格式: 数字-单词-单词-单词）
-                if line.contains("传输码:") {
-                    if let Some(code) = line.split("传输码:").nth(1) {
-                        let _ = handle.emit("share://code", code.trim().to_string());
+        // stdout：JSONL 事件行逐行转发（保持原始行，前端 JSON.parse 后按 type 分发）
+        let stdout_task = async {
+            if let Some(out) = stdout {
+                let mut lines = tokio::io::BufReader::new(out).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = handle.emit("share://progress", &line);
+                }
+            }
+        };
+        // stderr：人类可读输出（JSON 模式下配对码只在这里），提取配对码
+        let stderr_task = async {
+            if let Some(err) = stderr {
+                let mut lines = tokio::io::BufReader::new(err).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    // 从人类输出中提取配对码（格式: 数字-单词-单词-单词）
+                    if line.contains("传输码:") {
+                        if let Some(code) = line.split("传输码:").nth(1) {
+                            let _ = handle.emit("share://code", code.trim().to_string());
+                        }
                     }
                 }
-                let _ = handle.emit("share://progress", &line);
             }
+        };
+        tokio::join!(stdout_task, stderr_task);
+        // 流读完（子进程已退出）后取回句柄等待退出码；
+        // 句柄已被 cancel_transfer（或更新的传输）取走时不再发 done——由对方发
+        let at = {
+            let mut guard = CURRENT_TRANSFER.lock().unwrap();
+            if guard
+                .as_ref()
+                .map(|a| a.child.id() == my_id)
+                .unwrap_or(false)
+            {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        if let Some(mut at) = at {
+            let status = at.child.wait().await;
+            let _ = handle.emit(
+                "share://done",
+                status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1),
+            );
         }
-        let status = child.wait().await;
-        let _ = handle.emit(
-            "share://done",
-            status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1),
-        );
     });
     Ok(())
 }
 
 /// 数据集接收（P2P）：spawn `fan-files transfer get <code> --output <dir>`。
 /// 事件契约（与共享对称）：
-/// - `receive://progress` 载荷 = stderr 原始行
-/// - `receive://done`     载荷 = 退出码（0 成功）
+/// - `receive://progress` 载荷 = stdout JSONL 事件行（前端 JSON.parse 分发）
+/// - `receive://done`     载荷 = 退出码（0 成功，-1 = 信号终止/取消）
 /// - `receive://error`    载荷 = 错误信息（spawn 失败时）
-/// 命令立即返回，接收在 async runtime 上跑。
+/// 输出目录解析：显式 output > config [transfer].receive_dir > ~/Downloads/fan-received。
+/// 命令立即返回，接收在 async runtime 上跑。子进程句柄存入 CURRENT_TRANSFER。
 #[tauri::command]
 pub(crate) async fn receive_dataset(
     app: tauri::AppHandle,
     code: String,
-    output: String,
+    output: Option<String>,
 ) -> Result<(), String> {
+    let out_dir = match output.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(o) => o.to_string(),
+        None => match configured_receive_dir() {
+            Some(d) => d,
+            None => default_receive_dir(),
+        },
+    };
+    // config [transfer] → --chunk-size(字节)/--concurrency（缺省 4MB/4；
+    // 接收方 chunk_size 仅记录，实际块大小由发送方 FileMeta 决定）
+    let (chunk_bytes, concurrency) = transfer_cli_params();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut child = match tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"))
+            .env("FAN_JSON_PROGRESS", "1")
             .arg("transfer")
             .arg("get")
             .arg(&code)
             .arg("--output")
-            .arg(&output)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .arg(&out_dir)
+            .arg("--chunk-size")
+            .arg(chunk_bytes.to_string())
+            .arg("--concurrency")
+            .arg(concurrency.to_string())
+            .stdout(Stdio::piped())
+            // 接收方不需要配对码：stderr 直接丢弃（避免管道满阻塞子进程）
+            .stderr(Stdio::null())
             .spawn()
         {
             Ok(c) => c,
@@ -281,19 +380,55 @@ pub(crate) async fn receive_dataset(
                 return;
             }
         };
+        let stdout = child.stdout.take();
+        let my_id = child.id();
+        let old = CURRENT_TRANSFER
+            .lock()
+            .unwrap()
+            .replace(ActiveTransfer { child, event_prefix: "receive" });
+        if let Some(mut old) = old {
+            let _ = old.child.kill().await;
+        }
         use tokio::io::AsyncBufReadExt;
-        if let Some(stderr) = child.stderr.take() {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
+        if let Some(out) = stdout {
+            let mut lines = tokio::io::BufReader::new(out).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let _ = handle.emit("receive://progress", &line);
             }
         }
-        let status = child.wait().await;
-        let _ = handle.emit(
-            "receive://done",
-            status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1),
-        );
+        let at = {
+            let mut guard = CURRENT_TRANSFER.lock().unwrap();
+            if guard
+                .as_ref()
+                .map(|a| a.child.id() == my_id)
+                .unwrap_or(false)
+            {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        if let Some(mut at) = at {
+            let status = at.child.wait().await;
+            let _ = handle.emit(
+                "receive://done",
+                status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1),
+            );
+        }
     });
+    Ok(())
+}
+
+/// 取消当前传输（share_dataset / receive_dataset 的子进程）。
+/// 杀掉子进程并回收句柄（kill + wait 避免僵尸进程），
+/// 向对应事件流发 done（载荷 -1 = 信号终止，前端视为取消/失败）。
+#[tauri::command]
+pub(crate) async fn cancel_transfer(app: tauri::AppHandle) -> Result<(), String> {
+    let at = CURRENT_TRANSFER.lock().unwrap().take();
+    if let Some(mut at) = at {
+        let _ = at.child.kill().await;
+        let _ = app.emit(&format!("{}://done", at.event_prefix), -1);
+    }
     Ok(())
 }
 

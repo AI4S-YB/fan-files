@@ -141,6 +141,156 @@ pub(crate) fn write_config_at(path: &Path, cfg: FanConfig) -> Result<(), String>
         .map_err(|e| e.to_string())
 }
 
+// ---------- [transfer] 段读写（GUI 传输参数，与 CLI 共享同一文件） ----------
+
+/// 把 serde_json::Value 转 toml::Value（JSON null 跳过——TOML 没有 null）。
+fn json_to_toml(v: &serde_json::Value) -> Option<toml::Value> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(toml::Value::Boolean(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(toml::Value::Integer(i))
+            } else {
+                n.as_f64().map(toml::Value::Float)
+            }
+        }
+        serde_json::Value::String(s) => Some(toml::Value::String(s.clone())),
+        serde_json::Value::Array(a) => Some(toml::Value::Array(
+            a.iter().filter_map(json_to_toml).collect(),
+        )),
+        serde_json::Value::Object(o) => {
+            let mut t = toml::map::Map::new();
+            for (k, v) in o {
+                if let Some(tv) = json_to_toml(v) {
+                    t.insert(k.clone(), tv);
+                }
+            }
+            Some(toml::Value::Table(t))
+        }
+    }
+}
+
+/// 读取 config.toml 的 [transfer] 段。文件缺失 / 无该段时返回全默认值，
+/// 其余 IO/解析错误仍返回 Err。
+/// 返回对象始终含四个键：chunk_size_mb(4)/concurrency(4)/receive_dir(null)/udp_enabled(true)。
+pub(crate) fn read_transfer_config_at(path: &Path) -> Result<serde_json::Value, String> {
+    fn defaults() -> serde_json::Value {
+        serde_json::json!({
+            "chunk_size_mb": 4,
+            "concurrency": 4,
+            "receive_dir": serde_json::Value::Null,
+            "udp_enabled": true,
+        })
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(defaults()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let v: toml::Value = toml::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut out = defaults();
+    if let Some(toml::Value::Table(tab)) = v.get("transfer") {
+        // 已有的键覆盖默认值；缺失的键保留默认（serde default 语义对齐 CLI）
+        if let Ok(found) = serde_json::to_value(tab) {
+            if let (Some(out), Some(found)) = (out.as_object_mut(), found.as_object()) {
+                for (k, v) in found {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 写 [transfer] 段（read-modify-write，保留其他节——与 write_config_at 同模式）。
+/// cfg 必须是 JSON 对象：只合并 cfg 中提供的键，未提供的键保留原文件值；
+/// 值为 null 的键删除（TOML 无 null，读取时回退默认）。
+pub(crate) fn write_transfer_config_at(path: &Path, cfg: &serde_json::Value) -> Result<(), String> {
+    let mut root = match std::fs::read_to_string(path) {
+        Ok(raw) => match toml::from_str::<toml::Value>(&raw) {
+            Ok(toml::Value::Table(t)) => t,
+            _ => toml::map::Map::new(), // unparseable → start fresh
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::map::Map::new(),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut transfer = match root.get("transfer") {
+        Some(toml::Value::Table(t)) => t.clone(),
+        _ => toml::map::Map::new(),
+    };
+    match cfg {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                match json_to_toml(v) {
+                    Some(tv) => {
+                        transfer.insert(k.clone(), tv);
+                    }
+                    None => {
+                        transfer.remove(k);
+                    }
+                }
+            }
+        }
+        _ => return Err("transfer 配置必须是 JSON 对象".into()),
+    }
+    root.insert("transfer".into(), toml::Value::Table(transfer));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, toml::to_string_pretty(&toml::Value::Table(root)).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+/// 从 config.toml [transfer] 段解析 CLI 传输参数，返回 (chunk_size 字节, concurrency)。
+/// 缺省 4MB / 4；0 视为未设置（与 CLI resolve_transfer_params 语义一致）。
+/// 读失败（文件不可读等）静默回退默认——spawn 传输不能因配置损坏而失败。
+pub(crate) fn transfer_cli_params() -> (u64, usize) {
+    transfer_cli_params_at(&config_path())
+}
+
+/// 同 transfer_cli_params，但路径可注入（测试用）。
+pub(crate) fn transfer_cli_params_at(path: &Path) -> (u64, usize) {
+    let v = read_transfer_config_at(path).unwrap_or_default();
+    let chunk_mb = v
+        .get("chunk_size_mb")
+        .and_then(|x| x.as_u64())
+        .filter(|m| *m > 0)
+        .unwrap_or(4);
+    let concurrency = v
+        .get("concurrency")
+        .and_then(|x| x.as_u64())
+        .map(|c| c as usize)
+        .filter(|c| *c > 0)
+        .unwrap_or(4);
+    (chunk_mb.saturating_mul(1024 * 1024), concurrency)
+}
+
+/// config [transfer].receive_dir（None = 未配置）。
+pub(crate) fn configured_receive_dir() -> Option<String> {
+    configured_receive_dir_at(&config_path())
+}
+
+/// 同 configured_receive_dir，但路径可注入（测试用）。
+pub(crate) fn configured_receive_dir_at(path: &Path) -> Option<String> {
+    read_transfer_config_at(path)
+        .ok()?
+        .get("receive_dir")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// 接收默认目录：~/Downloads/fan-received（与前端现有默认一致，后端兜底）。
+pub(crate) fn default_receive_dir() -> String {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Downloads/fan-received")
+        .to_string_lossy()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +484,141 @@ model = "DSv4-flash"
         assert_eq!(cfg.api_key, "sk-jgv6-example");
         assert_eq!(cfg.model, "DSv4-flash");
         cleanup(&p);
+    }
+
+    // ---------- [transfer] 段 ----------
+
+    #[test]
+    fn read_transfer_config_missing_file_returns_defaults() {
+        let p = temp_config_path("transfer-missing");
+        cleanup(&p);
+        let v = read_transfer_config_at(&p).unwrap();
+        assert_eq!(v["chunk_size_mb"], 4);
+        assert_eq!(v["concurrency"], 4);
+        assert!(v["receive_dir"].is_null());
+        assert_eq!(v["udp_enabled"], true);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn read_transfer_config_partial_section_fills_defaults() {
+        let p = temp_config_path("transfer-partial");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "threads = 8\n[transfer]\nconcurrency = 8\n").unwrap();
+        let v = read_transfer_config_at(&p).unwrap();
+        assert_eq!(v["chunk_size_mb"], 4, "未写的 chunk_size_mb 用默认 4");
+        assert_eq!(v["concurrency"], 8);
+        assert!(v["receive_dir"].is_null());
+        assert_eq!(v["udp_enabled"], true);
+        cleanup(&p);
+    }
+
+    /// 回归：write_transfer_config_at 必须 read-modify-write，保留 [servers]/[scan]/[llm] 等
+    /// GUI 不拥有的节；null 字段省略（TOML 无 null），读取回退默认。
+    #[test]
+    fn write_transfer_config_preserves_other_sections() {
+        let p = temp_config_path("transfer-preserve");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"threads = 8
+[servers.foo]
+url = "http://remote:8929"
+[scan]
+include = ["/old"]
+exclude = []
+[llm]
+endpoint = "http://old"
+api_key = ""
+model = "old-model"
+"#,
+        )
+        .unwrap();
+        write_transfer_config_at(
+            &p,
+            &serde_json::json!({
+                "chunk_size_mb": 16,
+                "concurrency": 8,
+                "receive_dir": serde_json::Value::Null,
+                "udp_enabled": false,
+            }),
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("url = \"http://remote:8929\""), "servers.foo 应保留:\n{raw}");
+        assert!(raw.contains("[llm]"), "[llm] 节应保留:\n{raw}");
+        assert!(raw.contains("chunk_size_mb = 16"), "chunk_size_mb 应写入:\n{raw}");
+        assert!(raw.contains("udp_enabled = false"), "udp_enabled 应写入:\n{raw}");
+        assert!(!raw.contains("receive_dir"), "null 的 receive_dir 应省略:\n{raw}");
+        let v = read_transfer_config_at(&p).unwrap();
+        assert_eq!(v["chunk_size_mb"], 16);
+        assert_eq!(v["concurrency"], 8);
+        assert_eq!(v["udp_enabled"], false);
+        assert!(v["receive_dir"].is_null());
+        cleanup(&p);
+    }
+
+    /// 写只合并 cfg 提供的键，未提供的键保留原值（前端可只回传修改项）。
+    #[test]
+    fn write_transfer_config_merges_unspecified_keys() {
+        let p = temp_config_path("transfer-merge");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            "[transfer]\nchunk_size_mb = 16\nconcurrency = 8\nreceive_dir = \"/data/inbox\"\nudp_enabled = true\n",
+        )
+        .unwrap();
+        write_transfer_config_at(&p, &serde_json::json!({ "chunk_size_mb": 32 })).unwrap();
+        let v = read_transfer_config_at(&p).unwrap();
+        assert_eq!(v["chunk_size_mb"], 32);
+        assert_eq!(v["concurrency"], 8, "未提供的 concurrency 应保留原值");
+        assert_eq!(v["receive_dir"], "/data/inbox");
+        assert_eq!(v["udp_enabled"], true);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn write_transfer_config_rejects_non_object() {
+        let p = temp_config_path("transfer-nonobject");
+        cleanup(&p);
+        assert!(write_transfer_config_at(&p, &serde_json::json!(42)).is_err());
+        assert!(write_transfer_config_at(&p, &serde_json::json!("str")).is_err());
+        cleanup(&p);
+    }
+
+    #[test]
+    fn transfer_cli_params_from_config() {
+        let p = temp_config_path("params");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "[transfer]\nchunk_size_mb = 16\nconcurrency = 3\n").unwrap();
+        assert_eq!(transfer_cli_params_at(&p), (16 * 1024 * 1024, 3));
+        cleanup(&p);
+    }
+
+    #[test]
+    fn transfer_cli_params_defaults_when_missing() {
+        let p = temp_config_path("params-default");
+        cleanup(&p);
+        assert_eq!(transfer_cli_params_at(&p), (4 * 1024 * 1024, 4));
+        cleanup(&p);
+    }
+
+    #[test]
+    fn configured_receive_dir_reads_config() {
+        let p = temp_config_path("receive-dir");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "[transfer]\nreceive_dir = \"/data/inbox\"\n").unwrap();
+        assert_eq!(
+            configured_receive_dir_at(&p).as_deref(),
+            Some("/data/inbox")
+        );
+        cleanup(&p);
+        // 未配置 → None
+        assert_eq!(configured_receive_dir_at(&p), None);
     }
 }

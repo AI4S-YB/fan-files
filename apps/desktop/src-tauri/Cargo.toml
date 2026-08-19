@@ -29,5 +29,7 @@ toml = "0.8"
 dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # io-util: T17 scan_now 逐行读 discover 的 stderr（BufReader::lines）
-tokio = { version = "1", features = ["process", "rt-multi-thread", "sync", "time", "io-util"] }
+# macros: T2 share/receive 并发读 stdout（JSONL 事件）与 stderr（配对码），
+#         避免任一管道写满阻塞子进程（tokio::join!）
+tokio = { version = "1", features = ["process", "rt-multi-thread", "sync", "time", "io-util", "macros"] }
 

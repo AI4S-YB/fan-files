@@ -26,6 +26,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::read_config,
             commands::write_config,
+            commands::read_transfer_config,
+            commands::write_transfer_config,
             commands::fan_home,
             commands::pick_directory,
             commands::test_connection,
@@ -38,6 +40,7 @@ pub fn run() {
             commands::scan_state,
             commands::share_dataset,
             commands::receive_dataset,
+            commands::cancel_transfer,
             commands::transfer_history
         ])
         .setup(|app| {
