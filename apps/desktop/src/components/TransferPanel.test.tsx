@@ -1,14 +1,14 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
 import TransferPanel, { type TransferEvent } from "./TransferPanel";
 
 // TDD 测试：事件 → 面板各展示位的驱动（进度条 / 连接徽标 / 续传标识 / 取消）
 function renderPanel(events: TransferEvent[], log: string[] = []) {
   const onCancel = vi.fn();
-  render(
+  const utils = render(
     <TransferPanel name="rice.tar.gz" events={events} log={log} onCancel={onCancel} />
   );
-  return { onCancel };
+  return { onCancel, rerender: utils.rerender };
 }
 
 describe("TransferPanel", () => {
@@ -73,5 +73,78 @@ describe("TransferPanel", () => {
     );
     expect(screen.getByText(/原始日志/)).toBeInTheDocument();
     expect(screen.getByText("配对码: 8-purple-hammer")).toBeInTheDocument();
+  });
+
+  // GUI-T3 修复: 新传输（事件流清空）时重置速度样本，旧传输样本不污染新 ETA。
+  // 传输1: 0→100B/1s（剩余9s）；新传输清空后: 0→1000B/1s（剩余1s）。
+  // 若未重置，混入旧样本后 ETA 会算出"剩余 2 秒"——用文案差异证明重置生效。
+  it("resets speed samples when a new transfer starts (events cleared)", () => {
+    vi.useFakeTimers();
+    try {
+      const p = (sent: number, total: number): TransferEvent => ({
+        type: "progress",
+        sent,
+        total,
+        pct: (sent / total) * 100,
+        chunks: 1,
+      });
+      const { rerender } = renderPanel([p(0, 1000)]);
+      act(() => vi.advanceTimersByTime(1000));
+      rerender(
+        <TransferPanel
+          name="a.tar"
+          events={[p(0, 1000), p(100, 1000)]}
+          log={[]}
+          onCancel={vi.fn()}
+        />
+      );
+      act(() => vi.advanceTimersByTime(1000));
+      // 第 3 个事件渲染时才有 2 个速度样本 → ETA 出现
+      rerender(
+        <TransferPanel
+          name="a.tar"
+          events={[p(0, 1000), p(100, 1000), p(200, 1000)]}
+          log={[]}
+          onCancel={vi.fn()}
+        />
+      );
+      expect(screen.getByText("剩余 8 秒")).toBeInTheDocument();
+      act(() => vi.advanceTimersByTime(1000));
+      // 新传输：事件流清空 → 速度样本重置
+      rerender(
+        <TransferPanel name="b.tar" events={[]} log={[]} onCancel={vi.fn()} />
+      );
+      rerender(
+        <TransferPanel
+          name="b.tar"
+          events={[p(0, 2000)]}
+          log={[]}
+          onCancel={vi.fn()}
+        />
+      );
+      act(() => vi.advanceTimersByTime(1000));
+      rerender(
+        <TransferPanel
+          name="b.tar"
+          events={[p(0, 2000), p(1000, 2000)]}
+          log={[]}
+          onCancel={vi.fn()}
+        />
+      );
+      act(() => vi.advanceTimersByTime(1000));
+      rerender(
+        <TransferPanel
+          name="b.tar"
+          events={[p(0, 2000), p(1000, 2000), p(1500, 2000)]}
+          log={[]}
+          onCancel={vi.fn()}
+        />
+      );
+      // 重置后样本为 0@3s/1000@4s → 1s；混入旧样本则 (2000-1500)/(1000/4s)=2s
+      expect(screen.getByText("剩余 1 秒")).toBeInTheDocument();
+      expect(screen.queryByText("剩余 2 秒")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

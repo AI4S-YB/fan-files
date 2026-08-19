@@ -242,15 +242,17 @@ pub(crate) fn write_transfer_config_at(path: &Path, cfg: &serde_json::Value) -> 
         .map_err(|e| e.to_string())
 }
 
-/// 从 config.toml [transfer] 段解析 CLI 传输参数，返回 (chunk_size 字节, concurrency)。
-/// 缺省 4MB / 4；0 视为未设置（与 CLI resolve_transfer_params 语义一致）。
+/// 从 config.toml [transfer] 段解析 CLI 传输参数，返回
+/// (chunk_size 字节, concurrency, udp_enabled)。
+/// 缺省 4MB / 4 / true；0 视为未设置（与 CLI resolve_transfer_params 语义一致）。
 /// 读失败（文件不可读等）静默回退默认——spawn 传输不能因配置损坏而失败。
-pub(crate) fn transfer_cli_params() -> (u64, usize) {
+pub(crate) fn transfer_cli_params() -> (u64, usize, bool) {
     transfer_cli_params_at(&config_path())
 }
 
 /// 同 transfer_cli_params，但路径可注入（测试用）。
-pub(crate) fn transfer_cli_params_at(path: &Path) -> (u64, usize) {
+/// udp_enabled=false 时 spawn 侧注入 FAN_NO_UDP=1（引擎跳过 UDP 打洞相位）。
+pub(crate) fn transfer_cli_params_at(path: &Path) -> (u64, usize, bool) {
     let v = read_transfer_config_at(path).unwrap_or_default();
     let chunk_mb = v
         .get("chunk_size_mb")
@@ -263,7 +265,15 @@ pub(crate) fn transfer_cli_params_at(path: &Path) -> (u64, usize) {
         .map(|c| c as usize)
         .filter(|c| *c > 0)
         .unwrap_or(4);
-    (chunk_mb.saturating_mul(1024 * 1024), concurrency)
+    let udp_enabled = v
+        .get("udp_enabled")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true);
+    (
+        chunk_mb.saturating_mul(1024 * 1024),
+        concurrency,
+        udp_enabled,
+    )
 }
 
 /// config [transfer].receive_dir（None = 未配置）。
@@ -595,7 +605,7 @@ model = "old-model"
         cleanup(&p);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "[transfer]\nchunk_size_mb = 16\nconcurrency = 3\n").unwrap();
-        assert_eq!(transfer_cli_params_at(&p), (16 * 1024 * 1024, 3));
+        assert_eq!(transfer_cli_params_at(&p), (16 * 1024 * 1024, 3, true));
         cleanup(&p);
     }
 
@@ -603,7 +613,19 @@ model = "old-model"
     fn transfer_cli_params_defaults_when_missing() {
         let p = temp_config_path("params-default");
         cleanup(&p);
-        assert_eq!(transfer_cli_params_at(&p), (4 * 1024 * 1024, 4));
+        assert_eq!(transfer_cli_params_at(&p), (4 * 1024 * 1024, 4, true));
+        cleanup(&p);
+    }
+
+    /// GUI-T3 修复：设置页 UDP toggle 关闭（udp_enabled=false）时返回 false，
+    /// spawn 侧据此注入 FAN_NO_UDP=1（引擎跳过 UDP 打洞相位）。
+    #[test]
+    fn transfer_cli_params_udp_disabled_when_config_false() {
+        let p = temp_config_path("params-udp-off");
+        cleanup(&p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "[transfer]\nudp_enabled = false\n").unwrap();
+        assert_eq!(transfer_cli_params_at(&p), (4 * 1024 * 1024, 4, false));
         cleanup(&p);
     }
 

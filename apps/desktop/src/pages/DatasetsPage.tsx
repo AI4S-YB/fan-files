@@ -77,10 +77,29 @@ export default function DatasetsPage() {
   };
   const [receiveEvents, setReceiveEvents] = useState<TransferEvent[]>([]);
   const [receiveRaw, setReceiveRaw] = useState<string[]>([]);
-  // 最近一次接收的目标目录（"打开接收目录"用）
+  // 最近一次接收的目标目录（"打开接收目录"用；来自 receive_dataset 返回的实际路径）
   const [receiveDir, setReceiveDir] = useState<string | null>(null);
   // 续传确认弹窗（resume 事件触发）
   const [resumeAsk, setResumeAsk] = useState<ResumeAsk | null>(null);
+  // 续传弹窗超时（规格 §九：用户不响应默认继续——引擎已自动续传，不阻塞传输）
+  const RESUME_AUTO_CLOSE_MS = 60_000;
+  const resumeTimerRef = useRef<number | null>(null);
+  // 弹窗显示的同时挂 60s 自动关闭定时器（重复触发时重置计时）
+  function showResumeAsk(ask: ResumeAsk) {
+    if (resumeTimerRef.current) window.clearTimeout(resumeTimerRef.current);
+    setResumeAsk(ask);
+    resumeTimerRef.current = window.setTimeout(
+      () => setResumeAsk(null),
+      RESUME_AUTO_CLOSE_MS
+    );
+  }
+  // 卸载时清理弹窗定时器
+  useEffect(
+    () => () => {
+      if (resumeTimerRef.current) window.clearTimeout(resumeTimerRef.current);
+    },
+    []
+  );
   // 配对码复制反馈
   const [copied, setCopied] = useState(false);
   // 传输历史
@@ -125,7 +144,7 @@ export default function DatasetsPage() {
       if (!ev) return;
       setShareEvents((es) => [...es.slice(-200), ev]);
       if (ev.type === "resume") {
-        setResumeAsk({ side: "share", done: ev.done, total: ev.total });
+        showResumeAsk({ side: "share", done: ev.done, total: ev.total });
       }
     });
     const unDone = listen<number>("share://done", (e) => {
@@ -147,7 +166,7 @@ export default function DatasetsPage() {
       if (!ev) return;
       setReceiveEvents((es) => [...es.slice(-200), ev]);
       if (ev.type === "resume") {
-        setResumeAsk({ side: "receive", done: ev.done, total: ev.total });
+        showResumeAsk({ side: "receive", done: ev.done, total: ev.total });
       }
     });
     const unRDone = listen<number>("receive://done", (e) => {
@@ -193,11 +212,10 @@ export default function DatasetsPage() {
     setReceiveEvents([]);
     setReceiveRaw([]);
     try {
-      // 接收输出到 ~/Downloads/fan-received（默认接收目录）
-      const home = await invoke<string>("fan_home");
-      const downloads = home.replace("/.fan-files", "/Downloads/fan-received");
-      setReceiveDir(downloads);
-      await invoke("receive_dataset", { code, output: downloads });
+      // GUI-T3 修复：不传 output，接收目录由后端 config [transfer].receive_dir 决定
+      // （未配置时后端回退 ~/Downloads/fan-received）；命令返回实际目录供"打开"用
+      const dir = await invoke<string>("receive_dataset", { code });
+      setReceiveDir(dir);
     } catch (e) {
       setReceiveState("done-err");
       setReceiveRaw((l) => [...l, `接收启动失败: ${String(e)}`]);
@@ -240,12 +258,14 @@ export default function DatasetsPage() {
 
   // 续传确认：继续 → 仅关闭弹窗（引擎已自动续传缺失块）；放弃 → 取消对应方向
   function continueResume() {
+    if (resumeTimerRef.current) window.clearTimeout(resumeTimerRef.current);
+    resumeTimerRef.current = null;
     setResumeAsk(null);
   }
 
   function rejectResume() {
     const ask = resumeAsk;
-    setResumeAsk(null);
+    continueResume();
     if (ask?.side === "share") void cancelShare();
     else if (ask?.side === "receive") void cancelReceive();
   }
@@ -477,6 +497,9 @@ export default function DatasetsPage() {
                     <div className="share-code-cmd">
                       fan-files transfer get {share.code}
                     </div>
+                    {/* Minor-4 已知偏差（不改）："24 小时内有效"为硬编码，
+                        与引擎配对码默认有效期 24h 一致（transfer.rs CODE_TTL）；
+                        引擎若改默认需同步此处文案 */}
                     <div className="share-code-tip">⏳ 配对码 24 小时内有效</div>
                   </div>
                 )}

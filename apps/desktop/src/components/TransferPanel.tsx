@@ -59,11 +59,15 @@ export default function TransferPanel({ name, events, log, onCancel }: Props) {
     return { conn, progress, resume, terminal };
   }, [events]);
 
-  // 速度估算：记录最近几次 progress 事件的 sent + 到达时刻，用于剩余时间
+  // 速度估算：记录最近几次 progress 事件的 sent + 到达时刻，用于剩余时间。
+  // GUI-T3 修复：新传输（事件流从空开始，DatasetsPage 在 startShare/startReceive
+  // 时清空 events）重置样本，避免旧传输的慢速/快速样本让新传输 ETA 短期失真。
   const speedRef = useRef<{ sent: number; t: number }[]>([]);
   useEffect(() => {
     const ev = events[events.length - 1];
-    if (ev?.type === "progress") {
+    if (events.length === 0) {
+      speedRef.current = [];
+    } else if (ev?.type === "progress") {
       speedRef.current = [
         ...speedRef.current.slice(-8),
         { sent: ev.sent, t: performance.now() },

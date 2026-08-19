@@ -234,6 +234,17 @@ pub(crate) fn scan_state() -> bool {
     SCANNING.load(Ordering::SeqCst)
 }
 
+/// [transfer].udp_enabled=false 时的传输子进程环境注入：返回 FAN_NO_UDP=1
+/// （引擎 transfer.rs 的开关：跳过 UDP 打洞相位，强制 relay）；true → 空（默认）。
+/// 返回键值对而非直接操作 Command，便于单元测试断言注入内容。
+fn udp_envs(udp_enabled: bool) -> Vec<(&'static str, &'static str)> {
+    if udp_enabled {
+        Vec::new()
+    } else {
+        vec![("FAN_NO_UDP", "1")]
+    }
+}
+
 /// 数据集共享（P2P）：spawn `fan-files transfer send <path>`，把配对码和进度
 /// 以事件流推给前端。事件契约：
 /// - `share://code`     载荷 = 配对码（如 8-purple-hammer）
@@ -245,14 +256,19 @@ pub(crate) fn scan_state() -> bool {
 /// 前端可随时 cancel_transfer。
 #[tauri::command]
 pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    // config [transfer] → --chunk-size(字节)/--concurrency（缺省 4MB/4）
-    let (chunk_bytes, concurrency) = transfer_cli_params();
+    // config [transfer] → --chunk-size(字节)/--concurrency（缺省 4MB/4）+ udp_enabled
+    let (chunk_bytes, concurrency, udp_enabled) = transfer_cli_params();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let mut child = match tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"))
-            // FAN_JSON_PROGRESS=1：stdout 纯 JSONL 事件（conn/progress/resume/done/error），
-            // 人类可读输出（含配对码）走 stderr
-            .env("FAN_JSON_PROGRESS", "1")
+        let mut cmd = tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"));
+        // FAN_JSON_PROGRESS=1：stdout 纯 JSONL 事件（conn/progress/resume/done/error），
+        // 人类可读输出（含配对码）走 stderr
+        cmd.env("FAN_JSON_PROGRESS", "1");
+        // GUI-T3 修复：设置页 UDP toggle 关闭 → FAN_NO_UDP=1，让配置真正生效
+        for (k, v) in udp_envs(udp_enabled) {
+            cmd.env(k, v);
+        }
+        let mut child = match cmd
             .arg("transfer")
             .arg("send")
             .arg(&path)
@@ -335,19 +351,21 @@ pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result
     Ok(())
 }
 
-/// 数据集接收（P2P）：spawn `fan-files transfer get <code> --output <dir>`。
+/// 数据集接收（P2P）：spawn `fan-files transfer get <code>`。
+/// 返回实际使用的接收目录（前端"打开接收目录"按钮用）。
 /// 事件契约（与共享对称）：
 /// - `receive://progress` 载荷 = stdout JSONL 事件行（前端 JSON.parse 分发）
 /// - `receive://done`     载荷 = 退出码（0 成功，-1 = 信号终止/取消）
 /// - `receive://error`    载荷 = 错误信息（spawn 失败时）
-/// 输出目录解析：显式 output > config [transfer].receive_dir > ~/Downloads/fan-received。
-/// 命令立即返回，接收在 async runtime 上跑。子进程句柄存入 CURRENT_TRANSFER。
+/// 输出目录解析：显式 output > config [transfer].receive_dir > ~/Downloads/fan-received
+/// （GUI-T3 修复：前端不再传 output，统一走后两级，让设置页配置的接收目录真正生效）。
+/// 命令立即返回（已解析目录随返回值给出），接收在 async runtime 上跑。
 #[tauri::command]
 pub(crate) async fn receive_dataset(
     app: tauri::AppHandle,
     code: String,
     output: Option<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let out_dir = match output.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(o) => o.to_string(),
         None => match configured_receive_dir() {
@@ -356,17 +374,23 @@ pub(crate) async fn receive_dataset(
         },
     };
     // config [transfer] → --chunk-size(字节)/--concurrency（缺省 4MB/4；
-    // 接收方 chunk_size 仅记录，实际块大小由发送方 FileMeta 决定）
-    let (chunk_bytes, concurrency) = transfer_cli_params();
+    // 接收方 chunk_size 仅记录，实际块大小由发送方 FileMeta 决定）+ udp_enabled
+    let (chunk_bytes, concurrency, udp_enabled) = transfer_cli_params();
     let handle = app.clone();
+    let out_arg = out_dir.clone();
     tauri::async_runtime::spawn(async move {
-        let mut child = match tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"))
-            .env("FAN_JSON_PROGRESS", "1")
+        let mut cmd = tokio::process::Command::new(crate::engine::sidecar_bin("fan-files"));
+        cmd.env("FAN_JSON_PROGRESS", "1");
+        // GUI-T3 修复：设置页 UDP toggle 关闭 → FAN_NO_UDP=1，让配置真正生效
+        for (k, v) in udp_envs(udp_enabled) {
+            cmd.env(k, v);
+        }
+        let mut child = match cmd
             .arg("transfer")
             .arg("get")
             .arg(&code)
             .arg("--output")
-            .arg(&out_dir)
+            .arg(out_arg)
             .arg("--chunk-size")
             .arg(chunk_bytes.to_string())
             .arg("--concurrency")
@@ -434,7 +458,7 @@ pub(crate) async fn receive_dataset(
             );
         }
     });
-    Ok(())
+    Ok(out_dir)
 }
 
 /// 取消当前传输（share_dataset / receive_dataset 的子进程）。
@@ -461,4 +485,17 @@ pub(crate) fn transfer_history() -> Result<Vec<serde_json::Value>, String> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str(&stdout)
         .map_err(|e| format!("解析传输历史失败: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GUI-T3 修复：UDP toggle 关闭 → 子进程环境注入 FAN_NO_UDP=1；
+    /// 开启（默认）→ 不注入。
+    #[test]
+    fn udp_envs_inject_fan_no_udp_when_disabled() {
+        assert_eq!(udp_envs(false), vec![("FAN_NO_UDP", "1")]);
+        assert!(udp_envs(true).is_empty());
+    }
 }

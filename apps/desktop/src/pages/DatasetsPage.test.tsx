@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import DatasetsPage from "./DatasetsPage";
 import * as api from "../api";
@@ -352,11 +352,10 @@ describe("DatasetsPage", () => {
 
   // GUI-T3: 接收侧 progress 事件驱动面板（接收流程注入事件流）
   it("drives the receive panel from progress events", async () => {
-    // 挂载时 transfer_history → []；点击接收时 fan_home → 主目录路径；receive_dataset → ok
+    // 挂载时 transfer_history → []；receive_dataset → 后端解析的实际接收目录
     vi.mocked(invoke)
       .mockResolvedValueOnce([])
-      .mockResolvedValueOnce("/home/user/.fan-files")
-      .mockResolvedValueOnce(null);
+      .mockResolvedValueOnce("/home/user/Downloads/fan-received");
     render(<DatasetsPage />);
     await screen.findByText("Oryza_sativa_v1");
     fireEvent.change(screen.getByPlaceholderText(/输入配对码/), {
@@ -364,12 +363,14 @@ describe("DatasetsPage", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "接收" }));
     expect(await screen.findByText(/正在连接/)).toBeInTheDocument();
+    // GUI-T3 修复: 不再显式传 output（接收目录由后端 config [transfer].receive_dir 决定），
+    // 也不再调用 fan_home 推算目录
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("receive_dataset", {
         code: "8-purple-hammer",
-        output: "/home/user/Downloads/fan-received",
       })
     );
+    expect(invoke).not.toHaveBeenCalledWith("fan_home");
     eventMock.emit("receive://progress", JSON.stringify({ type: "conn", mode: "direct" }));
     expect(await screen.findByText("P2P直连")).toBeInTheDocument();
     eventMock.emit(
@@ -379,6 +380,55 @@ describe("DatasetsPage", () => {
     await waitFor(() =>
       expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50")
     );
+  });
+
+  // GUI-T3 修复: "打开接收目录"用后端返回的实际目录（不硬编码 ~/Downloads/fan-received）
+  it("opens the receive dir returned by the backend after a successful receive", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([]) // transfer_history
+      .mockResolvedValueOnce("/data/inbox") // receive_dataset 返回 config.receive_dir
+      .mockResolvedValue(null); // open_path 等其余调用
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.change(screen.getByPlaceholderText(/输入配对码/), {
+      target: { value: "8-purple-hammer" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "接收" }));
+    eventMock.emit("receive://done", 0);
+    const open = await screen.findByRole("button", { name: /打开接收目录/ });
+    fireEvent.click(open);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("open_path", { path: "/data/inbox" })
+    );
+  });
+
+  // GUI-T3 修复: 续传确认弹窗 60s 无响应自动关闭（规格 §九：超时默认继续续传）。
+  // 初始渲染在 real timers 下完成后再切 fake timers（React 调度依赖真实
+  // setTimeout/MessageChannel，全程 fake 会导致 render 永不推进）。
+  it("auto-closes the resume dialog after 60s without a response", async () => {
+    vi.mocked(invoke).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
+    await screen.findByText("资产");
+    fireEvent.click(screen.getByRole("button", { name: /共享/ }));
+    vi.useFakeTimers();
+    try {
+      act(() => {
+        eventMock.emit(
+          "share://progress",
+          JSON.stringify({ type: "resume", done: 34, total: 120 })
+        );
+      });
+      expect(screen.getByText(/发现未完成传输/)).toBeInTheDocument();
+      // 60s 后自动关闭（等价用户点了"继续续传"，不触发取消）
+      act(() => {
+        vi.advanceTimersByTime(60_000);
+      });
+      expect(screen.queryByText(/发现未完成传输/)).not.toBeInTheDocument();
+      expect(invoke).not.toHaveBeenCalledWith("cancel_transfer");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // GUI-T3: 配对码大字 + 复制按钮（navigator.clipboard）+ 有效期提示
