@@ -179,10 +179,17 @@ pub struct LlmConfig {
     pub api_key: String,
     #[serde(default = "default_llm_model")]
     pub model: String,
+    #[serde(default = "default_api_type")]
+    pub api_type: String,   // "openai" | "anthropic"
 }
 
 fn default_llm_model() -> String {
     "gpt-4o-mini".into()
+}
+
+/// 旧 config.toml 无 api_type → 默认 openai（OpenAI 兼容协议）
+fn default_api_type() -> String {
+    "openai".into()
 }
 
 impl Default for LlmConfig {
@@ -191,6 +198,7 @@ impl Default for LlmConfig {
             endpoint: String::new(),
             api_key: String::new(),
             model: default_llm_model(),
+            api_type: default_api_type(),
         }
     }
 }
@@ -447,5 +455,33 @@ mod tests {
         assert_eq!(cfg.transfer.chunk_size_mb, 4, "未写的 chunk_size_mb 用默认 4");
         assert_eq!(cfg.transfer.concurrency, 8);
         assert!(cfg.transfer.udp_enabled);
+    }
+
+    /// 旧 config.toml 无 llm.api_type → 默认 openai，不破坏加载
+    #[test]
+    fn legacy_llm_config_defaults_api_type_openai() {
+        let s = "[llm]\nendpoint = \"https://api.deepseek.com/v1/chat/completions\"\napi_key = \"sk-x\"\nmodel = \"deepseek-chat\"\n";
+        let cfg: Config = toml::from_str(s).unwrap();
+        assert_eq!(cfg.llm.api_type, "openai");
+        assert_eq!(cfg.llm.endpoint, "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(cfg.llm.model, "deepseek-chat");
+    }
+
+    /// [llm] 段整体缺失 → LlmConfig::default() 同样默认 openai
+    #[test]
+    fn llm_section_missing_defaults_openai() {
+        let cfg = Config::default();
+        assert_eq!(cfg.llm.api_type, "openai");
+    }
+
+    /// LlmConfig 读写 roundtrip：api_type 往返保留
+    #[test]
+    fn llm_config_roundtrip_keeps_api_type() {
+        let mut cfg = LlmConfig::default();
+        cfg.api_type = "anthropic".into();
+        let s = toml::to_string(&cfg).unwrap();
+        assert!(s.contains("api_type = \"anthropic\""), "s: {}", s);
+        let back: LlmConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.api_type, "anthropic");
     }
 }

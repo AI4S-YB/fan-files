@@ -462,10 +462,10 @@ pub fn run_hierarchical_inference(
 
     // Phase 1: get top-level classification
     let response: serde_json::Value = crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 3)?;
-    let content = response["choices"][0]["message"]["content"]
-        .as_str().ok_or("No content in LLM response")?;
+    let content = crate::llm::extract_llm_text(&llm_client.config, &response)
+        .ok_or("No content in LLM response")?;
 
-    let output: serde_json::Value = serde_json::from_str(content)
+    let output: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse LLM JSON: {}", e))?;
 
     let empty_projects = vec![];
@@ -552,8 +552,8 @@ pub fn run_hierarchical_inference(
                 "max_tokens": 16384
             }), 3) {
                 Ok(deep_resp) => {
-                    let deep_content = deep_resp["choices"][0]["message"]["content"].as_str().unwrap_or("");
-                    if let Ok(deep_output) = serde_json::from_str::<serde_json::Value>(deep_content) {
+                    let deep_content = crate::llm::extract_llm_text(&llm_client.config, &deep_resp).unwrap_or_default();
+                    if let Ok(deep_output) = serde_json::from_str::<serde_json::Value>(&deep_content) {
                         if let Some(deep_arr) = deep_output["projects"].as_array() {
                             deep_projects.extend(deep_arr.clone());
                             phase2_count += deep_arr.len();
@@ -1107,16 +1107,14 @@ pub fn run_dataset_asset_inference(
                     handles.push(s.spawn(move || -> usize {
                         match crate::llm::llm_api_call_with_retry(&config, &body, 2) {
                             Ok(resp) => {
-                                let rc = resp["choices"][0]["message"]["content"]
-                                    .as_str().unwrap_or("").to_string();
+                                let rc = crate::llm::extract_llm_text(&config, &resp).unwrap_or_default();
                                 if let Some(c) = process_batch_response(&sqlite, &bd, &rc) {
                                     return c;
                                 }
                                 eprintln!("  Batch JSON parse FAILED ({} chars), retrying once...", rc.len());
                                 match crate::llm::llm_api_call_with_retry(&config, &body, 1) {
                                     Ok(resp2) => {
-                                        let rc2 = resp2["choices"][0]["message"]["content"]
-                                            .as_str().unwrap_or("").to_string();
+                                        let rc2 = crate::llm::extract_llm_text(&config, &resp2).unwrap_or_default();
                                         if let Some(c) = process_batch_response(&sqlite, &bd, &rc2) {
                                             return c;
                                         }
