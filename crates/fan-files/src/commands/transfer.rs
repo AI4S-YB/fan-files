@@ -133,11 +133,16 @@ fn peer_supports_udp(wormhole: &Wormhole) -> bool {
     false
 }
 
-/// 打洞：同一 socket 上先 STUN 再互发打洞包（NAT 映射绑定 socket，缺一不可）
-/// 对称 NAT 支持：收到对端打洞包即学到对端真实源地址（可能 ≠ 通告地址），
-/// 后续发包（含补发拍）都发往真实地址——这是对称 NAT 能打通的唯一途径。
-fn try_hole_punch(msg: &UdpMsg, who: &str) -> Option<UdpDirect> {
-    let (peer_addr, nonce) = match msg {
+/// 打洞：在**已绑定且已做过 STUN 的 socket** 上互发打洞包。
+/// 必须复用 STUN 的同一 socket——NAT 端口映射绑定在 socket 上，换 socket 端口
+/// 映射就变了，通告地址立即失效（对称 NAT 双方都会向对方的"死端口"发包）。
+/// 收到对端打洞包即学到对端真实源地址（可能 ≠ 通告地址），后续发包发往真实地址。
+fn punch_on_socket(
+    sock: std::net::UdpSocket,
+    peer_msg: &UdpMsg,
+    who: &str,
+) -> Option<UdpDirect> {
+    let (peer_addr, nonce) = match peer_msg {
         UdpMsg::Hello { addr, nonce, .. } | UdpMsg::Ack { addr, nonce } => {
             let addr: std::net::SocketAddr = addr.parse().ok()?;
             (addr, *nonce)
@@ -147,8 +152,6 @@ fn try_hole_punch(msg: &UdpMsg, who: &str) -> Option<UdpDirect> {
     if peer_addr.ip().is_unspecified() {
         return None;
     }
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.set_nonblocking(true).ok()?;
     let result = crate::commands::udp_punch::punch_establish_on_sock(
         sock,
         peer_addr,
@@ -397,8 +400,8 @@ async fn udp_send_path(
         UdpMsg::Hello { .. } => return Err("收到意外的 UDP 握手消息".into()),
     };
     let _ = my_addr; // 公网地址已随 hello 发出，这里仅用于 STUN 成功判定
-    // ③ 打洞（同一 socket）
-    let direct = match try_hole_punch(&peer_hello, who) {
+    // ③ 打洞（复用 STUN 的同一 socket——NAT 端口映射绑定在 socket 上）
+    let direct = match punch_on_socket(sock, &peer_hello, who) {
         Some(d) => d,
         None => {
             eprintln!("  ⚠ UDP 打洞失败，降级 relay");
@@ -457,8 +460,8 @@ async fn udp_get_path(
         .await
         .map_err(|e| format!("send udp-ack: {e}"))?;
     let _ = my_addr; // 占位/真实地址均已随 ack 发出
-    // ② 打洞（同一 socket）
-    let direct = match try_hole_punch(hello, who) {
+    // ② 打洞（复用 STUN 的同一 socket——NAT 端口映射绑定在 socket 上）
+    let direct = match punch_on_socket(sock, hello, who) {
         Some(d) => d,
         None => {
             eprintln!("  ⚠ UDP 打洞失败，降级 relay");
