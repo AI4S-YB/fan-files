@@ -379,7 +379,8 @@ async fn recv_udp_msg(wormhole: &mut Wormhole, timeout: Duration, what: &str) ->
     res
 }
 
-/// UDP 直连发送（发送方 = QUIC 服务端）：STUN → hello → ack → 打洞 → quic_listen → 传数据
+/// UDP 直连发送（发送方 = QUIC 服务端，ICE-lite 多候选监听）：
+/// 收集 host + srflx 候选 → hello（完整候选）→ ack → 多端 quic_listen → accept 循环
 async fn udp_send_path(
     wormhole: &mut Wormhole,
     cert: rustls_pki_types::CertificateDer<'static>,
@@ -390,77 +391,107 @@ async fn udp_send_path(
     send_target: &str,
     display_name: &str,
 ) -> Result<u64, String> {
-    // ① 绑 socket + STUN（同 socket 保证端口映射一致）→ 发 udp-hello
-    //    注意：STUN 失败也要发 hello（占位 0.0.0.0:0）——接收方在等 hello，
-    //    不发会让它把 v1 transit 消费掉导致协议错乱。占位地址让双方立即降级。
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind udp: {e}"))?;
-    sock.set_nonblocking(true).map_err(|e| format!("set nonblocking: {e}"))?;
-    let my_addr = local_public_addr(&sock);
-    if my_addr.is_none() {
-        eprintln!("  ⚠ UDP STUN 失败，降级 relay");
+    // ① 收集候选：
+    //    - host：每个本地 IPv4 接口绑一个 socket（ip:0 随机端口），同网段对端免打洞直连
+    //    - srflx：0.0.0.0:0 + UDP STUN（同 socket 保证端口映射一致）
+    //    注意：STUN 失败也要发 hello（host 候选仍可直连）——接收方在等 hello，
+    //    不发会让它把 v1 transit 消费掉导致协议错乱。
+    let mut host_socks: Vec<std::net::UdpSocket> = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for ip in local_ipv4_addrs() {
+        if let Ok(s) = std::net::UdpSocket::bind((ip, 0)) {
+            if let Ok(addr) = s.local_addr() {
+                candidates.push(Candidate { kind: "host".into(), addr: addr.to_string(), prio: 30000 });
+            }
+            host_socks.push(s);
+        }
     }
-    // 占位候选列表：先用 STUN 结果作临时 srflx（Task 3 做完整收集 host+srflx）
-    let hello_candidates: Vec<Candidate> = my_addr
-        .map(|a| vec![Candidate { kind: "srflx".into(), addr: a.to_string(), prio: 20000 }])
-        .unwrap_or_default();
+    let srflx_sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind udp: {e}"))?;
+    srflx_sock.set_nonblocking(true).ok();
+    let my_public = local_public_addr(&srflx_sock);
+    if let Some(a) = my_public {
+        candidates.push(Candidate { kind: "srflx".into(), addr: a.to_string(), prio: 20000 });
+    }
+    if my_public.is_none() {
+        eprintln!("  ⚠ UDP STUN 失败（仅剩 host 候选，或降级 relay）");
+    }
+    sort_candidates(&mut candidates);
+
+    // ② 发 hello（完整候选列表）→ 等 udp-ack（超时/收到 v1 transit → 降级 relay）
     wormhole
         .send_json(&UdpMsg::Hello {
-            candidates: hello_candidates,
+            candidates,
             fingerprint: fp,
             nonce,
         })
         .await
         .map_err(|e| format!("send udp-hello: {e}"))?;
-    let my_addr = match my_addr {
-        Some(a) => a,
-        None => return Err("stun-fail".into()),
-    };
-    // ② 等 udp-ack（超时/收到 v1 transit → 降级 relay）
-    let peer_msg = match recv_udp_msg(wormhole, Duration::from_secs(15), "udp-ack").await? {
-        Some(m) => m,
+    let peer_cands = match recv_udp_msg(wormhole, Duration::from_secs(15), "udp-ack").await? {
+        Some(UdpMsg::Ack { candidates, .. }) => {
+            eprintln!("  ✅ 收到 udp-ack（{} 个候选）", candidates.len());
+            candidates
+        }
+        Some(_) => return Err("收到意外的 UDP 握手消息".into()),
         None => {
             eprintln!("  ⚠ UDP 握手超时，降级 relay");
             return Err("timeout".into());
         }
     };
-    let peer_hello = match &peer_msg {
-        UdpMsg::Ack { candidates, .. } => {
-            eprintln!("  ✅ 收到 udp-ack（{} 个候选）", candidates.len());
-            peer_msg
+
+    // ③ 多端监听：host sockets 直接 listen（同网段免打洞）+ srflx socket 打洞后 listen
+    //    cert/key 需 clone 给多个 quic_listen；endpoint 持有各自 socket 所有权。
+    let mut endpoints: Vec<quinn::Endpoint> = Vec::new();
+    for s in host_socks {
+        if let Ok(ep) = crate::commands::quic_link::quic_listen(s, cert.clone(), key.clone_key()).await {
+            endpoints.push(ep);
         }
-        UdpMsg::Hello { .. } => return Err("收到意外的 UDP 握手消息".into()),
-    };
-    let _ = my_addr; // 公网地址已随 hello 发出，这里仅用于 STUN 成功判定
-    // ③ 打洞（复用 STUN 的同一 socket——NAT 端口映射绑定在 socket 上）
-    let direct = match punch_on_socket(sock, &peer_hello, who) {
-        Some(d) => d,
-        None => {
-            eprintln!("  ⚠ UDP 打洞失败，降级 relay");
-            return Err("punch-fail".into());
+    }
+    if my_public.is_some() {
+        let ack_msg = UdpMsg::Ack { candidates: peer_cands.clone(), nonce };
+        // 复用 STUN 的同一 socket 打洞——NAT 端口映射绑定在 socket 上，换 socket 端口映射就变了
+        if let Some(direct) = punch_on_socket(srflx_sock, &ack_msg, who) {
+            if let Ok(ep) = crate::commands::quic_link::quic_listen(direct.sock, cert, key).await {
+                endpoints.push(ep);
+            }
         }
-    };
-    // ④ QUIC 服务端：在打通的 socket 上 listen，等对方连入
-    let endpoint = crate::commands::quic_link::quic_listen(direct.sock, cert, key)
-        .await
-        .map_err(|e| format!("quic listen: {e}"))?;
-    // ⑤ accept + 传数据（对方连入后 open_bi）
-    let incoming = futures_lite::future::or(
-        async { endpoint.accept().await.ok_or("server accept 超时".to_string()) },
-        async {
-            async_io::Timer::after(Duration::from_secs(15)).await;
-            Err("等待对方连接超时".to_string())
-        },
-    )
-    .await?;
-    let conn = incoming.await.map_err(|e| format!("入站握手: {e}"))?;
-    let sent = quic_send_file(&conn, send_target, display_name, |done, total| {
-        if total > 0 {
-            eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
+    }
+    if endpoints.is_empty() {
+        eprintln!("  ⚠ 无可监听端点，降级 relay");
+        return Err("no-endpoints".into());
+    }
+
+    // ④ accept 循环（15s 超时）：轮询各 endpoint 的非阻塞 accept，任一成功即用
+    //    quinn::Incoming 不可 Clone，每次拿到新的 Incoming 直接 await 驱动握手；
+    //    握手失败（坏连接/指纹不匹配）继续轮询下一个，容忍。
+    //    （quinn 0.11 的 accept() 返回 Accept future 而非 Option，用 poll_once 非阻塞轮询）
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        for ep in &endpoints {
+            if let Some(Some(incoming)) = futures_lite::future::poll_once(ep.accept()).await {
+                match incoming.await {
+                    Ok(conn) => {
+                        let sent = quic_send_file(&conn, send_target, display_name, |done, total| {
+                            if total > 0 {
+                                eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
+                            }
+                        })
+                        .await?;
+                        // 传输已完成（对端已确认），drop 全部 endpoint 释放 socket
+                        drop(endpoints);
+                        return Ok(sent);
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠ 入站握手失败: {e}，继续等待其他候选");
+                    }
+                }
+            }
         }
-    })
-    .await?;
-    drop(endpoint);
-    Ok(sent)
+        if std::time::Instant::now() >= deadline {
+            eprintln!("  ⚠ 等待对方连接超时，降级 relay");
+            return Err("accept-timeout".into());
+        }
+        async_io::Timer::after(Duration::from_millis(100)).await;
+    }
 }
 
 /// UDP 直连接收（接收方 = QUIC 客户端）：STUN → 收 hello → ack → 打洞 → quic_connect → 传数据
