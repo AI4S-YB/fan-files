@@ -41,10 +41,19 @@
 //! 生成块配对码），经主通道发 `relay-chunk {code, index}` 告知接收方 → 接收方
 //! 用该码发起 `transfer get` 收块（OffsetWriter 写 partial 对应 offset，逐块
 //! 原子更新清单）。发送方 `concurrency` 个 worker 并行（每 worker 一个会话），
-//! 失败重试 ≤3 次（重试 = 新会话 + 新码）；块级 SHA-256 由 magic-wormhole v1
+//! 每块总重试 ≤3 次（重试 = 新会话 + 新码）；块级 SHA-256 由 magic-wormhole v1
 //! 协议自带校验。partial + 清单与 QUIC 路径直接复用——relay 只传缺失块。
 //! 消息相位：UDP 相位各端收发计数对称（见 UdpMsg 注释），降级后
 //! FileMeta/ChunkStatus/RelayChunk 按序对齐，与 v1 降级同规则。
+//!
+//! **健壮性设计**（spec 评审后加固）：
+//! - 块 worker 跑在独立 std::thread + `catch_unwind`：库层 transit 复位 panic
+//!   （macOS `getpeername` EINVAL → `expect`）不炸进程，panic 按块失败重试。
+//!   注意：release profile 为 `panic = "abort"`，catch_unwind 仅在 debug 构建
+//!   生效——release 下该 panic 仍会终止进程（库层无法拦截，见 CR 记录）。
+//! - 每码超时：接收方 `request_file` 30s（弃置码不永久挂起）、`accept` 300s；
+//!   主通道 600s 整体超时；槽位等待与收尾等待均有 deadline，超时放弃 detach
+//!   的 worker 线程（清单保留可续传），不无条件 join。
 
 use crate::commands::chunked;
 use fan_core::config::{dirs_fan, DataLayer, Config};
@@ -829,8 +838,6 @@ async fn relay_send_chunks(
     }
     let pending: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
         std::sync::Arc::new(std::sync::Mutex::new(missing.to_vec()));
-    let attempts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let failed: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let total_sent: std::sync::Arc<std::sync::atomic::AtomicU64> =
@@ -842,17 +849,20 @@ async fn relay_send_chunks(
     progress(0, total_bytes);
 
     let n = concurrency.max(1);
-    let mut handles = Vec::new();
     for _ in 0..n {
-        let (pending, attempts, failed, total_sent) = (
-            pending.clone(), attempts.clone(), failed.clone(), total_sent.clone(),
+        let (pending, failed, total_sent) = (
+            pending.clone(), failed.clone(), total_sent.clone(),
         );
         let code_tx = code_tx.clone();
         let hints = hints.clone();
         let plan = plan.to_vec();
         let path = path.to_string();
         let mut progress = progress.clone();
-        handles.push(async_std::task::spawn(async move {
+        // worker 用独立 std::thread（非 async 任务）：块会话的库层 transit 复位
+        // panic（macOS getpeername EINVAL）被 catch_unwind 捕获，不炸进程；
+        // panic 视为该块会话失败进入重试。Done 必在最后一条 Relay 之后入队
+        // （mpsc FIFO 保证主任务转发完整性）。
+        std::thread::spawn(move || {
             loop {
                 // 取下一个待传块（Mutex 队列，先到先得；空 → 本 worker 结束）
                 let idx = {
@@ -882,16 +892,27 @@ async fn relay_send_chunks(
                     failed.lock().unwrap().push(idx);
                     continue;
                 }
-                // 重试 ≤3：每轮新建独立会话 + 新配对码（接收方经主通道拿新码重 get）
+                // 重试总次数 ≤3（规格 §四：每块最多 3 次，不重排；每次 = 新会话
+                // + 新配对码，接收方经主通道拿新码重 get）
                 let mut ok = false;
                 for attempt in 0..3 {
-                    match relay_send_one_chunk(&code_tx, &hints, &buf, idx).await {
-                        Ok(()) => {
+                    // 会话在独立线程内 + catch_unwind：库层 transit panic 按失败
+                    // 重试（debug 构建 unwind；release 为 panic=abort，见模块注释）
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        async_io::block_on(async {
+                            relay_send_one_chunk(&code_tx, &hints, &buf, idx).await
+                        })
+                    }));
+                    match r {
+                        Ok(Ok(())) => {
                             ok = true;
                             break;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             eprintln!("  ⚠ 块 {idx} relay 会话失败（第 {} 次）: {e}", attempt + 1);
+                        }
+                        Err(_) => {
+                            eprintln!("  ⚠ 块 {idx} 会话线程 panic（库层 transit 复位），按失败重试");
                         }
                     }
                 }
@@ -899,23 +920,15 @@ async fn relay_send_chunks(
                     total_sent.fetch_add(chunk.size, std::sync::atomic::Ordering::Relaxed);
                     progress(total_sent.load(std::sync::atomic::Ordering::Relaxed), total_bytes);
                 } else {
-                    // 失败：重试计数 +1，<3 次放回队列尾（下一轮由空闲 worker 再试）
-                    let mut a = attempts.lock().unwrap();
-                    let cnt = a.entry(idx).or_insert(0);
-                    *cnt += 1;
-                    if *cnt < 3 {
-                        pending.lock().unwrap().push(idx);
-                    } else {
-                        failed.lock().unwrap().push(idx);
-                    }
+                    // 3 次尝试全部失败 → 判死（已成功块保留在接收方清单，可续传）
+                    failed.lock().unwrap().push(idx);
                 }
             }
-            // Done 必在最后一条 Relay 之后入队（mpsc FIFO 保证主任务转发完整性）
             let _ = code_tx.send(RelayCodeMsg::Done);
-        }));
+        });
     }
     // 主任务：边转发 RelayChunk 码边等 worker 收尾（std mpsc try_recv 轮询，
-    // 不阻塞 executor）。转发失败 = 主通道断裂 → 整体报错（worker 随进程退出）。
+    // 不阻塞 executor）。转发失败 = 主通道断裂 → 整体报错（worker 线程随进程退出）。
     let mut remaining = n;
     while remaining > 0 {
         match code_rx.try_recv() {
@@ -932,10 +945,8 @@ async fn relay_send_chunks(
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    for h in handles {
-        h.await;
-    }
-    // 有块重试耗尽仍失败 → 整体报错（已成功块保留在接收方清单，可续传）
+    // Done 计数器归零即全部 worker 已收尾（Done 是 worker 最后一条消息），
+    // 无需再 join 线程
     let failed = failed.lock().unwrap();
     if !failed.is_empty() {
         return Err(format!("以下块 relay 传输失败（重试耗尽）: {:?}", failed));
@@ -975,18 +986,30 @@ where
     let wormhole = Wormhole::connect(mailbox)
         .await
         .map_err(|e| format!("Wormhole 连接: {e}"))?;
-    let req = match transfer::request_file(
-        wormhole,
-        hints.to_vec(),
-        transit::Abilities::ALL,
-        std::future::pending::<()>(),
+    // 每码 30s 超时：发送方会话可能在 offer 前死亡（库的 request_file 无超时、
+    // cancel=pending），无超时会让本 worker 永久挂起 → 收尾/Abort/超时全卡死
+    let req = futures_lite::future::or(
+        async {
+            match transfer::request_file(
+                wormhole,
+                hints.to_vec(),
+                transit::Abilities::ALL,
+                std::future::pending::<()>(),
+            )
+            .await
+            {
+                Ok(Some(r)) => Ok(Some(r)),
+                Ok(None) => Err("对方取消传输".into()),
+                Err(e) => Err(format!("请求块 {index}: {e}")),
+            }
+        },
+        async {
+            async_io::Timer::after(Duration::from_secs(30)).await;
+            Err(format!("块 {index} 会话 30s 无 offer（发送方会话可能已死），放弃该码"))
+        },
     )
-    .await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return Err("对方取消传输".into()),
-        Err(e) => return Err(format!("请求块 {index}: {e}")),
-    };
+    .await?
+    .ok_or_else(|| "对方取消传输".to_string())?;
     // 防御：offer 声明大小必须与块计划一致（损坏/错配会话 → 直接失败让发送方重试）
     if req.file_size() != expect_size {
         return Err(format!(
@@ -999,14 +1022,25 @@ where
         offset,
         written: std::cell::Cell::new(0),
     };
-    req.accept(
-        &|_| {},    // 连接类型不展示（relay 路径）
-        |_, _| {},  // 块粒度进度由 relay_recv_chunks 聚合
-        &mut writer,
-        std::future::pending::<()>(),
+    // accept 300s 超时：传输停滞（对端断流不关闭）时兜底，避免 worker 无限占用
+    // 槽位（正常 4MB 块经 relay 秒级完成，300s 极为宽裕）
+    futures_lite::future::or(
+        async {
+            req.accept(
+                &|_| {},    // 连接类型不展示（relay 路径）
+                |_, _| {},  // 块粒度进度由 relay_recv_chunks 聚合
+                &mut writer,
+                std::future::pending::<()>(),
+            )
+            .await
+            .map_err(|e| format!("收块 {index}: {e}"))
+        },
+        async {
+            async_io::Timer::after(Duration::from_secs(300)).await;
+            Err(format!("块 {index} accept 300s 超时（传输停滞），放弃该码"))
+        },
     )
-    .await
-    .map_err(|e| format!("收块 {index}: {e}"))?;
+    .await?;
     // 更新清单（原子）；重复块幂等——已记账的块不重写 done、不计数
     let mut d = done.lock().unwrap();
     if d.insert(index) {
@@ -1027,10 +1061,34 @@ where
     Ok(())
 }
 
+/// 有界等待所有 in-flight 块 worker 落定（active 计数归零）。每个 worker 已由
+/// 每码 30s 超时 + accept 内部/300s 超时界定，这里仅做最终兜底（120s）——
+/// 超时后放弃剩余 worker（detach 线程），其未落定的清单更新会被完成度/字节数
+/// 校验兜住，可续传。
+async fn settle_workers(
+    active: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    timeout: Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    while active.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "  ⚠ {} 个块 worker 超时未落定，放弃等待（清单保留可续传）",
+                active.load(std::sync::atomic::Ordering::Acquire)
+            );
+            return;
+        }
+        async_io::Timer::after(Duration::from_millis(20)).await;
+    }
+}
+
 /// relay 分块接收：主任务收 RelayChunk（块配对码）→ 分发给 worker 池（并发上限
 /// `concurrency`），每个 worker 用配对码发起独立 transfer get 收块写 partial。
-/// 结束条件：done 满（全部块）→ 等 in-flight worker 收尾后校验返回；
-/// 收到 Abort（发送方放弃）→ 报错（清单保留可续传）；主通道 600s 超时 → 报错。
+/// **worker 是独立 std::thread**：库层 transit 复位 panic（macOS getpeername
+/// EINVAL → expect）被 catch_unwind 捕获不炸进程，panic 按块失败处理（发送方
+/// 换新码重试）；每码 30s 无 offer 超时防弃置码永久挂起。
+/// 结束条件：done 满（全部块）→ settle_workers 等收尾后校验返回；收到 Abort
+/// （发送方放弃）→ 报错（清单保留可续传）；主通道 600s 超时 → 报错。
 /// 返回 (总完成块数, 本次收到字节数)。
 async fn relay_recv_chunks(
     main_wormhole: &mut Wormhole,
@@ -1070,7 +1128,7 @@ async fn relay_recv_chunks(
     let expected_bytes: u64 = file_size.saturating_sub(initial_bytes);
     let total_received: std::sync::Arc<std::sync::atomic::AtomicU64> =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // worker 活跃数（并发上限）；进度回调经 Arc<Mutex> 供 worker 共享
+    // worker 活跃数（并发上限 + 收尾追踪）；进度回调经 Arc<Mutex> 供 worker 共享
     let active: std::sync::Arc<std::sync::atomic::AtomicUsize> =
         std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hints = relay_hints();
@@ -1080,7 +1138,6 @@ async fn relay_recv_chunks(
         std::sync::Arc::new(std::sync::Mutex::new(progress));
 
     let n = concurrency.max(1);
-    let mut handles = Vec::new();
     // 主通道整体超时：发送方放弃（未发 Abort）/ 崩溃时兜底，清单保留可续传
     let deadline = std::time::Instant::now() + Duration::from_secs(600);
     loop {
@@ -1089,9 +1146,7 @@ async fn relay_recv_chunks(
             break;
         }
         if std::time::Instant::now() >= deadline {
-            for h in handles {
-                h.await;
-            }
+            settle_workers(&active, Duration::from_secs(120)).await;
             return Err("等待 relay 块超时（清单已保留，可续传）".into());
         }
         // 收 RelayChunk（20ms 轮询，与 quic_recv_chunks 的 accept 轮询同模式）
@@ -1120,10 +1175,18 @@ async fn relay_recv_chunks(
                     if done.lock().unwrap().len() >= plan.len() {
                         break;
                     }
+                    // 槽位等待也有 deadline：发送方死锁/放弃时不会无限等
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
                     async_io::Timer::after(Duration::from_millis(5)).await;
                 }
                 if done.lock().unwrap().len() >= plan.len() {
                     break;
+                }
+                // 槽位等待期间超时 → 回循环头走 deadline 分支（收尾后报错）
+                if std::time::Instant::now() >= deadline {
+                    continue;
                 }
                 let chunk = &plan[index as usize];
                 active.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -1135,56 +1198,61 @@ async fn relay_recv_chunks(
                 let progress = progress.clone();
                 let hints = hints.clone();
                 let (code2, chunk_size2, chunk_offset) = (code, chunk.size, chunk.offset);
-                handles.push(async_std::task::spawn(async move {
-                    let r = relay_recv_one_chunk(
-                        index,
-                        &code2,
-                        chunk_size2,
-                        chunk_offset,
-                        &hints,
-                        file_arc,
-                        &hash16,
-                        &file_name,
-                        file_size,
-                        chunk_size,
-                        initial_bytes,
-                        done,
-                        total_received,
-                        progress,
-                    )
-                    .await;
+                // 收块 worker：独立 std::thread + catch_unwind——库层 transit 复位
+                // panic（macOS getpeername EINVAL → expect）不炸进程，panic 视为
+                // 块失败（发送方换新码重试）。JoinHandle 直接丢弃（detach），
+                // 完成状态由 active 计数 + settle_workers 追踪。
+                std::thread::spawn(move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        async_io::block_on(async {
+                            relay_recv_one_chunk(
+                                index,
+                                &code2,
+                                chunk_size2,
+                                chunk_offset,
+                                &hints,
+                                file_arc,
+                                &hash16,
+                                &file_name,
+                                file_size,
+                                chunk_size,
+                                initial_bytes,
+                                done,
+                                total_received,
+                                progress,
+                            )
+                            .await
+                        })
+                    }));
+                    let r = match r {
+                        Ok(r) => r,
+                        Err(_) => Err("块会话线程 panic（库层 transit 复位）".into()),
+                    };
                     if let Err(e) = &r {
                         // 会话失败：发送方会换新配对码重试，这里只记录不中断
                         eprintln!("  ⚠ 块 {index} relay 接收失败（等待发送方重试）: {e}");
                     }
                     active.fetch_sub(1, std::sync::atomic::Ordering::Release);
-                }));
+                });
             }
             Ok(Some(UdpMsg::Abort)) => {
-                for h in handles {
-                    h.await;
-                }
+                settle_workers(&active, Duration::from_secs(120)).await;
                 return Err("对方中止 relay 传输（清单已保留，可续传）".into());
             }
             Ok(Some(_)) => {
-                for h in handles {
-                    h.await;
-                }
+                settle_workers(&active, Duration::from_secs(120)).await;
                 return Err("收到意外的 UDP 握手消息".into());
             }
             Ok(None) => { /* 轮询：回到循环头检查完成度/超时 */ }
             Err(e) => {
-                for h in handles {
-                    h.await;
-                }
+                settle_workers(&active, Duration::from_secs(120)).await;
                 return Err(e);
             }
         }
     }
-    // 收满：等所有 in-flight worker 完成（最后一块的清单更新可能仍在写）
-    for h in handles {
-        h.await;
-    }
+    // 收满：等所有 in-flight worker 落定（最后一块的清单更新可能仍在写；重复块
+    // worker 仍在传输时也一并等，120s 兜底后放弃）
+    settle_workers(&active, Duration::from_secs(120)).await;
     let chunks = done.lock().unwrap().len() as u32;
     let bytes = total_received.load(std::sync::atomic::Ordering::Relaxed);
     // 续传语义：完成度看总块数（含清单初始块），字节数看本次缺失块
@@ -1283,13 +1351,27 @@ async fn relay_recv_resume(
             (name, size, sha256, chunk_size, chunk_count)
         }
         Some(_) => return Err("收到意外的 UDP 握手消息".into()),
-        None => match recv_udp_msg(wormhole, Duration::from_secs(300), "file-meta").await? {
-            Some(UdpMsg::FileMeta { name, size, sha256, chunk_size, chunk_count }) => {
-                (name, size, sha256, chunk_size, chunk_count)
+        None => {
+            // 循环等 FileMeta：**容忍 Hello**——本端 FAN_NO_UDP 直连 relay 时
+            // 对方（未禁用 UDP）仍会先发 udp-hello 并等 ack；回 Abort 令其立即
+            // 降级 relay（不等 15s 超时），消息相位保持对称，然后继续等 FileMeta。
+            loop {
+                match recv_udp_msg(wormhole, Duration::from_secs(300), "file-meta").await? {
+                    Some(UdpMsg::FileMeta { name, size, sha256, chunk_size, chunk_count }) => {
+                        break (name, size, sha256, chunk_size, chunk_count);
+                    }
+                    Some(UdpMsg::Hello { .. }) => {
+                        eprintln!("  ⚠ 对方仍尝试 UDP 直连（本端未参与打洞），回 Abort 令其降级 relay");
+                        wormhole
+                            .send_json(&UdpMsg::Abort)
+                            .await
+                            .map_err(|e| format!("send abort: {e}"))?;
+                    }
+                    Some(_) => return Err("收到意外的 UDP 握手消息".into()),
+                    None => return Err("file-meta 超时".into()),
+                }
             }
-            Some(_) => return Err("收到意外的 UDP 握手消息".into()),
-            None => return Err("file-meta 超时".into()),
-        },
+        }
     };
     // 清单自洽校验：chunk_count 必须等于本地分块计划块数（防恶意/损坏的 FileMeta，
     // 同 quic_recv_resume 的 Task 4 C1 校验）
@@ -1424,6 +1506,13 @@ async fn udp_send_path(
         Some(UdpMsg::Ack { candidates, .. }) => {
             eprintln!("  ✅ 收到 udp-ack（{} 个候选）", candidates.len());
             candidates
+        }
+        // 单边 FAN_NO_UDP（对方禁用打洞）：本端 hello 后对方回 Abort 而非 ack，
+        // 视为对方放弃 UDP 直连 → 立即降级（与 accept 循环里的 Abort 处理一致，
+        // 消息相位对称，见 UdpMsg 注释）
+        Some(UdpMsg::Abort) => {
+            eprintln!("  ⚠ 对方放弃 UDP 直连（单边 FAN_NO_UDP），降级 relay");
+            return Err("peer-abort".into());
         }
         Some(_) => return Err("收到意外的 UDP 握手消息".into()),
         None => {
