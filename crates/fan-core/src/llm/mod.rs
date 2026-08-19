@@ -69,10 +69,10 @@ impl LlmClient {
 }
 
 /// 按 api_type 构造 LLM 请求（url/headers/body）
-/// openai    → {endpoint}（调用方已含 /v1/chat/completions）
+/// openai    → openai_chat_url(endpoint)（CC Switch OPENAI_BASE_URL 可能不含 /v1/chat/completions）
 ///             headers: Authorization: Bearer {api_key}
 ///             body: {"model","messages","temperature":0.1}
-/// anthropic → {endpoint}/v1/messages（endpoint 无 /v1 时拼）
+/// anthropic → anthropic_messages_url(endpoint)（endpoint 无 /v1 时拼）
 ///             headers: x-api-key: {api_key}, anthropic-version: 2023-06-01
 ///             body: {"model","messages","max_tokens":4096}
 pub fn build_llm_request(
@@ -102,18 +102,38 @@ pub fn build_llm_request(
             "messages": messages,
             "temperature": 0.1,
         });
-        Ok((cfg.endpoint.clone(), headers, body))
+        Ok((openai_chat_url(&cfg.endpoint), headers, body))
+    }
+}
+
+/// openai Chat Completions 端点 URL 规范化：
+/// - 已含 /chat/completions → 原样
+/// - 已含 /v1 → 拼 /chat/completions（CC Switch OPENAI_BASE_URL 形态，如 https://api.deepseek.com/v1）
+/// - 否则 → 拼 /v1/chat/completions
+fn openai_chat_url(endpoint: &str) -> String {
+    let ep = endpoint.trim_end_matches('/');
+    if ep.is_empty() {
+        return ep.to_string();
+    }
+    if ep.ends_with("/chat/completions") {
+        ep.to_string()
+    } else if ep.ends_with("/v1") {
+        format!("{}/chat/completions", ep)
+    } else {
+        format!("{}/v1/chat/completions", ep)
     }
 }
 
 /// anthropic Messages 端点 URL：endpoint 无 /v1 时拼 /v1/messages，已有不重复
+/// 尾斜杠先去掉，避免拼出 //v1/messages
 fn anthropic_messages_url(endpoint: &str) -> String {
-    if endpoint.ends_with("/v1/messages") {
-        endpoint.to_string()
-    } else if endpoint.ends_with("/v1") {
-        format!("{}/messages", endpoint)
+    let ep = endpoint.trim_end_matches('/');
+    if ep.ends_with("/v1/messages") {
+        ep.to_string()
+    } else if ep.ends_with("/v1") {
+        format!("{}/messages", ep)
     } else {
-        format!("{}/v1/messages", endpoint)
+        format!("{}/v1/messages", ep)
     }
 }
 
@@ -147,8 +167,20 @@ pub(crate) fn llm_api_call_with_retry(
         .unwrap_or_else(|| {
             messages.as_array().cloned().unwrap_or_else(|| vec![messages.clone()])
         });
-    let (url, headers, body) = build_llm_request(config, &msgs)
+    let (url, headers, mut body) = build_llm_request(config, &msgs)
         .map_err(|e| format!("LLM request build failed: {}", e))?;
+
+    // openai：保留透传调用方 body 的 response_format / max_tokens（旧语义）。
+    // 调用方依赖强制 JSON 输出与长输出上限（discovery.rs / infer_hierarchical.rs），
+    // 适配层重建 body 时不得丢弃；anthropic 协议不接收额外字段，不适用。
+    if config.api_type != "anthropic" {
+        if let Some(v) = messages.get("response_format") {
+            body["response_format"] = v.clone();
+        }
+        if let Some(v) = messages.get("max_tokens") {
+            body["max_tokens"] = v.clone();
+        }
+    }
 
     let mut last_err = String::new();
     for attempt in 0..max_retries {
@@ -259,6 +291,50 @@ mod tests {
         assert_eq!(url, "https://api.anthropic.com/v1/messages");
     }
 
+    /// openai_chat_url 三种形态：已含 /chat/completions → 原样；含 /v1 → 拼；
+    /// 否则 → 拼 /v1/chat/completions；尾斜杠不产生 //。
+    #[test]
+    fn openai_chat_url_three_forms() {
+        // CC Switch OPENAI_BASE_URL 形态
+        assert_eq!(
+            openai_chat_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        // 已含完整路径 → 原样
+        assert_eq!(
+            openai_chat_url("https://api.example.com/v1/chat/completions"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        // 裸主机 → 拼 /v1/chat/completions
+        assert_eq!(
+            openai_chat_url("https://api.example.com"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        // 尾斜杠
+        assert_eq!(
+            openai_chat_url("https://api.deepseek.com/v1/"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+    }
+
+    /// anthropic_messages_url：尾斜杠 endpoint 不拼出 //v1/messages
+    #[test]
+    fn anthropic_messages_url_trailing_slash() {
+        assert_eq!(
+            anthropic_messages_url("http://x:3200/v1/"),
+            "http://x:3200/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("http://x:3200/"),
+            "http://x:3200/v1/messages"
+        );
+        // 完整端点带尾斜杠 → 去掉尾斜杠保持原样
+        assert_eq!(
+            anthropic_messages_url("http://x:3200/v1/messages/"),
+            "http://x:3200/v1/messages"
+        );
+    }
+
     /// extract_llm_text：openai choices[0].message.content
     #[test]
     fn extract_text_openai() {
@@ -289,12 +365,13 @@ mod tests {
                 model: "gpt-4o-mini".into(),
                 api_type: "openai".into(),
             };
-            // 旧调用形态：带 model/messages/response_format 的整体 body
+            // 旧调用形态：带 model/messages/response_format/max_tokens 的整体 body
             llm_api_call_with_retry(&cfg, &serde_json::json!({
                 "model": "gpt-4o-mini",
                 "messages": [{"role": "user", "content": "hi"}],
                 "response_format": {"type": "json_object"},
                 "temperature": 0.1,
+                "max_tokens": 8192,
             }), 1).unwrap()
         });
         assert!(req.contains("POST /v1/chat/completions HTTP/1.1"), "req: {}", req);
@@ -303,6 +380,9 @@ mod tests {
         assert!(lower.contains("content-type: application/json"), "req: {}", req);
         assert!(req.contains("\"model\":\"gpt-4o-mini\""), "req: {}", req);
         assert!(req.contains("\"messages\":["), "req: {}", req);
+        // P1 回归：调用方 body 的 response_format / max_tokens 必须原样透传
+        assert!(req.contains("\"response_format\":{\"type\":\"json_object\"}"), "req: {}", req);
+        assert!(req.contains("\"max_tokens\":8192"), "req: {}", req);
         assert_eq!(result["choices"][0]["message"]["content"], "a, b");
     }
 

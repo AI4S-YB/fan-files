@@ -34,12 +34,17 @@ fn parse_cc_switch_dir(dir: &Path) -> Option<LlmEndpoint> {
 
     // 3. 识别协议：anthropic 优先（BASE_URL + AUTH_TOKEN）
     if let (Some(url), Some(key)) = (env_str("ANTHROPIC_BASE_URL"), env_str("ANTHROPIC_AUTH_TOKEN")) {
+        // ANTHROPIC_BASE_URL 可能不带 /v1，原样保留由协议层拼
+        // ANTHROPIC_MODEL 与顶层 model 均缺失 → 无有效模型，返回 None 让 GUI 提示"无 API 配置"
+        let model = match env_str("ANTHROPIC_MODEL").or_else(|| top_model.clone()) {
+            Some(m) if !m.is_empty() => m,
+            _ => return None,
+        };
         return Some(LlmEndpoint {
             api_type: "anthropic".into(),
             base_url: url,
             api_key: key,
-            // ANTHROPIC_BASE_URL 可能不带 /v1，原样保留由协议层拼
-            model: env_str("ANTHROPIC_MODEL").or(top_model).unwrap_or_default(),
+            model,
         });
     }
 
@@ -139,6 +144,18 @@ mod tests {
         let ep = parse_cc_switch_dir(dir.path()).unwrap();
         assert_eq!(ep.api_type, "anthropic");
         assert_eq!(ep.model, "claude-sonnet-4-8");
+    }
+
+    /// anthropic：ANTHROPIC_MODEL 与顶层 model 均缺失 → None
+    /// （让 GUI 提示"无 API 配置"而非给出空 model）
+    #[test]
+    fn anthropic_without_model_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "state.json", r#"{"activeProfile":"p"}"#);
+        write(dir.path(), "profiles/p/settings.json", r#"{
+            "env": {"ANTHROPIC_AUTH_TOKEN": "sk-test", "ANTHROPIC_BASE_URL": "http://x:1"}
+        }"#);
+        assert!(parse_cc_switch_dir(dir.path()).is_none());
     }
 
     /// openai profile：env 有 OPENAI_BASE_URL + API_KEY + MODEL
