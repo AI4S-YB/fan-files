@@ -71,6 +71,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const RENDEZVOUS_URL: &str = "wss://hub.moilab.net/wormhole/v1";
 /// 我们的 transit relay（打洞失败时中继兜底）
 const TRANSIT_RELAY: &str = "tcp://47.94.142.52:4001";
+/// 配对码默认有效期（小时）：7 天（main.rs --ttl-hours 默认值与接收方过期码提示共用）
+pub const DEFAULT_TTL_HOURS: u64 = 168;
 
 fn relay_hints() -> Vec<transit::RelayHint> {
     match url::Url::parse(TRANSIT_RELAY) {
@@ -2014,6 +2016,9 @@ async fn udp_get_path(
 }
 
 /// 审计日志表
+/// Task 3 状态机：code_used_at = 发送方 wormhole 配对完成（码被消费）；
+/// completed_at = 发送方数据发完（QUIC 收满 0x6b ack / relay 分块 / v1 传输完成）。
+/// 旧库（无这两列）由 ensure_audit_schema 的 ALTER TABLE 补齐。
 const AUDIT_DDL: &str = "
 CREATE TABLE IF NOT EXISTS transfer_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2025,7 +2030,9 @@ CREATE TABLE IF NOT EXISTS transfer_log (
     bytes_received INTEGER DEFAULT 0,
     status TEXT NOT NULL,
     started_at INTEGER NOT NULL,
-    finished_at INTEGER
+    finished_at INTEGER,
+    code_used_at INTEGER,
+    completed_at INTEGER
 );
 ";
 
@@ -2065,6 +2072,115 @@ fn dataset_path(store: &SqliteStore, name: &str) -> Option<String> {
         .map(|d| d.path)
 }
 
+/// 返回 transfer_log 的所有列名（PRAGMA table_info，用于迁移判断）
+fn audit_columns(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = conn.prepare("PRAGMA table_info(transfer_log)").unwrap();
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+    cols.filter_map(Result::ok).collect()
+}
+
+/// 建表 + 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已有表加列，
+/// 旧库（Task 3 之前建的 transfer_log）需 ALTER TABLE ADD COLUMN 补齐
+/// code_used_at/completed_at（幂等：已存在则跳过）。
+fn ensure_audit_schema(conn: &rusqlite::Connection) {
+    let _ = conn.execute_batch(AUDIT_DDL);
+    let cols = audit_columns(conn);
+    for col in ["code_used_at", "completed_at"] {
+        if !cols.iter().any(|c| c == col) {
+            let _ = conn.execute(
+                &format!("ALTER TABLE transfer_log ADD COLUMN {col} INTEGER"),
+                [],
+            );
+        }
+    }
+}
+
+/// 过期/无效配对码的友好错误映射（接收方 rendezvous 连接失败时用）。
+/// magic-wormhole 对未认领（已过期/从未创建）的 nameplate 报
+/// "Nameplate is unclaimed: …"，包装为面向用户的中文提示；其他错误原样返回。
+/// ttl_hours 用于提示"配对码有效期 X 小时"（接收方不知道发送方实际 ttl，
+/// 用默认 7 天说明常规有效期）。
+fn friendly_expired_code_error(err: &str, ttl_hours: u64) -> String {
+    let low = err.to_lowercase();
+    let expired = ["nameplate", "unclaimed", "not found", "already claimed"]
+        .iter()
+        .any(|k| low.contains(k));
+    if expired {
+        format!("配对码已过期或无效（配对码有效期 {ttl_hours} 小时）: {err}")
+    } else {
+        err.to_string()
+    }
+}
+
+/// 发送方审计：配对码生成即记一行（status=waiting，供后续阶段回写），
+/// 返回行 id（code_used / completed / finish 更新用，避免按 code 匹配歧义）。
+fn audit_begin(store: &SqliteStore, direction: &str, dataset: &str, code: &str, started_at: i64) -> i64 {
+    let conn = match store.conn.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("审计失败: 数据库锁 {}", e);
+            return 0;
+        }
+    };
+    ensure_audit_schema(&conn);
+    let _ = conn.execute(
+        "INSERT INTO transfer_log (direction, dataset, code, status, started_at)
+         VALUES (?1,?2,?3,'waiting',?4)",
+        rusqlite::params![direction, dataset, code, started_at],
+    );
+    conn.last_insert_rowid()
+}
+
+/// 发送方审计：wormhole 配对完成（`Wormhole::connect` 成功 / "Found peer"）
+/// → 回写 code_used_at（配对码已被消费）
+fn audit_mark_code_used(store: &SqliteStore, id: i64) {
+    let conn = match store.conn.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("审计失败: 数据库锁 {}", e);
+            return;
+        }
+    };
+    let _ = conn.execute(
+        "UPDATE transfer_log SET code_used_at=?1 WHERE id=?2",
+        rusqlite::params![now_secs(), id],
+    );
+}
+
+/// 发送方审计：数据发完（QUIC 收满全部 0x6b ack = 接收方回执 / relay 分块完成 /
+/// v1 send_file_or_folder 完成）→ 回写 completed_at。
+/// relay 路径无额外回执：v1 的 wormhole 被 send_file_or_folder 按值消费（所有权
+/// 转移）后无法再发消息，v3 主通道虽仍可用，但为保持与旧端协议相位一致不新增
+/// XferDone 消息——按规格"尽力回执"，以发送方数据发完为可靠完成点。
+fn audit_mark_completed(store: &SqliteStore, id: i64) {
+    let conn = match store.conn.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("审计失败: 数据库锁 {}", e);
+            return;
+        }
+    };
+    let _ = conn.execute(
+        "UPDATE transfer_log SET completed_at=?1 WHERE id=?2",
+        rusqlite::params![now_secs(), id],
+    );
+}
+
+/// 发送方审计：终态回写（ok / failed + peer_key + 字节 + finished_at）
+fn audit_finish(store: &SqliteStore, id: i64, peer_key: Option<&str>, bytes_sent: u64, status: &str) {
+    let conn = match store.conn.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("审计失败: 数据库锁 {}", e);
+            return;
+        }
+    };
+    let _ = conn.execute(
+        "UPDATE transfer_log SET peer_key=?1, bytes_sent=?2, status=?3, finished_at=?4 WHERE id=?5",
+        rusqlite::params![peer_key, bytes_sent as i64, status, now_secs(), id],
+    );
+}
+
 fn audit(
     store: &SqliteStore,
     direction: &str,
@@ -2080,7 +2196,7 @@ fn audit(
         Ok(c) => c,
         Err(e) => { eprintln!("审计失败: 数据库锁 {}", e); return; }
     };
-    let _ = conn.execute_batch(AUDIT_DDL);
+    ensure_audit_schema(&conn);
     let _ = conn.execute(
         "INSERT INTO transfer_log
          (direction, dataset, code, peer_key, bytes_sent, bytes_received, status, started_at, finished_at)
@@ -2140,19 +2256,28 @@ fn send(
         PathBuf::from(&path).file_name().unwrap_or_default().to_string_lossy().to_string()
     };
 
-    let result = async_io::block_on(async {
+    // 配对码状态机（Task 3）：配对码生成即入审计（waiting）→ 配对完成
+    // （code_used_at）→ 数据发完（completed_at）→ 终态（ok/failed）。
+    // 成功返回 (audit_id, peer_key, sent)，失败返回 (audit_id, 错误信息)。
+    let result: Result<(i64, String, u64), (i64, String)> = async_io::block_on(async {
         let mailbox = MailboxConnection::create(app_config(), 3)
             .await
-            .map_err(|e| format!("无法连接 rendezvous: {}", e))?;
+            .map_err(|e| (0i64, format!("无法连接 rendezvous: {}", e)))?;
         let code = mailbox.code().to_string();
 
-        // 配对码在 create 后即生成，先打印让接收方开始连接
+        // 配对码在 create 后即生成，先入审计（status=waiting）再打印让接收方开始连接。
+        // SqliteStore 字段 pub，借 Arc 克隆句柄进 async 块（不改 fan-core）
+        let audit_store = SqliteStore { conn: store.conn.clone() };
+        let audit_id = audit_begin(&audit_store, "send", dataset, &code, started_at);
         human!("\n  传输码: {}", code);
         human!("  ⏳ 等待对方输入此码开始传输…（{ttl_hours}h 内有效）\n");
 
-        let mut wormhole = Wormhole::connect(mailbox)
-            .await
-            .map_err(|e| format!("Wormhole 连接失败: {}", e))?;
+        let mut wormhole = match Wormhole::connect(mailbox).await {
+            Ok(w) => w,
+            Err(e) => return Err((audit_id, format!("Wormhole 连接失败: {}", e))),
+        };
+        // 配对完成（Found peer）→ 配对码已被消费
+        audit_mark_code_used(&audit_store, audit_id);
         let peer_key = format!("{:x}", wormhole.verifier());
 
         // UDP 打洞优先（双方都支持才尝试；失败/禁用自动降级 relay）
@@ -2180,12 +2305,14 @@ fn send(
             {
                 Ok(sent) => {
                     human!("\n  ✅ UDP 直连传输完成，校验通过（{} 字节）", sent);
-                    return Ok((code, peer_key, sent));
+                    // Task 3：数据发完 = 收满全部 0x6b ack（接收方逐块校验回执）
+                    audit_mark_completed(&audit_store, audit_id);
+                    return Ok((audit_id, peer_key, sent));
                 }
                 Err(e) => {
                     if e.contains("fingerprint") {
                         // 指纹不匹配 = 安全问题：中止，绝不降级 relay
-                        return Err(format!("UDP 直连安全校验失败（指纹不匹配），中止传输: {e}"));
+                        return Err((audit_id, format!("UDP 直连安全校验失败（指纹不匹配），中止传输: {e}")));
                     }
                     // 打洞/STUN/超时失败 → 降级 relay（消息相位已对齐，见模块注释）
                     eprintln!("  ⚠ UDP 直连失败（{}），降级 relay…", e);
@@ -2214,11 +2341,14 @@ fn send(
                 Err(e) => {
                     // 通知接收方立即放弃（收满的块仍会正常收尾——done 满优先于 Abort）
                     let _ = wormhole.send_json(&UdpMsg::Abort).await;
-                    return Err(format!("relay 分块传输失败: {e}"));
+                    return Err((audit_id, format!("relay 分块传输失败: {e}")));
                 }
             };
             human!("\n  ✅ relay 分块传输完成，校验通过（{} 字节）", sent);
-            Ok((code, peer_key, sent))
+            // Task 3：数据发完（所有块会话成功）→ 完成点。relay 无额外回执：
+            // v3 主通道虽仍可用，但与旧端相位保持一致不新增 XferDone 消息
+            audit_mark_completed(&audit_store, audit_id);
+            Ok((audit_id, peer_key, sent))
         } else {
             json_emit_conn("relay");
             let relay_hints = relay_hints();
@@ -2245,9 +2375,13 @@ fn send(
                 Ok(()) => {
                     let sent = total_bytes.load(std::sync::atomic::Ordering::Relaxed);
                     human!("\n  ✅ 传输完成，校验通过（{} 字节）", sent);
-                    Ok((code, peer_key, sent))
+                    // Task 3：数据发完 → 完成点。wormhole 已被 send_file_or_folder
+                    // 按值消费（所有权转移），无法再经 wormhole 发 XferDone 回执——
+                    // 按规格"尽力回执"跳过，以发送方数据发完为可靠完成点
+                    audit_mark_completed(&audit_store, audit_id);
+                    Ok((audit_id, peer_key, sent))
                 }
-                Err(e) => Err(format!("传输失败: {}", e)),
+                Err(e) => Err((audit_id, format!("传输失败: {}", e))),
             }
         }
     });
@@ -2259,12 +2393,14 @@ fn send(
 
     let elapsed = now_secs() as f64 - started_at as f64;
     match result {
-        Ok((code, peer_key, sent)) => {
-            audit(&store, "send", dataset, &code, Some(&peer_key), sent, 0, "ok", started_at);
+        Ok((audit_id, peer_key, sent)) => {
+            // 终态回写：ok + peer_key + 字节 + finished_at
+            // （code_used_at/completed_at 已在配对完成/数据发完时写入）
+            audit_finish(&store, audit_id, Some(&peer_key), sent, "ok");
             json_emit_done(true, sent, elapsed);
         }
-        Err(e) => {
-            audit(&store, "send", dataset, "unknown", None, 0, 0, "failed", started_at);
+        Err((audit_id, e)) => {
+            audit_finish(&store, audit_id, None, 0, "failed");
             json_emit_error(&e);
             eprintln!("{}", e);
             std::process::exit(1);
@@ -2339,12 +2475,15 @@ fn get(
     human!("  ⏳ 正在连接…");
 
     let result = async_io::block_on(async {
+        // Task 3：过期/无效配对码的友好报错——magic-wormhole 对未认领（已过期/
+        // 从未创建）的 nameplate 报 "Nameplate is unclaimed"，包一层语义化提示；
+        // 其他错误保持原文（接收方不知道发送方实际 ttl，用默认 7 天说明有效期）
         let mailbox = MailboxConnection::connect(app_config(), code, false)
             .await
-            .map_err(|e| format!("无法连接 rendezvous（请确认配对码有效）: {}", e))?;
+            .map_err(|e| friendly_expired_code_error(&format!("无法连接 rendezvous（请确认配对码有效）: {}", e), DEFAULT_TTL_HOURS))?;
         let mut wormhole = Wormhole::connect(mailbox)
             .await
-            .map_err(|e| format!("Wormhole 连接失败: {}", e))?;
+            .map_err(|e| friendly_expired_code_error(&format!("Wormhole 连接失败: {}", e), DEFAULT_TTL_HOURS))?;
         let peer_key = format!("{:x}", wormhole.verifier());
 
         // v3 对端：先尝试 UDP 打洞（FAN_NO_UDP=1 时跳过），失败/禁用 → relay 分块；
@@ -2503,9 +2642,10 @@ fn log(config: &Config, layer: &DataLayer, json: bool) {
         Ok(c) => c,
         Err(e) => { eprintln!("无法读审计日志: {}", e); return; }
     };
-    let _ = conn.execute_batch(AUDIT_DDL);
+    ensure_audit_schema(&conn);
     let mut stmt = match conn.prepare(
-        "SELECT direction, dataset, code, status, bytes_sent, bytes_received, started_at
+        "SELECT direction, dataset, code, status, bytes_sent, bytes_received, started_at,
+                code_used_at, completed_at
          FROM transfer_log ORDER BY id DESC LIMIT 50"
     ) {
         Ok(s) => s,
@@ -2515,7 +2655,7 @@ fn log(config: &Config, layer: &DataLayer, json: bool) {
         Ok((
             r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
             r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
-            r.get::<_, i64>(6)?,
+            r.get::<_, i64>(6)?, r.get::<_, Option<i64>>(7)?, r.get::<_, Option<i64>>(8)?,
         ))
     });
     if json {
@@ -2525,7 +2665,7 @@ fn log(config: &Config, layer: &DataLayer, json: bool) {
                 out.push(serde_json::json!({
                     "direction": row.0, "dataset": row.1, "code": row.2,
                     "status": row.3, "bytes_sent": row.4, "bytes_received": row.5,
-                    "time": row.6,
+                    "time": row.6, "code_used_at": row.7, "completed_at": row.8,
                 }));
             }
         }
@@ -3256,5 +3396,76 @@ mod tests {
         // CLI 显式 0 → 视为未指定（回退 config/默认）
         assert_eq!(resolve_transfer_params(Some(0), 4, Some(0), 4), (4 * 1024 * 1024, 4));
         assert_eq!(resolve_transfer_params(Some(0), 4, None, 4), (4 * 1024 * 1024, 4));
+    }
+
+    // ---------- Task 3：配对码状态机（code_used/completed）+ ttl 7 天 + 过期码友好报错 ----------
+
+    /// 配对码默认有效期：7 天（168 小时）——main.rs 的 --ttl-hours 默认值与
+    /// 接收方过期码提示里的有效期说明都引用同一常量（同源，不会漂移）。
+    #[test]
+    fn default_ttl_is_7_days() {
+        assert_eq!(DEFAULT_TTL_HOURS, 168, "默认 ttl 应为 168 小时（7 天）");
+        assert_eq!(DEFAULT_TTL_HOURS, 7 * 24, "7 天 × 24 小时 = 168");
+    }
+
+    /// 审计表结构：新库建表即含 code_used_at/completed_at 两列；旧库（无这两列）
+    /// 经 ALTER TABLE 迁移补齐。PRAGMA table_info 验证，迁移幂等（重复执行不报错）。
+    #[test]
+    fn audit_insert_includes_status_fields() {
+        // 新库：AUDIT_DDL 直接含两列
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(AUDIT_DDL).unwrap();
+        let cols = audit_columns(&conn);
+        assert!(cols.iter().any(|c| c == "code_used_at"), "新库应含 code_used_at 列: {cols:?}");
+        assert!(cols.iter().any(|c| c == "completed_at"), "新库应含 completed_at 列: {cols:?}");
+        // 旧库：模拟 CREATE TABLE IF NOT EXISTS 之前就存在的旧表（无两列）
+        // → ensure_audit_schema 迁移后补齐（AUDIT_DDL 的 CREATE IF NOT EXISTS
+        // 不会给已有表加列，必须 ALTER TABLE ADD COLUMN）
+        let conn2 = rusqlite::Connection::open_in_memory().unwrap();
+        conn2
+            .execute_batch(
+                "CREATE TABLE transfer_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    direction TEXT NOT NULL,
+                    dataset TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    peer_key TEXT,
+                    bytes_sent INTEGER DEFAULT 0,
+                    bytes_received INTEGER DEFAULT 0,
+                    status TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    finished_at INTEGER
+                );",
+            )
+            .unwrap();
+        ensure_audit_schema(&conn2);
+        let cols2 = audit_columns(&conn2);
+        assert!(cols2.iter().any(|c| c == "code_used_at"), "旧库迁移后应补 code_used_at 列: {cols2:?}");
+        assert!(cols2.iter().any(|c| c == "completed_at"), "旧库迁移后应补 completed_at 列: {cols2:?}");
+        // 幂等：重复迁移不报错、列不重复
+        ensure_audit_schema(&conn2);
+        let cols3 = audit_columns(&conn2);
+        assert_eq!(
+            cols3.iter().filter(|c| **c == "code_used_at").count(),
+            1,
+            "重复迁移不应产生重复列: {cols3:?}"
+        );
+    }
+
+    /// 过期/无效配对码错误 → 友好中文提示（含有效期说明）；其他错误原样保留。
+    /// 接收方 rendezvous 连接失败时 magic-wormhole 报 "Nameplate is unclaimed: …"
+    /// （nameplate 未认领 = 配对码已过期或从未创建），映射为面向用户的语义化提示。
+    #[test]
+    fn expired_code_error_is_friendly() {
+        // 原始错误（已核实：Nameplate is unclaimed）
+        let msg = friendly_expired_code_error("Nameplate is unclaimed: 3-foo-bar", DEFAULT_TTL_HOURS);
+        assert!(msg.contains("配对码已过期"), "应含友好提示: {msg}");
+        assert!(msg.contains("168"), "应含有效期说明: {msg}");
+        // 变体：not found（大小写不敏感）
+        let msg2 = friendly_expired_code_error("nameplate not found", DEFAULT_TTL_HOURS);
+        assert!(msg2.contains("配对码已过期"), "应含友好提示: {msg2}");
+        // 无关错误（网络/超时等）原样保留，不做语义化包装
+        let other = friendly_expired_code_error("connection reset by peer", DEFAULT_TTL_HOURS);
+        assert_eq!(other, "connection reset by peer", "无关错误应原样返回");
     }
 }

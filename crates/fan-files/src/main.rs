@@ -180,8 +180,8 @@ enum TransferAction {
     Send {
         /// dataset 名称（来自索引）或本地路径
         dataset: String,
-        /// 配对码有效期（小时，默认 24）
-        #[arg(long, default_value_t = 24)]
+        /// 配对码有效期（小时，默认 7 天 = 168）
+        #[arg(long, default_value_t = commands::transfer::DEFAULT_TTL_HOURS)]
         ttl_hours: u64,
         /// 块大小（字节，默认 config [transfer].chunk_size_mb × 1MB）
         #[arg(long)]
