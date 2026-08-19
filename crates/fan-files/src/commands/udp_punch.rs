@@ -56,10 +56,6 @@ pub struct PunchResult {
 
 /// 绑一个 UDP socket，向 peer_addr 发打洞包并监听回包。
 /// 返回 Some = 收到对方打洞包（打洞成功，含对端实际源地址）；None = 超时或达到 PUNCH_MAX_ATTEMPTS。
-///
-/// **对称 NAT 支持**：收到任意合法打洞包后，把后续发包（含补发拍）的目标切换为
-/// 包的实际源地址。对称 NAT 侧的通告地址仅对 STUN 服务器有效，对端必须学会
-/// "我发向它的包从哪个地址出来"才能打通。
 pub fn punch_establish(
     bind: SocketAddr,
     peer: SocketAddr,
@@ -68,6 +64,22 @@ pub fn punch_establish(
     timeout: Duration,
 ) -> Option<PunchResult> {
     let sock = UdpSocket::bind(bind).ok()?;
+    punch_establish_on_sock(sock, peer, nonce, who, timeout)
+}
+
+/// 在**已绑定**的 socket 上打洞（打洞 socket 与 UDP STUN 查询必须是同一个——
+/// NAT 端口映射绑定在 socket 上，换 socket 映射就变了，通告地址即失效）。
+///
+/// **对称 NAT 支持**：收到任意合法打洞包后，把后续发包（含补发拍）的目标切换为
+/// 包的实际源地址。对称 NAT 侧的通告地址仅对 STUN 服务器有效，对端必须学会
+/// "我发向它的包从哪个地址出来"才能打通。
+pub fn punch_establish_on_sock(
+    sock: UdpSocket,
+    peer: SocketAddr,
+    nonce: u64,
+    who: String,
+    timeout: Duration,
+) -> Option<PunchResult> {
     sock.set_nonblocking(true).ok()?;
     let pkt = PunchPacket { nonce, from: who }.encode();
     let deadline = std::time::Instant::now() + timeout;
