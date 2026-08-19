@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -11,16 +11,39 @@ import {
   type Facet,
 } from "../api";
 import DataTable from "../components/DataTable";
+import TransferPanel, { type TransferEvent } from "../components/TransferPanel";
 
 // meta.type_counts 缺失时（老后端/空库）回退到固定类型集
 const FALLBACK_TYPES = ["genome", "transcriptome", "variant", "other"];
 
-// 共享状态：null=未共享，code=已生成码等待接收，running=传输中，done=完成
+// 解析引擎 JSONL 事件行；非 JSON 行（人类输出/配对码）返回 null（进原始日志）
+function parseTransferLine(line: string): TransferEvent | null {
+  try {
+    const obj = JSON.parse(line) as TransferEvent;
+    if (obj && typeof obj === "object" && typeof obj.type === "string") return obj;
+  } catch {
+    /* 非 JSON 行忽略 */
+  }
+  return null;
+}
+
+// 共享状态：idle=未共享，code=已生成码等待接收，running=传输中，
+// done=完成/失败，cancelled=用户取消（后端 done(-1) 已由取消流程消费，忽略）
 type ShareState =
   | { status: "idle" }
   | { status: "running" }
   | { status: "code"; code: string }
-  | { status: "done"; ok: boolean };
+  | { status: "done"; ok: boolean }
+  | { status: "cancelled" };
+
+type ReceiveStatus = "idle" | "running" | "done-ok" | "done-err" | "cancelled";
+
+// 续传确认弹窗内容（resume 事件触发）
+interface ResumeAsk {
+  side: "share" | "receive";
+  done: number;
+  total: number;
+}
 
 export default function DatasetsPage() {
   const [rows, setRows] = useState<DatasetSummary[]>([]);
@@ -33,17 +56,33 @@ export default function DatasetsPage() {
   const [history, setHistory] = useState<number[]>([]);
   // 翻页 loading guard：请求在途时禁用上一页/下一页，防连点双请求
   const [loading, setLoading] = useState(false);
-  // 数据集共享（P2P）状态 + 进度日志
+  // 数据集共享（P2P）状态
   const [share, setShare] = useState<ShareState>({ status: "idle" });
-  const [shareLog, setShareLog] = useState<string[]>([]);
+  // ref 镜像：事件监听闭包需读"当前"状态（取消后忽略后续 done(-1)，避免覆盖 cancelled 态）
+  const shareStatusRef = useRef<ShareState>({ status: "idle" });
+  const setShareState = (s: ShareState) => {
+    shareStatusRef.current = s;
+    setShare(s);
+  };
+  // 共享面板：解析后的事件（驱动面板）+ 原始行（折叠日志）
+  const [shareEvents, setShareEvents] = useState<TransferEvent[]>([]);
+  const [shareRaw, setShareRaw] = useState<string[]>([]);
   // 接收（P2P）状态
   const [receiveCode, setReceiveCode] = useState("");
-  const [receiveStatus, setReceiveStatus] = useState<
-    "idle" | "running" | "done-ok" | "done-err"
-  >("idle");
-  const [receiveLog, setReceiveLog] = useState<string[]>([]);
+  const [receiveStatus, setReceiveStatus] = useState<ReceiveStatus>("idle");
+  const receiveStatusRef = useRef<ReceiveStatus>("idle");
+  const setReceiveState = (s: ReceiveStatus) => {
+    receiveStatusRef.current = s;
+    setReceiveStatus(s);
+  };
+  const [receiveEvents, setReceiveEvents] = useState<TransferEvent[]>([]);
+  const [receiveRaw, setReceiveRaw] = useState<string[]>([]);
   // 最近一次接收的目标目录（"打开接收目录"用）
   const [receiveDir, setReceiveDir] = useState<string | null>(null);
+  // 续传确认弹窗（resume 事件触发）
+  const [resumeAsk, setResumeAsk] = useState<ResumeAsk | null>(null);
+  // 配对码复制反馈
+  const [copied, setCopied] = useState(false);
   // 传输历史
   const [transferHistory, setTransferHistory] = useState<HistoryEntry[]>([]);
 
@@ -72,34 +111,57 @@ export default function DatasetsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiveStatus === "done-ok", share.status === "done"]);
 
-  // 监听共享事件流（share://code / progress / done / error）
+  // 监听共享事件流（share://code / progress / done / error）与接收事件流
+  // （receive://progress / done / error）。progress 为 JSONL 行：JSON.parse
+  // 成功 → 分发到面板；失败（人类输出等）→ 仅进原始日志。
   useEffect(() => {
     const unCode = listen<string>("share://code", (e) => {
-      setShare({ status: "code", code: e.payload });
-      setShareLog((l) => [...l, `传输码: ${e.payload}`]);
+      setShareState({ status: "code", code: e.payload });
+      setShareRaw((l) => [...l.slice(-200), `配对码: ${e.payload}`]);
     });
     const unProgress = listen<string>("share://progress", (e) => {
-      setShareLog((l) => [...l.slice(-200), e.payload]);
+      setShareRaw((l) => [...l.slice(-200), e.payload]);
+      const ev = parseTransferLine(e.payload);
+      if (!ev) return;
+      setShareEvents((es) => [...es.slice(-200), ev]);
+      if (ev.type === "resume") {
+        setResumeAsk({ side: "share", done: ev.done, total: ev.total });
+      }
     });
     const unDone = listen<number>("share://done", (e) => {
-      setShare({ status: "done", ok: e.payload === 0 });
-      if (e.payload !== 0) setShareLog((l) => [...l, "共享失败"]);
+      const s = shareStatusRef.current;
+      if (s.status === "cancelled" || s.status === "idle") return;
+      setShareState({ status: "done", ok: e.payload === 0 });
+      setShareRaw((l) => [
+        ...l.slice(-200),
+        e.payload === 0 ? "共享完成" : `共享失败（退出码 ${e.payload}）`,
+      ]);
     });
     const unError = listen<string>("share://error", (e) => {
-      setShare({ status: "done", ok: false });
-      setShareLog((l) => [...l, `共享错误: ${e.payload}`]);
+      setShareState({ status: "done", ok: false });
+      setShareRaw((l) => [...l.slice(-200), `共享错误: ${e.payload}`]);
     });
-    // 接收事件流（receive://progress / done / error）
     const unRProgress = listen<string>("receive://progress", (e) => {
-      setReceiveLog((l) => [...l.slice(-200), e.payload]);
+      setReceiveRaw((l) => [...l.slice(-200), e.payload]);
+      const ev = parseTransferLine(e.payload);
+      if (!ev) return;
+      setReceiveEvents((es) => [...es.slice(-200), ev]);
+      if (ev.type === "resume") {
+        setResumeAsk({ side: "receive", done: ev.done, total: ev.total });
+      }
     });
     const unRDone = listen<number>("receive://done", (e) => {
-      setReceiveStatus(e.payload === 0 ? "done-ok" : "done-err");
-      if (e.payload !== 0) setReceiveLog((l) => [...l, "接收失败"]);
+      const s = receiveStatusRef.current;
+      if (s === "cancelled" || s === "idle") return;
+      setReceiveState(e.payload === 0 ? "done-ok" : "done-err");
+      setReceiveRaw((l) => [
+        ...l.slice(-200),
+        e.payload === 0 ? "接收完成" : `接收失败（退出码 ${e.payload}）`,
+      ]);
     });
     const unRError = listen<string>("receive://error", (e) => {
-      setReceiveStatus("done-err");
-      setReceiveLog((l) => [...l, `接收错误: ${e.payload}`]);
+      setReceiveState("done-err");
+      setReceiveRaw((l) => [...l.slice(-200), `接收错误: ${e.payload}`]);
     });
     return () => {
       unCode.then((u) => u());
@@ -113,21 +175,23 @@ export default function DatasetsPage() {
   }, []);
 
   async function startShare(path: string) {
-    setShare({ status: "running" });
-    setShareLog([]);
+    setShareState({ status: "running" });
+    setShareEvents([]);
+    setShareRaw([]);
     try {
       await invoke("share_dataset", { path });
     } catch (e) {
-      setShare({ status: "done", ok: false });
-      setShareLog((l) => [...l, `共享启动失败: ${String(e)}`]);
+      setShareState({ status: "done", ok: false });
+      setShareRaw((l) => [...l, `共享启动失败: ${String(e)}`]);
     }
   }
 
   async function startReceive() {
     const code = receiveCode.trim();
     if (!code || receiveStatus === "running") return;
-    setReceiveStatus("running");
-    setReceiveLog([]);
+    setReceiveState("running");
+    setReceiveEvents([]);
+    setReceiveRaw([]);
     try {
       // 接收输出到 ~/Downloads/fan-received（默认接收目录）
       const home = await invoke<string>("fan_home");
@@ -135,8 +199,66 @@ export default function DatasetsPage() {
       setReceiveDir(downloads);
       await invoke("receive_dataset", { code, output: downloads });
     } catch (e) {
-      setReceiveStatus("done-err");
-      setReceiveLog((l) => [...l, `接收启动失败: ${String(e)}`]);
+      setReceiveState("done-err");
+      setReceiveRaw((l) => [...l, `接收启动失败: ${String(e)}`]);
+    }
+  }
+
+  // 取消共享：面板推进到终态（合成 done 事件 → 取消按钮禁用），后端杀子进程；
+  // 后端随后发的 done(-1) 由监听闭包按 cancelled 态忽略
+  async function cancelShare() {
+    const s = shareStatusRef.current;
+    if (s.status === "idle" || s.status === "cancelled") return;
+    setShareState({ status: "cancelled" });
+    setShareEvents((es) => [
+      ...es.slice(-200),
+      { type: "done", ok: false, bytes: 0, elapsed_secs: 0 },
+    ]);
+    setShareRaw((l) => [...l.slice(-200), "已取消"]);
+    try {
+      await invoke("cancel_transfer");
+    } catch {
+      /* 取消失败不影响面板终态 */
+    }
+  }
+
+  async function cancelReceive() {
+    const s = receiveStatusRef.current;
+    if (s === "idle" || s === "cancelled") return;
+    setReceiveState("cancelled");
+    setReceiveEvents((es) => [
+      ...es.slice(-200),
+      { type: "done", ok: false, bytes: 0, elapsed_secs: 0 },
+    ]);
+    setReceiveRaw((l) => [...l.slice(-200), "已取消"]);
+    try {
+      await invoke("cancel_transfer");
+    } catch {
+      /* 取消失败不影响面板终态 */
+    }
+  }
+
+  // 续传确认：继续 → 仅关闭弹窗（引擎已自动续传缺失块）；放弃 → 取消对应方向
+  function continueResume() {
+    setResumeAsk(null);
+  }
+
+  function rejectResume() {
+    const ask = resumeAsk;
+    setResumeAsk(null);
+    if (ask?.side === "share") void cancelShare();
+    else if (ask?.side === "receive") void cancelReceive();
+  }
+
+  // 复制配对码到剪贴板（navigator.clipboard；非安全上下文等失败静默）
+  async function copyCode() {
+    if (share.status !== "code") return;
+    try {
+      await navigator.clipboard.writeText(share.code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* 剪贴板不可用时静默 */
     }
   }
 
@@ -231,8 +353,19 @@ export default function DatasetsPage() {
         {receiveStatus === "done-err" && (
           <span className="feedback-err">❌ 接收失败</span>
         )}
-        {receiveLog.length > 0 && (
-          <pre className="receive-log">{receiveLog.join("\n")}</pre>
+        {receiveStatus === "cancelled" && (
+          <span className="feedback-err">已取消</span>
+        )}
+        {/* 接收传输面板（进度/徽标/续传/取消 + 折叠原始日志） */}
+        {receiveStatus !== "idle" && (
+          <div className="receive-panel-wrap">
+            <TransferPanel
+              name={receiveCode.trim() || "接收"}
+              events={receiveEvents}
+              log={receiveRaw}
+              onCancel={() => void cancelReceive()}
+            />
+          </div>
         )}
       </div>
       {/* P2P 传输历史 */}
@@ -335,23 +468,47 @@ export default function DatasetsPage() {
                 {share.status === "code" && (
                   <div className="share-code">
                     <div className="share-code-label">把下面的配对码发给对方，对方执行：</div>
-                    <code className="share-code-value">{share.code}</code>
+                    <div className="share-code-row">
+                      <code className="share-code-value">{share.code}</code>
+                      <button className="secondary copy-btn" onClick={copyCode}>
+                        {copied ? "已复制 ✓" : "📋 复制"}
+                      </button>
+                    </div>
                     <div className="share-code-cmd">
                       fan-files transfer get {share.code}
                     </div>
+                    <div className="share-code-tip">⏳ 配对码 24 小时内有效</div>
                   </div>
                 )}
-                {share.status === "running" && <div className="share-hint">⏳ 正在连接 rendezvous…</div>}
-                {share.status === "done" && (
-                  <div className={share.ok ? "feedback-ok" : "feedback-err"}>
-                    {share.ok ? "✅ 共享完成" : "❌ 共享失败"}
-                  </div>
-                )}
-                {shareLog.length > 0 && (
-                  <pre className="share-log">{shareLog.join("\n")}</pre>
-                )}
+                {/* 共享传输面板（进度/徽标/续传/取消 + 折叠原始日志） */}
+                <TransferPanel
+                  name={detail?.name ?? "共享"}
+                  events={shareEvents}
+                  log={shareRaw}
+                  onCancel={() => void cancelShare()}
+                />
               </div>
             )}
+          </div>
+        </div>
+      )}
+      {/* 续传确认弹窗（resume 事件触发；继续=关弹窗，引擎已自动续传） */}
+      {resumeAsk && (
+        <div className="modal" onClick={continueResume}>
+          <div className="modal-body" onClick={(e) => e.stopPropagation()}>
+            <h3>续传确认</h3>
+            <p>
+              发现未完成传输，已收 {resumeAsk.done}/{resumeAsk.total}（
+              {Math.round((resumeAsk.done / resumeAsk.total) * 100)}%），是否续传？
+            </p>
+            <div className="modal-actions">
+              <button className="primary" onClick={continueResume}>
+                继续续传
+              </button>
+              <button className="secondary" onClick={rejectResume}>
+                放弃并取消
+              </button>
+            </div>
           </div>
         </div>
       )}

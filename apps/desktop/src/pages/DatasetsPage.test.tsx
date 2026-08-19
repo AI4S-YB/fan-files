@@ -8,6 +8,27 @@ vi.mock("../api");
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 import { invoke } from "@tauri-apps/api/core";
 
+// Tauri 事件流 mock：测试通过 eventMock.emit 注入 share:// / receive:// 事件
+// （驱动传输面板与续传弹窗）。listen 是普通函数（非 vi.fn），
+// 不受 beforeEach 的 vi.resetAllMocks() 影响。
+const eventMock = vi.hoisted(() => {
+  const listeners = new Map<string, ((e: { payload: unknown }) => void)[]>();
+  return {
+    listeners,
+    listen: (event: string, cb: (e: { payload: unknown }) => void) => {
+      const arr = listeners.get(event) ?? [];
+      arr.push(cb);
+      listeners.set(event, arr);
+      return Promise.resolve(() => undefined);
+    },
+    emit: (event: string, payload: unknown) => {
+      for (const cb of listeners.get(event) ?? []) cb({ payload });
+    },
+    clear: () => listeners.clear(),
+  };
+});
+vi.mock("@tauri-apps/api/event", () => ({ listen: eventMock.listen }));
+
 const mockedApi = vi.mocked(api);
 
 const summary1 = {
@@ -77,6 +98,7 @@ const filesPage = {
 beforeEach(() => {
   // resetAllMocks：连未消费的 mockResolvedValueOnce 队列也清掉，避免一个用例中途失败污染后续用例
   vi.resetAllMocks();
+  eventMock.clear(); // 事件监听跨用例清空，防泄漏
   mockedApi.fetchDatasets.mockResolvedValue(pageOne);
   mockedApi.fetchDatasetDetail.mockResolvedValue(detailFixture);
   mockedApi.fetchFiles.mockResolvedValue(filesPage);
@@ -259,5 +281,123 @@ describe("DatasetsPage", () => {
     );
     // 传输中显示连接提示
     expect(screen.getByText(/正在连接/)).toBeInTheDocument();
+  });
+
+  // GUI-T3: progress/conn 事件驱动共享传输面板（进度条 + 连接徽标）
+  it("drives the share panel from progress events", async () => {
+    vi.mocked(invoke).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
+    await screen.findByText("资产");
+    fireEvent.click(screen.getByRole("button", { name: /共享/ }));
+    expect(await screen.findByText(/正在连接/)).toBeInTheDocument();
+    // conn 事件 → 徽标
+    eventMock.emit("share://progress", JSON.stringify({ type: "conn", mode: "punching" }));
+    expect(await screen.findByText("打洞中")).toBeInTheDocument();
+    // progress 事件 → 进度条
+    eventMock.emit(
+      "share://progress",
+      JSON.stringify({ type: "progress", sent: 512, total: 1024, pct: 50, chunks: 1 })
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50")
+    );
+  });
+
+  // GUI-T3: resume 事件 → 续传确认弹窗；拒绝 → cancel_transfer
+  it("shows the resume confirm dialog and rejecting invokes cancel_transfer", async () => {
+    vi.mocked(invoke).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
+    await screen.findByText("资产");
+    fireEvent.click(screen.getByRole("button", { name: /共享/ }));
+    eventMock.emit("share://progress", JSON.stringify({ type: "resume", done: 34, total: 120 }));
+    expect(await screen.findByText(/发现未完成传输/)).toBeInTheDocument();
+    expect(screen.getByText(/已收 34\/120/)).toBeInTheDocument();
+    // 拒绝 → cancel_transfer（弹窗关闭）
+    fireEvent.click(screen.getByRole("button", { name: "放弃并取消" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("cancel_transfer"));
+    expect(screen.queryByText(/发现未完成传输/)).not.toBeInTheDocument();
+  });
+
+  // GUI-T3: 确认续传 → 只关闭弹窗（引擎已自动续传），不触发取消
+  it("confirming resume only closes the dialog", async () => {
+    vi.mocked(invoke).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
+    await screen.findByText("资产");
+    fireEvent.click(screen.getByRole("button", { name: /共享/ }));
+    eventMock.emit("share://progress", JSON.stringify({ type: "resume", done: 34, total: 120 }));
+    await screen.findByText(/发现未完成传输/);
+    fireEvent.click(screen.getByRole("button", { name: "继续续传" }));
+    await waitFor(() =>
+      expect(screen.queryByText(/发现未完成传输/)).not.toBeInTheDocument()
+    );
+    expect(invoke).not.toHaveBeenCalledWith("cancel_transfer");
+  });
+
+  // GUI-T3: 面板取消按钮 → cancel_transfer + 面板终态（按钮禁用）
+  it("cancel button invokes cancel_transfer and ends the panel", async () => {
+    vi.mocked(invoke).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
+    await screen.findByText("资产");
+    fireEvent.click(screen.getByRole("button", { name: /共享/ }));
+    await screen.findByText(/正在连接/);
+    fireEvent.click(screen.getByRole("button", { name: /取消传输/ }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("cancel_transfer"));
+    expect(await screen.findByText(/传输失败或已取消/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /取消传输/ })).toBeDisabled();
+  });
+
+  // GUI-T3: 接收侧 progress 事件驱动面板（接收流程注入事件流）
+  it("drives the receive panel from progress events", async () => {
+    // 挂载时 transfer_history → []；点击接收时 fan_home → 主目录路径；receive_dataset → ok
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce("/home/user/.fan-files")
+      .mockResolvedValueOnce(null);
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.change(screen.getByPlaceholderText(/输入配对码/), {
+      target: { value: "8-purple-hammer" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "接收" }));
+    expect(await screen.findByText(/正在连接/)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("receive_dataset", {
+        code: "8-purple-hammer",
+        output: "/home/user/Downloads/fan-received",
+      })
+    );
+    eventMock.emit("receive://progress", JSON.stringify({ type: "conn", mode: "direct" }));
+    expect(await screen.findByText("P2P直连")).toBeInTheDocument();
+    eventMock.emit(
+      "receive://progress",
+      JSON.stringify({ type: "progress", sent: 512, total: 1024, pct: 50, chunks: 1 })
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50")
+    );
+  });
+
+  // GUI-T3: 配对码大字 + 复制按钮（navigator.clipboard）+ 有效期提示
+  it("copies the pairing code with feedback", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    vi.mocked(invoke).mockResolvedValue(null);
+    render(<DatasetsPage />);
+    fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
+    await screen.findByText("资产");
+    fireEvent.click(screen.getByRole("button", { name: /共享/ }));
+    eventMock.emit("share://code", "8-purple-hammer");
+    expect(await screen.findByText("8-purple-hammer")).toBeInTheDocument();
+    expect(screen.getByText(/24 小时内有效/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /复制/ }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("8-purple-hammer"));
+    expect(await screen.findByText("已复制 ✓")).toBeInTheDocument();
   });
 });

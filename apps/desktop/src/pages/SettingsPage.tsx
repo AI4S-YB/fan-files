@@ -14,6 +14,22 @@ interface FanConfig {
 
 const EMPTY: FanConfig = { threads: null, include: [], exclude: [], endpoint: "", api_key: "", model: "" };
 
+// [transfer] 段（与后端 read_transfer_config 返回形状一致：chunk_size_mb/concurrency/
+// receive_dir/udp_enabled；缺失键回退默认）
+interface TransferCfg {
+  chunk_size_mb: number;
+  concurrency: number;
+  receive_dir: string | null;
+  udp_enabled: boolean;
+}
+
+const DEFAULT_TRANSFER: TransferCfg = {
+  chunk_size_mb: 4,
+  concurrency: 4,
+  receive_dir: null,
+  udp_enabled: true,
+};
+
 export default function SettingsPage() {
   const [cfg, setCfg] = useState<FanConfig>(EMPTY);
   const [saved, setSaved] = useState(false);
@@ -23,11 +39,21 @@ export default function SettingsPage() {
   const [testError, setTestError] = useState<string | null>(null);
   const [testRunning, setTestRunning] = useState(false);
   const [updateText, setUpdateText] = useState<string | null>(null);
+  // 传输参数（[transfer] 段，独立加载/保存）
+  const [transfer, setTransfer] = useState<TransferCfg>(DEFAULT_TRANSFER);
+  const [transferSaved, setTransferSaved] = useState(false);
+  const [transferError, setTransferError] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<FanConfig>("read_config")
       .then(setCfg)
       .catch(() => setCfg(EMPTY)); // 读取失败 → 全空默认（同 T9 模式）
+  }, []);
+
+  useEffect(() => {
+    invoke<Partial<TransferCfg>>("read_transfer_config")
+      .then((c) => setTransfer({ ...DEFAULT_TRANSFER, ...c }))
+      .catch(() => setTransfer(DEFAULT_TRANSFER)); // 读取失败 → 默认值
   }, []);
 
   const patch = <K extends keyof FanConfig>(key: K, value: FanConfig[K]) => {
@@ -105,6 +131,45 @@ export default function SettingsPage() {
     }
   };
 
+  // ---- 传输参数（[transfer] 段）----
+
+  const patchTransfer = <K extends keyof TransferCfg>(key: K, value: TransferCfg[K]) => {
+    setTransfer((t) => ({ ...t, [key]: value }));
+    setTransferSaved(false);
+    setTransferError(null);
+  };
+
+  // 保存 [transfer] 段：read-modify-write 由后端保证；receive_dir=null 会删除该键
+  const saveTransfer = () => {
+    const cfg: TransferCfg = {
+      chunk_size_mb: transfer.chunk_size_mb,
+      concurrency: transfer.concurrency,
+      receive_dir: transfer.receive_dir,
+      udp_enabled: transfer.udp_enabled,
+    };
+    invoke("write_transfer_config", { cfg })
+      .then(() => {
+        setTransferSaved(true);
+        setTransferError(null);
+      })
+      .catch((e) => {
+        setTransferSaved(false);
+        setTransferError(String(e));
+      });
+  };
+
+  // 默认接收目录选择（复用原生目录选择器 pick_directory；取消（null）不修改）
+  const pickReceiveDir = async () => {
+    try {
+      const dir = await invoke<string | null>("pick_directory");
+      if (dir) {
+        patchTransfer("receive_dir", dir);
+      }
+    } catch (e) {
+      setTransferError(String(e));
+    }
+  };
+
   return (
     <div className="page settings">
       <h2>设置</h2>
@@ -133,6 +198,81 @@ export default function SettingsPage() {
         <button className="secondary" onClick={addDirectory}>
           📁 添加目录
         </button>
+      </section>
+
+      {/* GUI-T3: 传输参数（config [transfer] 段，独立保存） */}
+      <section className="settings-section">
+        <h3>传输设置</h3>
+        <label className="field" htmlFor="chunk-size">
+          <span>块大小（MB）</span>
+          <select
+            id="chunk-size"
+            value={transfer.chunk_size_mb}
+            onChange={(e) => patchTransfer("chunk_size_mb", Number(e.target.value))}
+          >
+            {[2, 4, 8, 16].map((v) => (
+              <option key={v} value={v}>
+                {v} MB
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field" htmlFor="concurrency">
+          <span>并发数（同时传输的块数）</span>
+          <select
+            id="concurrency"
+            value={transfer.concurrency}
+            onChange={(e) => patchTransfer("concurrency", Number(e.target.value))}
+          >
+            {[1, 2, 4, 8].map((v) => (
+              <option key={v} value={v}>
+                {v}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="field">
+          <span>默认接收目录</span>
+          <div className="dir-row">
+            <input
+              aria-label="默认接收目录"
+              readOnly
+              className="dir-input dir-readonly"
+              value={
+                transfer.receive_dir ?? "未设置（默认 ~/Downloads/fan-received）"
+              }
+            />
+            <button className="secondary" onClick={pickReceiveDir}>
+              📁 选择目录
+            </button>
+            {transfer.receive_dir && (
+              <button
+                className="secondary"
+                onClick={() => patchTransfer("receive_dir", null)}
+              >
+                清除
+              </button>
+            )}
+          </div>
+        </div>
+        <label className="field toggle-row" htmlFor="udp-enabled">
+          <span>启用 UDP 直连（P2P 打洞，失败自动降级中继）</span>
+          <input
+            id="udp-enabled"
+            type="checkbox"
+            checked={transfer.udp_enabled}
+            onChange={(e) => patchTransfer("udp_enabled", e.target.checked)}
+          />
+        </label>
+        <div className="settings-actions">
+          <button className="secondary" onClick={saveTransfer}>
+            保存传输设置
+          </button>
+          {transferSaved && <span className="feedback-ok">已保存 ✓</span>}
+          {transferError && (
+            <span className="feedback-err">保存失败：{transferError}</span>
+          )}
+        </div>
       </section>
 
       <section className="settings-section">

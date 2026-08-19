@@ -293,7 +293,8 @@ pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result
                 }
             }
         };
-        // stderr：人类可读输出（JSON 模式下配对码只在这里），提取配对码
+        // stderr：人类可读输出（JSON 模式下配对码只在这里）。提取配对码发 code 事件，
+        // 其余行转发原始行（前端 JSON.parse 失败 → 折叠日志，失败原因可见）
         let stderr_task = async {
             if let Some(err) = stderr {
                 let mut lines = tokio::io::BufReader::new(err).lines();
@@ -304,6 +305,7 @@ pub(crate) async fn share_dataset(app: tauri::AppHandle, path: String) -> Result
                             let _ = handle.emit("share://code", code.trim().to_string());
                         }
                     }
+                    let _ = handle.emit("share://progress", &line);
                 }
             }
         };
@@ -370,8 +372,10 @@ pub(crate) async fn receive_dataset(
             .arg("--concurrency")
             .arg(concurrency.to_string())
             .stdout(Stdio::piped())
-            // 接收方不需要配对码：stderr 直接丢弃（避免管道满阻塞子进程）
-            .stderr(Stdio::null())
+            // stderr：人类可读输出/失败原因 → 逐行转发原始行（前端 JSON.parse
+            // 失败 → 折叠日志）。此前 Stdio::null() 丢弃，接收失败时看不到原因。
+            // 双管道并发读（tokio::join!）避免管道满阻塞子进程。
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
@@ -381,6 +385,7 @@ pub(crate) async fn receive_dataset(
             }
         };
         let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
         let my_id = child.id();
         let old = CURRENT_TRANSFER
             .lock()
@@ -390,12 +395,25 @@ pub(crate) async fn receive_dataset(
             let _ = old.child.kill().await;
         }
         use tokio::io::AsyncBufReadExt;
-        if let Some(out) = stdout {
-            let mut lines = tokio::io::BufReader::new(out).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = handle.emit("receive://progress", &line);
+        // stdout：JSONL 事件行逐行转发（与共享侧对称）
+        let stdout_task = async {
+            if let Some(out) = stdout {
+                let mut lines = tokio::io::BufReader::new(out).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = handle.emit("receive://progress", &line);
+                }
             }
-        }
+        };
+        // stderr：人类可读输出（失败原因等）逐行转发原始行
+        let stderr_task = async {
+            if let Some(err) = stderr {
+                let mut lines = tokio::io::BufReader::new(err).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = handle.emit("receive://progress", &line);
+                }
+            }
+        };
+        tokio::join!(stdout_task, stderr_task);
         let at = {
             let mut guard = CURRENT_TRANSFER.lock().unwrap();
             if guard

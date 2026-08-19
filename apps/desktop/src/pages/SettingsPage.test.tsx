@@ -10,6 +10,13 @@ beforeEach(() => {
 });
 
 const DEFAULT_CFG = { include: [], exclude: [], endpoint: "", api_key: "", model: "" };
+// 挂载时 read_transfer_config 的返回值（传输参数 [transfer] 段）
+const TRANSFER_CFG = {
+  chunk_size_mb: 4,
+  concurrency: 4,
+  receive_dir: null,
+  udp_enabled: true,
+};
 
 describe("SettingsPage", () => {
   it("loads config into fields", async () => {
@@ -60,6 +67,7 @@ describe("SettingsPage", () => {
   it("shows error line when write_config fails", async () => {
     vi.mocked(invoke)
       .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
       .mockRejectedValueOnce(new Error("disk full"));
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByRole("button", { name: "保存配置" })).toBeInTheDocument());
@@ -69,8 +77,11 @@ describe("SettingsPage", () => {
   });
   // T13: 添加目录走原生目录选择器 pick_directory 命令
   it("invokes pick_directory when adding a directory, cancel keeps list unchanged", async () => {
-    // 第一次调用是挂载时的 read_config，第二次是点击后的 pick_directory（用户取消 → null）
-    vi.mocked(invoke).mockResolvedValueOnce(DEFAULT_CFG).mockResolvedValueOnce(null);
+    // 挂载时的 read_config / read_transfer_config，然后点击后的 pick_directory（用户取消 → null）
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValueOnce(null);
     render(<SettingsPage />);
     fireEvent.click(screen.getByRole("button", { name: /添加目录/ }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("pick_directory"));
@@ -79,7 +90,10 @@ describe("SettingsPage", () => {
     expect(screen.queryByLabelText(/目录 \d+/)).not.toBeInTheDocument();
   });
   it("appends the picked directory to the include list", async () => {
-    vi.mocked(invoke).mockResolvedValueOnce(DEFAULT_CFG).mockResolvedValueOnce("/a");
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValueOnce("/a");
     render(<SettingsPage />);
     fireEvent.click(screen.getByRole("button", { name: /添加目录/ }));
     // include 列表出现新目录输入项
@@ -87,7 +101,10 @@ describe("SettingsPage", () => {
   });
   // T13: 测试连接 → test_connection 命令，按返回值展示 连接成功/连接失败
   it("shows 连接成功 when test_connection returns true", async () => {
-    vi.mocked(invoke).mockResolvedValueOnce(DEFAULT_CFG).mockResolvedValueOnce(true);
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValueOnce(true);
     render(<SettingsPage />);
     fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
     await waitFor(() => expect(screen.getByText(/连接成功/)).toBeInTheDocument());
@@ -97,7 +114,10 @@ describe("SettingsPage", () => {
     );
   });
   it("shows 连接失败 when test_connection returns false", async () => {
-    vi.mocked(invoke).mockResolvedValueOnce(DEFAULT_CFG).mockResolvedValueOnce(false);
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValueOnce(false);
     render(<SettingsPage />);
     fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
     await waitFor(() => expect(screen.getByText(/连接失败/)).toBeInTheDocument());
@@ -107,9 +127,80 @@ describe("SettingsPage", () => {
   it("shows check_update output text", async () => {
     vi.mocked(invoke)
       .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
       .mockResolvedValueOnce("已是最新版本 v1.2.3");
     render(<SettingsPage />);
     fireEvent.click(screen.getByRole("button", { name: "检查更新" }));
     await waitFor(() => expect(screen.getByText(/已是最新版本 v1\.2\.3/)).toBeInTheDocument());
+  });
+
+  // GUI-T3: 传输设置区渲染（块大小/并发/UDP 直连默认值 + 保存按钮）
+  it("renders the transfer settings section with defaults", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(DEFAULT_CFG).mockResolvedValueOnce(TRANSFER_CFG);
+    render(<SettingsPage />);
+    const chunkSelect = await screen.findByLabelText("块大小（MB）");
+    expect(chunkSelect).toHaveValue("4");
+    expect(screen.getByLabelText("并发数（同时传输的块数）")).toHaveValue("4");
+    expect(screen.getByLabelText(/启用 UDP 直连/)).toBeChecked();
+    expect(screen.getByRole("button", { name: "保存传输设置" })).toBeInTheDocument();
+    // 未设置默认接收目录 → 提示默认路径
+    expect(screen.getByDisplayValue(/未设置（默认 ~\/Downloads\/fan-received）/)).toBeInTheDocument();
+  });
+
+  // GUI-T3: 保存传输设置 → write_transfer_config（块大小/并发/UDP 透传）
+  it("saves transfer config via write_transfer_config on button click", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValue(undefined); // 后续 write_transfer_config
+    render(<SettingsPage />);
+    fireEvent.change(await screen.findByLabelText("块大小（MB）"), {
+      target: { value: "8" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存传输设置" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "write_transfer_config",
+        expect.objectContaining({
+          cfg: expect.objectContaining({
+            chunk_size_mb: 8,
+            concurrency: 4,
+            udp_enabled: true,
+            receive_dir: null,
+          }),
+        })
+      )
+    );
+    expect(await screen.findByText(/已保存/)).toBeInTheDocument();
+  });
+
+  // GUI-T3: UDP 直连 toggle 关闭后保存 → udp_enabled=false
+  it("saves udp_enabled=false when the toggle is off", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValue(undefined); // 后续 write_transfer_config
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByLabelText(/启用 UDP 直连/));
+    fireEvent.click(screen.getByRole("button", { name: "保存传输设置" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "write_transfer_config",
+        expect.objectContaining({
+          cfg: expect.objectContaining({ udp_enabled: false }),
+        })
+      )
+    );
+  });
+
+  // GUI-T3: 默认接收目录走原生目录选择器 pick_directory
+  it("picks the default receive directory via pick_directory", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValueOnce("/data/received");
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByRole("button", { name: /选择目录/ }));
+    await waitFor(() => expect(screen.getByDisplayValue("/data/received")).toBeInTheDocument());
   });
 });
