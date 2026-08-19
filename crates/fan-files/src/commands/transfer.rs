@@ -88,6 +88,105 @@ fn udp_disabled() -> bool {
     std::env::var("FAN_NO_UDP").map(|v| v == "1").unwrap_or(false)
 }
 
+// ---------- JSONL 事件输出（FAN_JSON_PROGRESS=1，GUI 解析用） ----------
+// 事件行输出到 stdout（人类可读进度仍在 stderr，互不污染）：
+//   {"type":"conn","mode":"direct"|"relay"|"punching"}
+//   {"type":"progress","sent","total","chunk","chunks","pct"}
+//   {"type":"resume","done","total"}   （接收方清单命中，续传）
+//   {"type":"done","ok","bytes","elapsed_secs"}
+//   {"type":"error","msg"}
+// 非 JSON 模式（未设 FAN_JSON_PROGRESS）下所有 emit 均为 no-op，行为完全不变。
+
+/// FAN_JSON_PROGRESS=1 → 事件以 JSONL 逐行输出
+fn json_mode() -> bool {
+    std::env::var("FAN_JSON_PROGRESS").map(|v| v == "1").unwrap_or(false)
+}
+
+/// 人类可读输出：JSON 模式下转 stderr（stdout 保持纯 JSONL 供 GUI 逐行解析），
+/// 非 JSON 模式原样 println 到 stdout（行为完全不变）。
+macro_rules! human {
+    ($($arg:tt)*) => {
+        if json_mode() {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    };
+}
+
+/// 组装事件 JSON 值：type 字段 + 附加字段
+fn json_event_value(ev_type: &str, fields: &serde_json::Value) -> serde_json::Value {
+    let mut v = serde_json::json!({ "type": ev_type });
+    if let serde_json::Value::Object(map) = fields {
+        for (k, val) in map {
+            v[k] = val.clone();
+        }
+    }
+    v
+}
+
+/// 输出一行 JSONL（仅 JSON 模式）
+fn json_emit(v: &serde_json::Value) {
+    if json_mode() {
+        println!("{}", serde_json::to_string(v).unwrap_or_else(|_| "{}".into()));
+    }
+}
+
+/// 连接模式事件：direct（UDP 直连）/ relay（中继兜底）/ punching（打洞中）
+fn json_emit_conn(mode: &str) {
+    json_emit(&json_event_value("conn", &serde_json::json!({ "mode": mode })));
+}
+
+/// 进度事件：已传/总字节 + 块大小/块数 + 百分比
+fn json_emit_progress(sent: u64, total: u64, chunk_size: u64, chunks: u32) {
+    let pct = if total > 0 { sent as f64 / total as f64 * 100.0 } else { 0.0 };
+    json_emit(&json_event_value("progress", &serde_json::json!({
+        "sent": sent, "total": total, "chunk": chunk_size, "chunks": chunks, "pct": pct,
+    })));
+}
+
+/// 清单命中（接收方续传）：done = 已收块数，total = 总块数
+fn json_emit_resume(done: usize, total: u32) {
+    json_emit(&json_event_value("resume", &serde_json::json!({ "done": done, "total": total })));
+}
+
+/// 完成事件（成功路径）
+fn json_emit_done(ok: bool, bytes: u64, elapsed_secs: f64) {
+    json_emit(&json_event_value("done", &serde_json::json!({ "ok": ok, "bytes": bytes, "elapsed_secs": elapsed_secs })));
+}
+
+/// 错误事件（失败路径）
+fn json_emit_error(msg: &str) {
+    json_emit(&json_event_value("error", &serde_json::json!({ "msg": msg })));
+}
+
+/// JSON 进度封装：非 JSON 模式原样转发（行为不变）；JSON 模式额外输出 progress 行
+fn progress_with_json<F>(mut cb: F, chunk_size: u64, chunks: u32) -> impl FnMut(u64, u64) + Clone + Send + 'static
+where
+    F: FnMut(u64, u64) + Clone + Send + 'static,
+{
+    move |sent, total| {
+        cb(sent, total);
+        json_emit_progress(sent, total, chunk_size, chunks);
+    }
+}
+
+/// 传输参数解析：CLI > config.toml [transfer] > 默认值（4MB / 4）。
+/// CLI 的 chunk_size 单位为字节，config 的 chunk_size_mb 单位为 MB；
+/// 显式 0 视为未指定（回退）。
+fn resolve_transfer_params(
+    cli_chunk_bytes: Option<u64>,
+    cfg_chunk_mb: u64,
+    cli_concurrency: Option<usize>,
+    cfg_concurrency: usize,
+) -> (u64, usize) {
+    let chunk = cli_chunk_bytes
+        .filter(|c| *c > 0)
+        .unwrap_or_else(|| cfg_chunk_mb.saturating_mul(1024 * 1024));
+    let concurrency = cli_concurrency.filter(|c| *c > 0).unwrap_or(cfg_concurrency);
+    (chunk, concurrency)
+}
+
 /// 握手协议消息类型
 /// 相位对齐说明：wormhole 的 phase 密钥由各端自己的消息计数派生（side+count），
 /// 双方各自从 0 计数、按序收发即可解密——不要求两端计数相等。
@@ -157,9 +256,6 @@ struct UdpDirect {
     /// 对端真实源地址（打洞包学习所得，对称 NAT 下 ≠ 通告地址）
     peer: std::net::SocketAddr,
 }
-
-/// 多流并发传块的 worker 流数（每流一块 4MB 块）
-const QUIC_CHUNK_CONCURRENCY: usize = 4;
 
 /// 获取本机公网地址（UDP STUN，与打洞同一 socket 保证端口映射一致）
 fn local_public_addr(sock: &std::net::UdpSocket) -> Option<std::net::SocketAddr> {
@@ -347,7 +443,10 @@ async fn quic_send_chunks(
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let total_sent: std::sync::Arc<std::sync::atomic::AtomicU64> =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut progress = progress;
+    // JSON 进度需要块信息（块大小/块数），progress 经 progress_with_json 封装
+    let chunk_size = plan.first().map(|c| c.size).unwrap_or(0);
+    let chunk_count = plan.len() as u32;
+    let mut progress = progress_with_json(progress, chunk_size, chunk_count);
     progress(0, total_bytes);
 
     let n = concurrency.max(1);
@@ -504,7 +603,7 @@ async fn quic_recv_chunks(
     let expected_bytes: u64 = file_size.saturating_sub(initial_bytes);
     let total_received: std::sync::Arc<std::sync::atomic::AtomicU64> =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut progress = progress;
+    let mut progress = progress_with_json(progress, chunk_size, chunk_count);
     progress(initial_bytes, file_size);
 
     let mut handles = Vec::new();
@@ -679,6 +778,7 @@ async fn quic_recv_resume(
     };
     if !done.is_empty() {
         eprintln!("  ♻ 清单命中 {} 块，续传缺失块（总 {} 块）", done.len(), chunk_count);
+        json_emit_resume(done.len(), chunk_count);
     }
     // ③ 回 ChunkStatus（清单回执；空 = 全量传输）
     wormhole
@@ -713,9 +813,6 @@ async fn quic_recv_resume(
 // 每 worker 一个会话）并发传块；接收方按码发起 transfer get 收块（OffsetWriter
 // 写 partial 对应 offset，逐块原子更新清单）。块级 SHA-256 由 magic-wormhole
 // v1 协议自带校验；失败重试 = 新会话 + 新码（发送方驱动，接收方只消费主通道码）。
-
-/// relay 分块并发数（每 worker 一个独立 wormhole 会话；与 QUIC 并发一致）
-const RELAY_CHUNK_CONCURRENCY: usize = 4;
 
 /// relay 块 worker → 主任务的控制消息（std mpsc，FIFO 保序）
 enum RelayCodeMsg {
@@ -877,7 +974,10 @@ async fn relay_send_chunks(
     // (index, code) 转发通道：worker 生成配对码 → 主任务经主通道发 RelayChunk
     let (code_tx, code_rx) = std::sync::mpsc::channel::<RelayCodeMsg>();
     let hints = relay_hints();
-    let mut progress = progress;
+    // JSON 进度需要块信息（块大小/块数），progress 经 progress_with_json 封装
+    let chunk_size = plan.first().map(|c| c.size).unwrap_or(0);
+    let chunk_count = plan.len() as u32;
+    let mut progress = progress_with_json(progress, chunk_size, chunk_count);
     progress(0, total_bytes);
 
     let n = concurrency.max(1);
@@ -1182,7 +1282,7 @@ async fn relay_recv_chunks(
     let active: std::sync::Arc<std::sync::atomic::AtomicUsize> =
         std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hints = relay_hints();
-    let mut progress = progress;
+    let mut progress = progress_with_json(progress, chunk_size, plan.len() as u32);
     progress(initial_bytes, file_size);
     let progress: std::sync::Arc<std::sync::Mutex<_>> =
         std::sync::Arc::new(std::sync::Mutex::new(progress));
@@ -1329,12 +1429,15 @@ async fn relay_send_resume(
     wormhole: &mut Wormhole,
     send_target: &str,
     display_name: &str,
+    chunk_size: u64,
+    concurrency: usize,
     progress: impl FnMut(u64, u64) + Clone + Send + 'static,
 ) -> Result<u64, String> {
+    json_emit_conn("relay");
     let filesize = std::fs::metadata(send_target)
         .map_err(|e| format!("文件元数据: {e}"))?
         .len();
-    let plan = chunked::chunk_plan(filesize, chunked::DEFAULT_CHUNK_SIZE);
+    let plan = chunked::chunk_plan(filesize, chunk_size);
     let chunk_size = plan.first().map(|c| c.size).unwrap_or(0);
     // 文件级 SHA-256：后台线程计算（relay 相位无时间窗口，仅避免阻塞主协程太久）。
     // 接收方等 FileMeta 的超时窗口为 300s（> 大文件哈希时间），不会误判降级。
@@ -1376,7 +1479,7 @@ async fn relay_send_resume(
         send_target,
         &plan,
         &missing,
-        RELAY_CHUNK_CONCURRENCY,
+        concurrency,
         progress,
     )
     .await
@@ -1391,6 +1494,7 @@ async fn relay_recv_resume(
     wormhole: &mut Wormhole,
     output: &Option<String>,
     initial_meta: Option<UdpMsg>,
+    concurrency: usize,
     progress: impl FnMut(u64, u64) + Clone + Send + 'static,
 ) -> Result<(String, u64), String> {
     // ① 收 FileMeta（hello 阶段已收到则复用，不重收）。超时窗口 300s：
@@ -1439,6 +1543,7 @@ async fn relay_recv_resume(
     };
     if !done.is_empty() {
         eprintln!("  ♻ 清单命中 {} 块，续传缺失块（总 {} 块）", done.len(), chunk_count);
+        json_emit_resume(done.len(), chunk_count);
     }
     // ③ 回 ChunkStatus（清单回执；空 = 全量传输）
     wormhole
@@ -1453,7 +1558,7 @@ async fn relay_recv_resume(
         &hash16,
         &name,
         &plan,
-        RELAY_CHUNK_CONCURRENCY,
+        concurrency,
         progress,
     )
     .await?;
@@ -1479,8 +1584,10 @@ async fn relay_get_result(
     wormhole: &mut Wormhole,
     output: &Option<String>,
     initial_meta: Option<UdpMsg>,
+    concurrency: usize,
 ) -> Result<(String, u64), String> {
-    relay_recv_resume(wormhole, output, initial_meta, |d, t| {
+    json_emit_conn("relay");
+    relay_recv_resume(wormhole, output, initial_meta, concurrency, |d, t| {
         if t > 0 {
             eprintln!("\r  进度: {}/{} ({:.0}%)", d, t, d as f64 / t as f64 * 100.0);
         }
@@ -1499,12 +1606,14 @@ async fn udp_send_path(
     who: &str,
     send_target: &str,
     display_name: &str,
+    chunk_size: u64,
+    concurrency: usize,
 ) -> Result<u64, String> {
     // 预备：文件大小 + 分块计划（纯内存计算，快）
     let filesize = std::fs::metadata(send_target)
         .map_err(|e| format!("文件元数据: {e}"))?
         .len();
-    let plan = chunked::chunk_plan(filesize, chunked::DEFAULT_CHUNK_SIZE);
+    let plan = chunked::chunk_plan(filesize, chunk_size);
     let chunk_size = plan.first().map(|c| c.size).unwrap_or(0);
     // 文件级 SHA-256 放入后台线程（64KB 增量读）——与候选收集/hello/打洞/accept
     // 并行。大文件（>20-30GB）哈希可能超过 13s，不能阻塞在 hello 之前：否则接收方
@@ -1712,7 +1821,9 @@ async fn udp_send_path(
                 if !done_set.is_empty() {
                     eprintln!("  ♻ 清单回执 {} 块已完成，续传缺失 {} 块", done_set.len(), missing.len());
                 }
-                let sent = quic_send_chunks(&conn, send_target, &plan, &missing, QUIC_CHUNK_CONCURRENCY, |done, total| {
+                // UDP 直连已建立 → 事件通知（GUI 显示 direct 模式）
+                json_emit_conn("direct");
+                let sent = quic_send_chunks(&conn, send_target, &plan, &missing, concurrency, |done, total| {
                     if total > 0 {
                         eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
                     }
@@ -1843,6 +1954,8 @@ async fn udp_get_path(
                     eprintln!("  🔗 尝试 host 直连 {} → {}", sock.local_addr().map(|a| a.to_string()).unwrap_or_default(), addr);
                     match crate::commands::quic_link::quic_connect(sock, addr, expected_fp.clone(), Duration::from_secs(2)).await {
                         Ok((ep, conn)) => {
+                            // UDP 直连已建立 → 事件通知（GUI 显示 direct 模式）
+                            json_emit_conn("direct");
                             let r = quic_recv_resume(&conn, wormhole, output, |d, t| {
                                 if t > 0 { eprintln!("\r  进度: {}/{} ({:.0}%)", d, t, d as f64 / t as f64 * 100.0); }
                             }).await;
@@ -1869,6 +1982,8 @@ async fn udp_get_path(
                     Some(direct) => {
                         match crate::commands::quic_link::quic_connect(direct.sock, direct.peer, expected_fp.clone(), Duration::from_secs(10)).await {
                             Ok((ep, conn)) => {
+                                // UDP 直连已建立 → 事件通知（GUI 显示 direct 模式）
+                                json_emit_conn("direct");
                                 let r = quic_recv_resume(&conn, wormhole, output, |d, t| {
                                     if t > 0 { eprintln!("\r  进度: {}/{} ({:.0}%)", d, t, d as f64 / t as f64 * 100.0); }
                                 }).await;
@@ -1916,8 +2031,10 @@ CREATE TABLE IF NOT EXISTS transfer_log (
 
 pub fn run(config: &Config, layer: &DataLayer, action: TransferAction) {
     match action {
-        TransferAction::Send { dataset, ttl_hours } => send(config, layer, &dataset, ttl_hours),
-        TransferAction::Get { code, output } => get(config, layer, &code, output),
+        TransferAction::Send { dataset, ttl_hours, chunk_size, concurrency } =>
+            send(config, layer, &dataset, ttl_hours, chunk_size, concurrency),
+        TransferAction::Get { code, output, chunk_size, concurrency } =>
+            get(config, layer, &code, output, chunk_size, concurrency),
         TransferAction::Log { json } => log(config, layer, json),
     }
 }
@@ -1977,8 +2094,20 @@ fn now_secs() -> i64 {
 }
 
 /// 发送端：`transfer send <dataset|path>`
-fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
+fn send(
+    config: &Config,
+    layer: &DataLayer,
+    dataset: &str,
+    ttl_hours: u64,
+    cli_chunk_size: Option<u64>,
+    cli_concurrency: Option<usize>,
+) {
     let store = open_store(config, layer);
+    // 参数优先级：CLI > config.toml [transfer] > 默认值（4MB / 4）
+    let t = &config.transfer;
+    let (chunk_size, concurrency) =
+        resolve_transfer_params(cli_chunk_size, t.chunk_size_mb, cli_concurrency, t.concurrency);
+    let udp_allowed = t.udp_enabled;
     let path = match dataset_path(&store, dataset) {
         Some(p) => p,
         None => {
@@ -1989,10 +2118,10 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
     let is_dir = PathBuf::from(&path).is_dir();
 
     let started_at = now_secs();
-    println!("fan-files transfer send");
-    println!("  数据集: {}", dataset);
-    println!("  路径:   {}", path);
-    println!("  配对码有效期: {} 小时", ttl_hours);
+    human!("fan-files transfer send");
+    human!("  数据集: {}", dataset);
+    human!("  路径:   {}", path);
+    human!("  配对码有效期: {} 小时", ttl_hours);
 
     // 目录 → 临时 tar 打包（v1 协议仅支持单文件）
     let temp_tar = if is_dir {
@@ -2018,8 +2147,8 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
         let code = mailbox.code().to_string();
 
         // 配对码在 create 后即生成，先打印让接收方开始连接
-        println!("\n  传输码: {}", code);
-        println!("  ⏳ 等待对方输入此码开始传输…（{ttl_hours}h 内有效）\n");
+        human!("\n  传输码: {}", code);
+        human!("  ⏳ 等待对方输入此码开始传输…（{ttl_hours}h 内有效）\n");
 
         let mut wormhole = Wormhole::connect(mailbox)
             .await
@@ -2027,7 +2156,8 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
         let peer_key = format!("{:x}", wormhole.verifier());
 
         // UDP 打洞优先（双方都支持才尝试；失败/禁用自动降级 relay）
-        if !udp_disabled() && peer_supports_udp(&wormhole) {
+        if udp_allowed && !udp_disabled() && peer_supports_udp(&wormhole) {
+            json_emit_conn("punching");
             eprintln!("  🔎 对端支持 UDP 打洞，尝试直连…");
             let (cert, key, fp) = crate::commands::quic_link::gen_cert_with_fingerprint();
             let nonce = std::time::SystemTime::now()
@@ -2043,11 +2173,13 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
                 "sender",
                 send_target.as_str(),
                 &display_name,
+                chunk_size,
+                concurrency,
             )
             .await
             {
                 Ok(sent) => {
-                    println!("\n  ✅ UDP 直连传输完成，校验通过（{} 字节）", sent);
+                    human!("\n  ✅ UDP 直连传输完成，校验通过（{} 字节）", sent);
                     return Ok((code, peer_key, sent));
                 }
                 Err(e) => {
@@ -2068,6 +2200,8 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
                 &mut wormhole,
                 send_target.as_str(),
                 &display_name,
+                chunk_size,
+                concurrency,
                 |done, total| {
                     if total > 0 {
                         eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
@@ -2083,9 +2217,10 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
                     return Err(format!("relay 分块传输失败: {e}"));
                 }
             };
-            println!("\n  ✅ relay 分块传输完成，校验通过（{} 字节）", sent);
+            human!("\n  ✅ relay 分块传输完成，校验通过（{} 字节）", sent);
             Ok((code, peer_key, sent))
         } else {
+            json_emit_conn("relay");
             let relay_hints = relay_hints();
             let total_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let tb = total_bytes.clone();
@@ -2109,7 +2244,7 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
             match res {
                 Ok(()) => {
                     let sent = total_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                    println!("\n  ✅ 传输完成，校验通过（{} 字节）", sent);
+                    human!("\n  ✅ 传输完成，校验通过（{} 字节）", sent);
                     Ok((code, peer_key, sent))
                 }
                 Err(e) => Err(format!("传输失败: {}", e)),
@@ -2122,12 +2257,15 @@ fn send(config: &Config, layer: &DataLayer, dataset: &str, ttl_hours: u64) {
         let _ = std::fs::remove_file(tmp);
     }
 
+    let elapsed = now_secs() as f64 - started_at as f64;
     match result {
         Ok((code, peer_key, sent)) => {
             audit(&store, "send", dataset, &code, Some(&peer_key), sent, 0, "ok", started_at);
+            json_emit_done(true, sent, elapsed);
         }
         Err(e) => {
             audit(&store, "send", dataset, "unknown", None, 0, 0, "failed", started_at);
+            json_emit_error(&e);
             eprintln!("{}", e);
             std::process::exit(1);
         }
@@ -2163,8 +2301,29 @@ fn extract_tar(src: &std::path::Path, dst: &std::path::Path) -> Result<(), Strin
 }
 
 /// 接收端：`transfer get <code> [--output <path>]`
-fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String>) {
+fn get(
+    config: &Config,
+    layer: &DataLayer,
+    code_str: &str,
+    output: Option<String>,
+    cli_chunk_size: Option<u64>,
+    cli_concurrency: Option<usize>,
+) {
     let store = open_store(config, layer);
+    // 参数优先级：CLI > config.toml [transfer] > 默认值（4MB / 4）。
+    // 接收方块大小由发送方 FileMeta 决定（chunk_size 仅记录，不参与分块）。
+    let t = &config.transfer;
+    let (_chunk_size, concurrency) =
+        resolve_transfer_params(cli_chunk_size, t.chunk_size_mb, cli_concurrency, t.concurrency);
+    let udp_allowed = t.udp_enabled;
+    // --output 未指定时优先用 [transfer].receive_dir（不存在则创建，作目录用）
+    let output = match output {
+        Some(o) => Some(o),
+        None => t.receive_dir.as_ref().map(|d| {
+            let _ = std::fs::create_dir_all(d);
+            d.clone()
+        }),
+    };
     let started_at = now_secs();
 
     let code: Code = match code_str.parse() {
@@ -2175,9 +2334,9 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
         }
     };
 
-    println!("fan-files transfer get");
-    println!("  配对码: {}", code_str);
-    println!("  ⏳ 正在连接…");
+    human!("fan-files transfer get");
+    human!("  配对码: {}", code_str);
+    human!("  ⏳ 正在连接…");
 
     let result = async_io::block_on(async {
         let mailbox = MailboxConnection::connect(app_config(), code, false)
@@ -2198,14 +2357,15 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
             let finish_relay = |r: Result<(String, u64), String>, pk: &str| -> Result<(String, u64), String> {
                 match r {
                     Ok((file_name, received)) => {
-                        println!("\n  ✅ relay 分块接收完成，SHA-256 校验通过（{} 字节）", received);
-                        println!("  已保存: {}", file_name);
+                        human!("\n  ✅ relay 分块接收完成，SHA-256 校验通过（{} 字节）", received);
+                        human!("  已保存: {}", file_name);
                         Ok((pk.to_string(), received))
                     }
                     Err(e) => Err(format!("relay 分块接收失败: {e}")),
                 }
             };
-            if !udp_disabled() {
+            if udp_allowed && !udp_disabled() {
+                json_emit_conn("punching");
                 eprintln!("  🔎 对端支持 UDP 打洞，等待对方 UDP 握手…");
                 // 接收方：限时等 udp-hello（旧版发送方不会发 hello，超时即降级）。
                 // v3 relay 分块下 FileMeta 也可在 hello 阶段直接收到（单边
@@ -2215,8 +2375,8 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
                         // UDP 路径：目标路径在 quic_recv_resume 内部解析（含文件名）
                         match udp_get_path(&mut wormhole, &hello, "receiver", &output).await {
                             Ok((file_name, received)) => {
-                                println!("\n  ✅ UDP 直连接收完成，SHA-256 校验通过（{} 字节）", received);
-                                println!("  已保存: {}", file_name);
+                                human!("\n  ✅ UDP 直连接收完成，SHA-256 校验通过（{} 字节）", received);
+                                human!("  已保存: {}", file_name);
                                 return Ok((peer_key, received));
                             }
                             Err(e) => {
@@ -2230,18 +2390,18 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
                             }
                         }
                         // UDP 失败 → v3 relay 分块（消息流未错位：FileMeta 是对方下一条）
-                        return finish_relay(relay_get_result(&mut wormhole, &output, None).await, &peer_key);
+                        return finish_relay(relay_get_result(&mut wormhole, &output, None, concurrency).await, &peer_key);
                     }
                     Ok(Some(meta @ UdpMsg::FileMeta { .. })) => {
                         // 对方直接走 relay 分块（单边 FAN_NO_UDP 等）：FileMeta 已收，
                         // 不再重复接收（相位计数保持对称）
-                        return finish_relay(relay_get_result(&mut wormhole, &output, Some(meta)).await, &peer_key);
+                        return finish_relay(relay_get_result(&mut wormhole, &output, Some(meta), concurrency).await, &peer_key);
                     }
                     Ok(Some(_)) | Ok(None) => {
                         // 收到 Abort（对方已降级）/ hello 超时（对方已降级或走 v1）：
                         // 继续等 FileMeta（v3 relay 分块）；v1 transit 由下方请求解析
                         // 失败兜底
-                        return finish_relay(relay_get_result(&mut wormhole, &output, None).await, &peer_key);
+                        return finish_relay(relay_get_result(&mut wormhole, &output, None, concurrency).await, &peer_key);
                     }
                     Err(_) => {
                         // 收到非 UdpMsg（v1 transit）→ 对方走 v1 → 下方 v1 路径
@@ -2249,10 +2409,11 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
                 }
             } else {
                 // FAN_NO_UDP=1：跳过 UDP 相位，直接走 relay 分块（等 FileMeta）
-                return finish_relay(relay_get_result(&mut wormhole, &output, None).await, &peer_key);
+                return finish_relay(relay_get_result(&mut wormhole, &output, None, concurrency).await, &peer_key);
             }
         }
 
+        json_emit_conn("relay");
         let relay_hints = relay_hints();
         let req = match transfer::request_file(wormhole, relay_hints, transit::Abilities::ALL, std::future::pending::<()>()).await {
             Ok(Some(r)) => r,
@@ -2293,14 +2454,14 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
         match res {
             Ok(()) => {
                 let received = total_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                println!("\n  ✅ 接收完成，SHA-256 校验通过（{} 字节）", received);
-                println!("  已保存: {}", target_path.display());
+                human!("\n  ✅ 接收完成，SHA-256 校验通过（{} 字节）", received);
+                human!("  已保存: {}", target_path.display());
                 // 若是 tar 包则自动解包到输出目录（目录数据集场景）
                 if target_path.extension().map(|e| e == "tar").unwrap_or(false) {
                     let out_dir = target_path.parent().unwrap_or(std::path::Path::new("."));
                     match extract_tar(&target_path, out_dir) {
                         Ok(()) => {
-                            println!("  ✅ 已解包到: {}", out_dir.display());
+                            human!("  ✅ 已解包到: {}", out_dir.display());
                             let _ = std::fs::remove_file(&target_path);
                         }
                         Err(e) => eprintln!("  ⚠ 解包失败: {}（tar 文件保留在 {}）", e, target_path.display()),
@@ -2312,12 +2473,15 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
         }
     });
 
+    let elapsed = now_secs() as f64 - started_at as f64;
     match result {
         Ok((peer_key, received)) => {
             audit(&store, "get", code_str, code_str, Some(&peer_key), 0, received, "ok", started_at);
+            json_emit_done(true, received, elapsed);
         }
         Err(e) => {
             audit(&store, "get", code_str, code_str, None, 0, 0, "failed", started_at);
+            json_emit_error(&e);
             eprintln!("{}", e);
             std::process::exit(1);
         }
@@ -2392,8 +2556,20 @@ fn chrono_fmt(ts: i64) -> String {
 /// CLI 子命令（由 main.rs 解析）
 #[derive(Debug, Clone)]
 pub enum TransferAction {
-    Send { dataset: String, ttl_hours: u64 },
-    Get { code: String, output: Option<String> },
+    Send {
+        dataset: String,
+        ttl_hours: u64,
+        /// 块大小（字节）；None → config [transfer] / 默认 4MB
+        chunk_size: Option<u64>,
+        /// 并发传输数；None → config [transfer] / 默认 4
+        concurrency: Option<usize>,
+    },
+    Get {
+        code: String,
+        output: Option<String>,
+        chunk_size: Option<u64>,
+        concurrency: Option<usize>,
+    },
     Log { json: bool },
 }
 
@@ -3004,5 +3180,81 @@ mod tests {
         chunked::clear_manifest(&hash16);
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&output);
+    }
+
+    // ---------- GUI-T1：JSONL 事件格式 + 参数优先级 ----------
+
+    /// JSONL 事件：值 → 字符串 → 解析回值，字段齐全且类型正确
+    #[test]
+    fn json_events_format_roundtrip() {
+        // 进度事件
+        let ev = json_event_value("progress", &serde_json::json!({
+            "sent": 4 * 1024 * 1024,
+            "total": 16 * 1024 * 1024,
+            "chunk": 4 * 1024 * 1024,
+            "chunks": 4,
+            "pct": 25.0,
+        }));
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("\"type\":\"progress\""), "应含 type 字段: {s}");
+        let back: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(back["type"], "progress");
+        assert_eq!(back["sent"], 4 * 1024 * 1024);
+        assert_eq!(back["total"], 16 * 1024 * 1024);
+        assert_eq!(back["chunk"], 4 * 1024 * 1024);
+        assert_eq!(back["chunks"], 4);
+        assert_eq!(back["pct"], 25.0);
+    }
+
+    /// 五种事件类型都带 "type" 且字段名与规格一致
+    #[test]
+    fn json_events_all_types_have_expected_fields() {
+        let cases: Vec<(serde_json::Value, &str)> = vec![
+            (json_event_value("conn", &serde_json::json!({"mode": "relay"})), "conn"),
+            (json_event_value("resume", &serde_json::json!({"done": 3, "total": 8})), "resume"),
+            (json_event_value("done", &serde_json::json!({"ok": true, "bytes": 123, "elapsed_secs": 1.5})), "done"),
+            (json_event_value("error", &serde_json::json!({"msg": "传输失败: 连接超时"})), "error"),
+        ];
+        for (ev, ty) in cases {
+            let s = serde_json::to_string(&ev).unwrap();
+            assert!(s.contains(&format!("\"type\":\"{ty}\"")), "{ty} 事件应含 type: {s}");
+            let back: serde_json::Value = serde_json::from_str(&s).unwrap();
+            assert_eq!(back["type"], ty);
+        }
+        // conn 模式合法值
+        for mode in ["direct", "relay", "punching"] {
+            let ev = json_event_value("conn", &serde_json::json!({"mode": mode}));
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&serde_json::to_string(&ev).unwrap()).unwrap()["mode"], mode);
+        }
+    }
+
+    /// progress 事件：total=0 时不除零、pct=0
+    #[test]
+    fn json_progress_zero_total_safe() {
+        let ev = json_event_value("progress", &serde_json::json!({
+            "sent": 0, "total": 0, "chunk": 4 * 1024 * 1024, "chunks": 1, "pct": 0.0,
+        }));
+        let back: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(back["pct"], 0.0);
+    }
+
+    /// 参数优先级：CLI > config [transfer] > 默认值（4MB / 4）
+    #[test]
+    fn resolve_transfer_params_precedence() {
+        // 全部未指定 → 默认（config 默认值 4MB / 4）
+        assert_eq!(resolve_transfer_params(None, 4, None, 4), (4 * 1024 * 1024, 4));
+        // config 生效（CLI 未给）
+        assert_eq!(resolve_transfer_params(None, 16, None, 8), (16 * 1024 * 1024, 8));
+        // CLI 覆盖 config
+        assert_eq!(
+            resolve_transfer_params(Some(2 * 1024 * 1024), 16, Some(1), 8),
+            (2 * 1024 * 1024, 1)
+        );
+        // 只给一个 CLI 参数 → 另一个仍用 config
+        assert_eq!(resolve_transfer_params(Some(1024), 16, None, 8), (1024, 8));
+        assert_eq!(resolve_transfer_params(None, 16, Some(2), 8), (16 * 1024 * 1024, 2));
+        // CLI 显式 0 → 视为未指定（回退 config/默认）
+        assert_eq!(resolve_transfer_params(Some(0), 4, Some(0), 4), (4 * 1024 * 1024, 4));
+        assert_eq!(resolve_transfer_params(Some(0), 4, None, 4), (4 * 1024 * 1024, 4));
     }
 }

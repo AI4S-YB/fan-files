@@ -23,6 +23,8 @@ pub struct Config {
     pub threads: Option<usize>,
     #[serde(default)]
     pub servers: ServersConfig,
+    #[serde(default)]
+    pub transfer: TransferConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +140,37 @@ pub struct ServerConfig {
 
 fn default_true() -> bool { true }
 
+/// 传输配置（config.toml [transfer] 段）
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TransferConfig {
+    /// 块大小（MB，默认 4）
+    #[serde(default = "default_chunk_size_mb")]
+    pub chunk_size_mb: u64,
+    /// 并发传输数（默认 4）
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+    /// 接收目录（None → 系统默认：当前目录）
+    #[serde(default)]
+    pub receive_dir: Option<String>,
+    /// 是否启用 UDP 打洞直连（默认 true；false 等价 FAN_NO_UDP=1）
+    #[serde(default = "default_true")]
+    pub udp_enabled: bool,
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            chunk_size_mb: default_chunk_size_mb(),
+            concurrency: default_concurrency(),
+            receive_dir: None,
+            udp_enabled: default_true(),
+        }
+    }
+}
+
+fn default_chunk_size_mb() -> u64 { 4 }
+fn default_concurrency() -> usize { 4 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     #[serde(default)]
@@ -214,6 +247,7 @@ impl Default for Config {
             llm: LlmConfig::default(),
             threads: None,
             servers: ServersConfig::default(),
+            transfer: TransferConfig::default(),
         }
     }
 }
@@ -348,4 +382,70 @@ pub struct LlmProvider {
     pub endpoint: &'static str,
     pub default_model: &'static str,
     pub description: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [transfer] 段默认值：4MB / 4 并发 / None 接收目录 / UDP 启用
+    #[test]
+    fn transfer_config_defaults() {
+        let t = TransferConfig::default();
+        assert_eq!(t.chunk_size_mb, 4);
+        assert_eq!(t.concurrency, 4);
+        assert!(t.receive_dir.is_none());
+        assert!(t.udp_enabled);
+    }
+
+    /// Config::default() 也应带上 [transfer] 默认段
+    #[test]
+    fn config_default_includes_transfer() {
+        let cfg = Config::default();
+        assert_eq!(cfg.transfer.chunk_size_mb, 4);
+        assert_eq!(cfg.transfer.concurrency, 4);
+    }
+
+    /// config.toml [transfer] 读写 roundtrip（含部分覆盖默认值）
+    #[test]
+    fn transfer_config_toml_roundtrip() {
+        let cfg = Config {
+            transfer: TransferConfig {
+                chunk_size_mb: 16,
+                concurrency: 8,
+                receive_dir: Some("/data/inbox".into()),
+                udp_enabled: false,
+            },
+            ..Config::default()
+        };
+        let s = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.transfer.chunk_size_mb, 16);
+        assert_eq!(back.transfer.concurrency, 8);
+        assert_eq!(back.transfer.receive_dir.as_deref(), Some("/data/inbox"));
+        assert!(!back.transfer.udp_enabled);
+    }
+
+    /// 旧 config.toml 无 [transfer] 段 → 加载不崩，用默认值
+    #[test]
+    fn legacy_config_without_transfer_loads() {
+        let s = "[daemon]\nsocket = \"/tmp/test.sock\"\n[scan]\ninclude = [\"/data\"]\n";
+        let cfg: Config = toml::from_str(s).unwrap();
+        assert_eq!(cfg.transfer.chunk_size_mb, 4);
+        assert_eq!(cfg.transfer.concurrency, 4);
+        assert!(cfg.transfer.udp_enabled);
+        assert!(cfg.transfer.receive_dir.is_none());
+        // 旧字段不受影响
+        assert_eq!(cfg.scan.include, vec!["/data".to_string()]);
+    }
+
+    /// [transfer] 部分字段缺省 → 其余用默认值
+    #[test]
+    fn transfer_partial_table_uses_defaults() {
+        let s = "[transfer]\nconcurrency = 8\n";
+        let cfg: Config = toml::from_str(s).unwrap();
+        assert_eq!(cfg.transfer.chunk_size_mb, 4, "未写的 chunk_size_mb 用默认 4");
+        assert_eq!(cfg.transfer.concurrency, 8);
+        assert!(cfg.transfer.udp_enabled);
+    }
 }

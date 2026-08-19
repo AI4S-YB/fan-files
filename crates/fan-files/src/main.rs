@@ -183,14 +183,26 @@ enum TransferAction {
         /// 配对码有效期（小时，默认 24）
         #[arg(long, default_value_t = 24)]
         ttl_hours: u64,
+        /// 块大小（字节，默认 config [transfer].chunk_size_mb × 1MB）
+        #[arg(long)]
+        chunk_size: Option<u64>,
+        /// 并发传输数（默认 config [transfer].concurrency）
+        #[arg(long)]
+        concurrency: Option<usize>,
     },
     /// 请求方：凭配对码接收数据
     Get {
         /// 配对码（如 8-purple-hammer）
         code: String,
-        /// 输出路径（默认当前目录 + 原文件名）
+        /// 输出路径（默认当前目录 + 原文件名，或 [transfer].receive_dir）
         #[arg(long)]
         output: Option<String>,
+        /// 块大小（字节；接收方由发送方 FileMeta 决定，仅记录）
+        #[arg(long)]
+        chunk_size: Option<u64>,
+        /// 并发接收数（默认 config [transfer].concurrency）
+        #[arg(long)]
+        concurrency: Option<usize>,
     },
     /// 查看审计日志
     Log {
@@ -201,7 +213,12 @@ enum TransferAction {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    // FAN_JSON_PROGRESS=1（JSONL 事件模式）：日志走 stderr，stdout 保持纯 JSONL
+    if std::env::var("FAN_JSON_PROGRESS").map(|v| v == "1").unwrap_or(false) {
+        tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
     let cli = Cli::parse();
 
     // Async version check (non-blocking)
@@ -265,10 +282,10 @@ fn main() {
         },
         Commands::Init => commands::init::run(&config, &layer),
         Commands::Transfer(action) => commands::transfer::run(&config, &layer, match action {
-            TransferAction::Send { dataset, ttl_hours } =>
-                commands::transfer::TransferAction::Send { dataset, ttl_hours },
-            TransferAction::Get { code, output } =>
-                commands::transfer::TransferAction::Get { code, output },
+            TransferAction::Send { dataset, ttl_hours, chunk_size, concurrency } =>
+                commands::transfer::TransferAction::Send { dataset, ttl_hours, chunk_size, concurrency },
+            TransferAction::Get { code, output, chunk_size, concurrency } =>
+                commands::transfer::TransferAction::Get { code, output, chunk_size, concurrency },
             TransferAction::Log { json } =>
                 commands::transfer::TransferAction::Log { json },
         }),
