@@ -89,6 +89,34 @@ pub struct SearchQuery {
     pub q: String,
 }
 
+/// 对话消息（chat-search 的多轮上下文）
+#[derive(Debug, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+/// POST /api/v1/chat-search 请求体
+#[derive(Debug, Deserialize)]
+pub struct ChatSearchRequest {
+    /// 多轮对话历史（首轮可为空）
+    pub messages: Vec<ChatMessage>,
+    /// 当前问题
+    pub question: String,
+}
+/// LLM 生成的结构化查询（响应中原样返回，前端可展开展示）
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatQuery {
+    pub keywords: Vec<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub dataset_type: Option<String>,
+}
+/// POST /api/v1/chat-search 响应体
+#[derive(Debug, Serialize)]
+pub struct ChatSearchResponse {
+    pub query: ChatQuery,
+    pub results: Vec<DatasetSummary>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct Facet {
     pub value: String,

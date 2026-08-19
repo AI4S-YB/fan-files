@@ -15,6 +15,9 @@ pub enum AppError {
     Busy,
     #[error("service is not ready: {0}")]
     NotReady(String),
+    /// LLM 未配置或调用失败（chat-search；前端据此降级基础搜索）
+    #[error("模型未配置或调用失败")]
+    LlmUnavailable,
     #[error("internal error")]
     Internal,
 }
@@ -36,6 +39,7 @@ impl IntoResponse for AppError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "database_busy"),
             Self::NotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, "not_ready"),
+            Self::LlmUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "llm_unavailable"),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         let message = self.to_string();

@@ -13,7 +13,6 @@ use tower::ServiceBuilder;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
-    timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 use tracing::info;
@@ -27,15 +26,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Settings::load(Args::parse())?;
     let state = Arc::new(AppState::new(settings.clone())?);
     let request_id = http::HeaderName::from_static("x-request-id");
+    // 注意：请求级超时（TimeoutLayer）按路由应用在 api::router 内——
+    // chat-search 要调 LLM（可能数秒），不能套普通端点的 5s 上限
     let app = api::router(state).layer(
         ServiceBuilder::new()
             .layer(SetRequestIdLayer::new(request_id.clone(), MakeRequestUuid))
             .layer(PropagateRequestIdLayer::new(request_id))
             .layer(TraceLayer::new_for_http())
-            .layer(TimeoutLayer::with_status_code(
-                http::StatusCode::REQUEST_TIMEOUT,
-                Duration::from_millis(settings.request_timeout_ms),
-            ))
             .layer(CatchPanicLayer::new()),
     );
 

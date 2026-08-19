@@ -48,6 +48,21 @@ impl LlmClient {
             .map_err(|e| format!("Failed to parse LLM JSON output: {}", e).into())
     }
 
+    /// 通用对话补全：传入消息列表，返回助手文本（原样，不做结构拆分）。
+    /// body 带 response_format=json_object + max_tokens（openai 协议透传；
+    /// anthropic 不接收额外字段，适配层自动丢弃）。chat-search 端点使用。
+    pub fn chat(&self, messages: &[serde_json::Value]) -> Result<String, Box<dyn std::error::Error>> {
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+            "max_tokens": 16384
+        });
+        let json = llm_api_call_with_retry(&self.config, &body, 2)?;
+        extract_llm_text(&self.config, &json).ok_or_else(|| "No content in LLM response".into())
+    }
+
     /// Simple LLM call that returns a list of candidate strings
     pub fn infer_candidates(&self, prompt: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
@@ -352,6 +367,30 @@ mod tests {
         // 无文本块（tool_use）→ None
         let no_text = serde_json::json!({"content":[{"type":"tool_use","name":"x"}]});
         assert_eq!(extract_llm_text(&anthropic_cfg(), &no_text), None);
+    }
+
+    /// chat()：消息数组直传 + response_format 保留 + 文本原样提取（openai 协议端到端）
+    #[test]
+    fn chat_returns_text_with_messages_and_json_mode() {
+        let resp = r#"{"choices":[{"message":{"content":"{\"keywords\":[\"水稻\"]}"}}]}"#;
+        let (result, req) = with_llm_server(resp, |base| {
+            let cfg = LlmConfig {
+                endpoint: format!("{base}/v1/chat/completions"),
+                api_key: "sk-test".into(),
+                model: "gpt-4o-mini".into(),
+                api_type: "openai".into(),
+            };
+            LlmClient::new(cfg)
+                .chat(&[serde_json::json!({"role": "user", "content": "hi"})])
+                .unwrap()
+        });
+        assert_eq!(result, "{\"keywords\":[\"水稻\"]}");
+        assert!(req.contains("\"messages\":["), "req: {}", req);
+        assert!(
+            req.contains("\"response_format\":{\"type\":\"json_object\"}"),
+            "req: {}",
+            req
+        );
     }
 
     /// 端到端：llm_api_call_with_retry 走 openai 协议（真实 HTTP 环回，旧式 body 兼容）

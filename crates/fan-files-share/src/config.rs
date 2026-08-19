@@ -1,4 +1,5 @@
 use clap::Parser;
+use fan_core::config::LlmConfig;
 use serde::Deserialize;
 use std::{env, fs, net::SocketAddr, path::PathBuf};
 
@@ -31,6 +32,9 @@ pub struct Settings {
     pub max_page_size: u32,
     pub expose_absolute_paths: bool,
     pub supported_schema_versions: Vec<i64>,
+    /// LLM 模型配置（config.toml [llm] 段；未配置时 chat-search 返回 503，
+    /// 前端降级基础搜索）。旧配置文件无该段 → 默认空配置，不破坏加载
+    pub llm: LlmConfig,
 }
 
 impl Default for Settings {
@@ -45,6 +49,7 @@ impl Default for Settings {
             max_page_size: 200,
             expose_absolute_paths: false,
             supported_schema_versions: vec![4],
+            llm: LlmConfig::default(),
         }
     }
 }
@@ -126,5 +131,30 @@ mod tests {
         let args = Args::try_parse_from(["fan-files-share"]).unwrap();
         let settings = Settings::load(args).unwrap();
         assert_eq!(settings.stats_cache_seconds, 60);
+    }
+
+    /// [llm] 段解析进 Settings.llm（NR-T2：chat-search 的模型配置来源）；
+    /// 缺 [llm] 段 → 默认空配置（未配置，chat-search 返回 503）
+    #[test]
+    fn settings_load_parses_llm_section_and_defaults_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[llm]\nendpoint = \"https://api.example.com/v1\"\napi_key = \"sk-x\"\nmodel = \"deepseek-chat\"\napi_type = \"anthropic\"\n",
+        )
+        .unwrap();
+        let args = Args::try_parse_from(["fan-files-share", "--config", path.to_str().unwrap()])
+            .unwrap();
+        let settings = Settings::load(args).unwrap();
+        assert_eq!(settings.llm.endpoint, "https://api.example.com/v1");
+        assert_eq!(settings.llm.api_key, "sk-x");
+        assert_eq!(settings.llm.model, "deepseek-chat");
+        assert_eq!(settings.llm.api_type, "anthropic");
+        // 无 [llm] 段 → 默认空配置（未配置，chat-search 返回 503）
+        let plain = Args::try_parse_from(["fan-files-share"]).unwrap();
+        let settings = Settings::load(plain).unwrap();
+        assert!(settings.llm.endpoint.is_empty());
+        assert!(settings.llm.api_key.is_empty());
     }
 }
