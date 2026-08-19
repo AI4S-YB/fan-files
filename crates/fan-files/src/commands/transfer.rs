@@ -21,6 +21,7 @@
 //! → 中止报错，绝不降级 relay（安全问题，见规格 §七）。
 //! 环境开关 `FAN_NO_UDP=1` 禁用打洞，直接走 relay。
 
+use crate::commands::chunked;
 use fan_core::config::{dirs_fan, DataLayer, Config};
 use fan_core::index::sqlite::SqliteStore;
 use magic_wormhole::transfer::{self, APP_CONFIG};
@@ -364,6 +365,284 @@ async fn quic_recv_file(
     // 确认（close 触发对端 recv 返回）
     send.write_all(&[0x6b]).await.map_err(|e| format!("写确认: {e}"))?;
     Ok((header.filename, received))
+}
+
+// ---------- QUIC 多流并发分块传输（阶段 1，Task 2） ----------
+
+/// QUIC 块头长度：u32 index(4) + u32 size(4) + [u8;32] sha256 = 40 字节（大端）。
+/// 规格 §四：块级 SHA-256 携带在块头，接收方校验失败只重传该块。
+pub const CHUNK_HEADER_LEN: usize = 4 + 4 + 32;
+
+/// QUIC 多流并发传块（发送方）：信号量式 worker 池，`concurrency` 条并行流，
+/// 每流传一块。流格式：40 字节块头（u32 index + u32 size + [u8;32] sha256，大端）
+/// → 块数据 → 接收方校验后回 1 字节确认（0x6b = 通过，0x65 = 失败 → 重试）。
+/// 每块独立 std::fs::File + seek(offset) 读块数据（避免共享游标并发问题）。
+/// 失败重试 ≤3 次（attempts map），失败块放回队列尾由空闲 worker 再取；
+/// 重试耗尽仍失败 → 返回 Err（已成功块由接收方清单保留，可续传）。
+/// 进度回调：已传字节 / 总字节。返回已传字节总数。
+async fn quic_send_chunks(
+    conn: &quinn::Connection,
+    path: &str,
+    plan: &[chunked::Chunk],
+    missing: &[u32],
+    concurrency: usize,
+    progress: impl FnMut(u64, u64) + Clone + Send + 'static,
+) -> Result<u64, String> {
+    use futures_lite::io::AsyncReadExt;
+    use sha2::Digest;
+    let total_bytes: u64 = plan.iter().map(|c| c.size).sum();
+    if !std::path::Path::new(path).exists() {
+        return Err(format!("发送文件不存在: {path}"));
+    }
+    let pending: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(missing.to_vec()));
+    let attempts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let failed: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let total_sent: std::sync::Arc<std::sync::atomic::AtomicU64> =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut progress = progress;
+    progress(0, total_bytes);
+
+    let n = concurrency.max(1);
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let (pending, attempts, failed, total_sent) = (
+            pending.clone(), attempts.clone(), failed.clone(), total_sent.clone(),
+        );
+        let conn = conn.clone();
+        let plan = plan.to_vec();
+        let path = path.to_string();
+        let mut progress = progress.clone();
+        handles.push(async_std::task::spawn(async move {
+            loop {
+                // 取下一个待传块（Mutex 队列，先到先得）
+                let idx = {
+                    let mut p = pending.lock().unwrap();
+                    if p.is_empty() {
+                        return; // 队列空 → 本 worker 结束
+                    }
+                    let i = p.remove(0);
+                    i
+                };
+                let chunk = &plan[idx as usize];
+                // 读块数据：独立 File + seek（避免共享游标并发问题）
+                let mut f = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // 本地文件读失败重试无意义，直接判死
+                        eprintln!("  ⚠ 打开文件失败: {e}");
+                        failed.lock().unwrap().push(idx);
+                        continue;
+                    }
+                };
+                let mut buf = vec![0u8; chunk.size as usize];
+                if std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(chunk.offset)).is_err() {
+                    eprintln!("  ⚠ seek 块 {idx} 失败");
+                    failed.lock().unwrap().push(idx);
+                    continue;
+                }
+                if std::io::Read::read_exact(&mut f, &mut buf).is_err() {
+                    eprintln!("  ⚠ 读块 {idx} 失败");
+                    failed.lock().unwrap().push(idx);
+                    continue;
+                }
+                // 块级 SHA-256（写进块头，接收方校验）
+                let sha: [u8; 32] = sha2::Sha256::digest(&buf).into();
+                // 重试循环 ≤3 次（open_bi / 发送 / 确认任一失败都换新流重试）
+                let mut ok = false;
+                for _ in 0..3 {
+                    let (mut send, mut recv) = match conn.open_bi().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("  ⚠ open_bi: {e}");
+                            continue;
+                        }
+                    };
+                    // 块头：u32 index + u32 size + sha256（大端）
+                    if send.write_all(&idx.to_be_bytes()).await.is_err() { continue; }
+                    if send.write_all(&(chunk.size as u32).to_be_bytes()).await.is_err() { continue; }
+                    if send.write_all(&sha).await.is_err() { continue; }
+                    if send.write_all(&buf).await.is_err() { continue; }
+                    if send.finish().is_err() { continue; }
+                    // 等确认：0x6b = 校验通过；0x65 = 校验失败（重试）。
+                    // 注意：read 返回的是读取字节数（Some(1)），须检查 ack[0] 内容。
+                    let mut ack = [0u8; 1];
+                    match recv.read(&mut ack).await {
+                        Ok(Some(_)) if ack[0] == 0x6b => {
+                            ok = true;
+                            break;
+                        }
+                        Ok(Some(_)) if ack[0] == 0x65 => {
+                            eprintln!("  ⚠ 块 {idx} 校验失败（0x65），重试");
+                            continue;
+                        }
+                        _ => {
+                            eprintln!("  ⚠ 块 {idx} 未收到确认，重试");
+                            continue;
+                        }
+                    }
+                }
+                if ok {
+                    total_sent.fetch_add(chunk.size, std::sync::atomic::Ordering::Relaxed);
+                    progress(total_sent.load(std::sync::atomic::Ordering::Relaxed), total_bytes);
+                } else {
+                    // 失败：重试计数 +1，<3 次放回队列尾（下一轮由空闲 worker 再试）
+                    let mut a = attempts.lock().unwrap();
+                    let cnt = a.entry(idx).or_insert(0);
+                    *cnt += 1;
+                    if *cnt < 3 {
+                        pending.lock().unwrap().push(idx);
+                    } else {
+                        failed.lock().unwrap().push(idx);
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.await;
+    }
+    // 有块重试耗尽仍失败 → 整体报错（已成功块保留在接收方清单，可续传）
+    let failed = failed.lock().unwrap();
+    if !failed.is_empty() {
+        return Err(format!("以下块传输失败（重试耗尽）: {:?}", failed));
+    }
+    Ok(total_sent.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// QUIC 多流并发收块（接收方）：accept_bi 循环 + 每流一个 task 并发处理。
+/// 流格式与发送方对称：40 字节块头 → 块数据 → 回 1 字节确认（0x6b / 0x65）。
+/// 块写入 partial 文件（chunked::partial_path，按 offset seek+write），每块完成
+/// 更新清单（done 集合，原子持久化）。多流共享同一文件句柄，用 Mutex 串行化
+/// seek+write——POSIX 下同一文件描述符的游标是共享的，不加锁并发 seek+write
+/// 会互相抢占游标写错位置（不同 offset 的写入本身无冲突）。
+/// 返回 (收到块数, 收到字节数)。
+async fn quic_recv_chunks(
+    conn: &quinn::Connection,
+    hash16: &str,
+    file_name: &str,
+    file_size: u64,
+    chunk_size: u64,
+    chunk_count: u32,
+    progress: impl FnMut(u64, u64) + Clone + Send + 'static,
+) -> Result<(u32, u64), String> {
+    use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+    use sha2::Digest;
+    let part_path = chunked::partial_path(hash16);
+    if let Some(parent) = part_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 partial 目录: {e}"))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&part_path)
+        .map_err(|e| format!("打开 partial 文件 {}: {}", part_path.display(), e))?;
+    let file_arc: std::sync::Arc<std::sync::Mutex<std::fs::File>> =
+        std::sync::Arc::new(std::sync::Mutex::new(file));
+    let done: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let total_received: std::sync::Arc<std::sync::atomic::AtomicU64> =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut progress = progress;
+    progress(0, file_size);
+
+    let mut handles = Vec::new();
+    loop {
+        // 块已收完 → 退出 accept 循环
+        if done.lock().unwrap().len() as u32 >= chunk_count {
+            break;
+        }
+        // accept_bi 与完成度轮询竞争：最后一块可能在 accept 阻塞期间完成，
+        // 轮询保证收满后及时退出（否则会永远等一条不存在的流）
+        let res = futures_lite::future::or(
+            async { conn.accept_bi().await.map_err(|e| format!("accept_bi: {e}")) },
+            async {
+                async_io::Timer::after(Duration::from_millis(20)).await;
+                Err(String::new())
+            },
+        )
+        .await;
+        let (send, recv) = match res {
+            Ok(v) => v,
+            Err(e) if e.is_empty() => continue, // 轮询：回到循环头检查完成度
+            Err(e) => {
+                // 连接关闭等真实错误：若块恰好已收完则正常结束，否则报错
+                if done.lock().unwrap().len() as u32 >= chunk_count {
+                    break;
+                }
+                return Err(e);
+            }
+        };
+        let (file_arc, done, total_received) =
+            (file_arc.clone(), done.clone(), total_received.clone());
+        let hash16 = hash16.to_string();
+        let file_name = file_name.to_string();
+        let mut progress = progress.clone();
+        handles.push(async_std::task::spawn(async move {
+            let mut recv = recv;
+            let mut send = send;
+            // 读块头：u32 index + u32 size + [u8;32] sha256（大端）
+            let mut hdr = [0u8; CHUNK_HEADER_LEN];
+            if recv.read_exact(&mut hdr).await.is_err() {
+                return; // 断流：不确认，发送方自会重试
+            }
+            let idx = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+            let size = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+            // 限长 64MB（L3 教训：防恶意/损坏 peer 声明超大块长导致 OOM）
+            if size as u64 > 64 * 1024 * 1024 || idx as usize >= chunk_count as usize {
+                let _ = send.write_all(&[0x65]).await; // 协议异常 → nack
+                return;
+            }
+            let mut buf = vec![0u8; size as usize];
+            if recv.read_exact(&mut buf).await.is_err() {
+                return; // 断流：不确认，发送方自会重试
+            }
+            // 块级 SHA-256 校验：不匹配 → nack（0x65），发送方只重传该块
+            let digest: [u8; 32] = sha2::Sha256::digest(&buf).into();
+            if digest != hdr[8..CHUNK_HEADER_LEN] {
+                let _ = send.write_all(&[0x65]).await;
+                return;
+            }
+            // 按 offset 写入 partial 文件（offset = index × chunk_size，块连续排列；
+            // 共享句柄 + 写锁：POSIX 文件游标共享，seek+write 必须原子成对）
+            {
+                let mut f = file_arc.lock().unwrap();
+                let offset = idx as u64 * chunk_size;
+                if std::io::Seek::seek(&mut *f, std::io::SeekFrom::Start(offset)).is_err()
+                    || std::io::Write::write_all(&mut *f, &buf).is_err()
+                {
+                    return; // 写入失败：不确认（发送方重试）
+                }
+            }
+            // 确认（0x6b = 校验通过）
+            let _ = send.write_all(&[0x6b]).await;
+            // 更新清单：done 集合 + 原子持久化（锁内完成，防并发清单丢失更新）
+            let mut d = done.lock().unwrap();
+            d.insert(idx);
+            total_received.fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
+            let m = chunked::Manifest {
+                file_name,
+                file_size,
+                chunk_size,
+                done: d.iter().copied().collect(),
+            };
+            let _ = chunked::save_manifest(&hash16, &m);
+            progress(total_received.load(std::sync::atomic::Ordering::Relaxed), file_size);
+        }));
+    }
+    for h in handles {
+        h.await;
+    }
+    let chunks = done.lock().unwrap().len() as u32;
+    let bytes = total_received.load(std::sync::atomic::Ordering::Relaxed);
+    if bytes != file_size {
+        return Err(format!(
+            "收到 {bytes} 字节 ≠ 期望 {file_size}（{chunks}/{chunk_count} 块，可能断线）"
+        ));
+    }
+    Ok((chunks, bytes))
 }
 
 /// 读一个 QUIC 帧的长度（4 字节大端）
@@ -1218,5 +1497,95 @@ mod tests {
             }
             _ => panic!("应为 Hello"),
         }
+    }
+
+    /// 多流并发分块回环：同机双 endpoint，发送方 2 worker 并行传 2 块（8MB 文件
+    /// 4MB 块），接收方每流一个 task 并发收块写 partial。断言：收到 2 块、partial
+    /// 内容与原文件 SHA-256 一致、进度回调累计到总字节。
+    /// 方向与生产一致：发送方 = QUIC 服务端（quic_listen），接收方 = QUIC 客户端
+    /// （quic_connect）。参考 quic_link.rs 的 quic_stream_roundtrip_one_byte 模式。
+    #[test]
+    fn quic_multi_stream_parallel_chunks() {
+        let tmp = std::env::temp_dir().join("fan-chunk-test.bin");
+        let data = vec![0xABu8; 8 * 1024 * 1024];
+        std::fs::write(&tmp, &data).unwrap();
+        let tmp_str = tmp.to_string_lossy().to_string();
+        // partial/清单键：用唯一 hash，测试结束 clear_manifest 清理
+        let hash16 = "test-hash-1";
+        chunked::clear_manifest(hash16);
+
+        let (cert, key, fp) = crate::commands::quic_link::gen_cert_with_fingerprint();
+        let server_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server_sock.set_nonblocking(true).unwrap();
+        let addr = server_sock.local_addr().unwrap();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_sock.set_nonblocking(true).unwrap();
+
+        // 进度回调累计（发送/接收各一份，断言最后一次 = 总字节）
+        let snd_progress: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>> = Default::default();
+        let rcv_progress: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>> = Default::default();
+
+        let result = async_std::task::block_on(async {
+            let server = crate::commands::quic_link::quic_listen(server_sock, cert, key).await.expect("server endpoint");
+            // 发送方（QUIC 服务端）：worker 池并发传块
+            let srv = futures_lite::future::or(
+                async {
+                    let incoming = server.accept().await.ok_or("server accept 超时")?;
+                    let conn = incoming.await.map_err(|e| format!("incoming handshake: {e}"))?;
+                    let plan = chunked::chunk_plan(8 * 1024 * 1024, chunked::DEFAULT_CHUNK_SIZE);
+                    assert_eq!(plan.len(), 2, "8MB/4MB 应为 2 块");
+                    let missing: Vec<u32> = (0..plan.len() as u32).collect();
+                    let p = snd_progress.clone();
+                    let sent = quic_send_chunks(&conn, &tmp_str, &plan, &missing, 2,
+                        move |d, t| { p.lock().unwrap().push((d, t)); }).await?;
+                    assert_eq!(sent, 8 * 1024 * 1024, "发送字节数应等于文件大小");
+                    conn.close(0u32.into(), b"test done");
+                    let _ = conn.closed().await;
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(30)).await;
+                    Err("server 侧 30s 超时".to_string())
+                },
+            );
+            // 接收方（QUIC 客户端）：并发收块写 partial + 更新清单
+            let cli = futures_lite::future::or(
+                async {
+                    let (endpoint, conn) = crate::commands::quic_link::quic_connect(client_sock, addr, fp, Duration::from_secs(10)).await?;
+                    let p = rcv_progress.clone();
+                    let (chunks, bytes) = quic_recv_chunks(&conn, hash16, "fan-chunk-test.bin",
+                        8 * 1024 * 1024, chunked::DEFAULT_CHUNK_SIZE, 2,
+                        move |d, t| { p.lock().unwrap().push((d, t)); }).await?;
+                    assert_eq!(chunks, 2, "应收满 2 块");
+                    assert_eq!(bytes, 8 * 1024 * 1024, "收到字节数应等于文件大小");
+                    conn.close(0u32.into(), b"test done");
+                    drop(endpoint);
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(30)).await;
+                    Err("client 侧 30s 超时".to_string())
+                },
+            );
+            let (srv_res, cli_res) = futures_lite::future::zip(srv, cli).await;
+            srv_res?;
+            cli_res
+        });
+
+        // 断言 partial 文件内容与原文件一致（块按 offset 写入 = 完整文件）
+        let part = chunked::partial_path(hash16);
+        let part_matches = part.exists()
+            && std::fs::read(&part).map(|d| d == data).unwrap_or(false);
+        // 断言进度回调最后一次 = (总字节, 总字节)
+        let snd_ok = snd_progress.lock().unwrap().last() == Some(&(8 * 1024 * 1024, 8 * 1024 * 1024));
+        let rcv_ok = rcv_progress.lock().unwrap().last() == Some(&(8 * 1024 * 1024, 8 * 1024 * 1024));
+        // 清理（partial + 清单 + 临时文件）
+        chunked::clear_manifest(hash16);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(result.is_ok(), "多流并发分块传输应成功: {result:?}");
+        assert!(part_matches, "partial 文件内容应与原文件一致（块级 SHA-256 + offset 写入）");
+        assert!(snd_ok, "发送方进度应累计到总字节: {:?}", snd_progress.lock().unwrap());
+        assert!(rcv_ok, "接收方进度应累计到总字节: {:?}", rcv_progress.lock().unwrap());
     }
 }
