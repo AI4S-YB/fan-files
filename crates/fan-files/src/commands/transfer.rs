@@ -273,9 +273,13 @@ async fn quic_send_file(
         .await
         .map_err(|e| format!("写 hash: {e}"))?;
     send.finish().map_err(|e| format!("finish: {e}"))?;
-    // 等对端确认关闭（对端验证 SHA-256 后 close）
+    // 等对端确认：0x6b = 对端 SHA-256 校验通过。EOF（对端失败未写 ack）≠ 成功。
     let mut ack_buf = [0u8; 1];
-    let _ = recv.read(&mut ack_buf).await;
+    match recv.read(&mut ack_buf).await {
+        Ok(Some(0x6b)) => {}
+        Ok(_) => return Err("对端未确认（SHA-256 校验失败或接收出错）".into()),
+        Err(e) => return Err(format!("等确认失败: {e}")),
+    }
     Ok(sent)
 }
 
@@ -324,6 +328,10 @@ async fn quic_recv_file(
         let n = read_frame_len(&mut recv).await?;
         if n == 0 {
             break; // EOF
+        }
+        // L3：块长上限 64MB（防恶意/损坏 peer 声明超大块长导致 OOM；正常 64KB 分块）
+        if n > 64 * 1024 * 1024 {
+            return Err(format!("数据块长度异常: {n}"));
         }
         if n > buf.len() {
             buf.resize(n, 0);
@@ -486,11 +494,12 @@ async fn udp_send_path(
         return Err("no-endpoints".into());
     }
 
-    // ④ accept 循环（15s 超时）：轮询各 endpoint 的非阻塞 accept + srflx channel，
+    // ④ accept 循环（20s 超时）：轮询各 endpoint 的非阻塞 accept + srflx channel，
     //    任一成功即用。quinn::Incoming 不可 Clone，每次拿到新的 Incoming 直接
-    //    await 驱动握手；握手失败（坏连接/指纹不匹配）继续轮询下一个，容忍。
+    //    await 驱动握手（带 5s 超时，防恶意连接挂死循环）；握手失败继续轮询。
     //    同时非阻塞监听 wormhole：对方发 Abort（候选全失败）→ 立即降级，不等超时。
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    //    20s > 接收方全候选预算（host ≤2s×N + 打洞 3s + 握手 10s），保证 Abort 必达。
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         // 先收打洞线程送来的 srflx endpoint（非阻塞）
         if let Ok(ep) = srflx_rx.try_recv() {
@@ -506,22 +515,44 @@ async fn udp_send_path(
         }
         for ep in &endpoints {
             if let Some(Some(incoming)) = futures_lite::future::poll_once(ep.accept()).await {
-                match incoming.await {
-                    Ok(conn) => {
-                        let sent = quic_send_file(&conn, send_target, display_name, |done, total| {
-                            if total > 0 {
-                                eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
-                            }
-                        })
-                        .await?;
-                        // 传输已完成（对端已确认），drop 全部 endpoint 释放 socket
-                        drop(endpoints);
-                        return Ok(sent);
-                    }
+                // S1 安全：握手超时保护（quinn 无握手超时，恶意连接可无限挂死循环）
+                let conn = match futures_lite::future::or(
+                    async { incoming.await.map_err(|e| format!("入站握手: {e}")) },
+                    async {
+                        async_io::Timer::after(Duration::from_secs(5)).await;
+                        Err("入站握手 5s 超时".into())
+                    },
+                )
+                .await
+                {
+                    Ok(c) => c,
                     Err(e) => {
-                        eprintln!("  ⚠ 入站握手失败: {e}，继续等待其他候选");
+                        eprintln!("  ⚠ {e}，继续等待其他候选");
+                        continue;
                     }
+                };
+                // S1 安全：校验对端来源 ∈ 对方通告的候选（防同网段任意设备窃取数据）。
+                // - host 路径：对端来源必须精确匹配其通告的 host 地址（同网段直连语义，
+                //   来源与通告一一对应——陌生设备不在此集合）
+                // - srflx 路径：对端来源 = 打洞学习到的真实地址（对称 NAT 下 ≠ 通告地址，
+                //   但只有与我们互发过打洞包的对端才能连入，本身已认证）
+                let remote = conn.remote_address();
+                let allowed = peer_cands.iter().any(|c| {
+                    c.addr.parse::<std::net::SocketAddr>().map(|a| a == remote).unwrap_or(false)
+                });
+                if !allowed {
+                    eprintln!("  ⚠ 拒绝未知来源连接: {remote}（不在对方通告候选内）");
+                    continue;
                 }
+                let sent = quic_send_file(&conn, send_target, display_name, |done, total| {
+                    if total > 0 {
+                        eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
+                    }
+                })
+                .await?;
+                // 传输已完成（对端已确认），drop 全部 endpoint 释放 socket
+                drop(endpoints);
+                return Ok(sent);
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -567,7 +598,12 @@ async fn udp_get_path(
     }
     let srflx_sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind udp: {e}"))?;
     srflx_sock.set_nonblocking(true).ok();
-    if let Some(a) = local_public_addr(&srflx_sock) {
+    let my_public = local_public_addr(&srflx_sock);
+    if my_public.is_none() {
+        // L4：接收方 STUN 失败也要有日志（与发送方对称，便于排障）
+        eprintln!("  ⚠ UDP STUN 失败（仅 host 候选可用）");
+    }
+    if let Some(a) = my_public {
         candidates.push(Candidate { kind: "srflx".into(), addr: a.to_string(), prio: 20000 });
     }
     sort_candidates(&mut candidates);
@@ -608,8 +644,32 @@ async fn udp_get_path(
                     eprintln!("  ⚠ host 候选 {} 不同网段，跳过", cand.addr);
                     continue;
                 }
-                let addr: std::net::SocketAddr = cand.addr.parse().map_err(|_| format!("坏 host 地址: {}", cand.addr))?;
+                let addr: std::net::SocketAddr = match cand.addr.parse() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        // S2：坏地址也是失败出口——发 Abort 通知发送方，避免它空等 accept 超时
+                        eprintln!("  ⚠ 坏 host 地址: {}", cand.addr);
+                        let _ = wormhole.send_json(&UdpMsg::Abort).await;
+                        return Err("punch-fail".into());
+                    }
+                };
+                // M3：只尝试与候选同网段的 socket（跨网段 socket 必超时，浪费 2s/次）
+                let peer_v4: Option<std::net::Ipv4Addr> = match addr.ip() {
+                    std::net::IpAddr::V4(v4) => Some(v4),
+                    _ => None,
+                };
                 for s in &host_socks {
+                    let sock_local = match s.local_addr() {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    let same_sock_subnet = match (peer_v4, sock_local.ip()) {
+                        (Some(p), std::net::IpAddr::V4(l)) => same_subnet_v4(l, p, 24),
+                        _ => false,
+                    };
+                    if !same_sock_subnet {
+                        continue;
+                    }
                     // quic_connect 消费 socket 所有权 → 每个尝试 try_clone 独立 socket
                     let sock = s.try_clone().map_err(|e| format!("clone: {e}"))?;
                     eprintln!("  🔗 尝试 host 直连 {} → {}", sock.local_addr().map(|a| a.to_string()).unwrap_or_default(), addr);
