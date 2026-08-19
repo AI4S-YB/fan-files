@@ -93,21 +93,77 @@ pub(crate) async fn pick_directory(app: tauri::AppHandle) -> Result<Option<Strin
 /// 让前端能区分"连通但认证失败"与"请求本身出错"。
 #[tauri::command]
 pub(crate) async fn test_connection(cfg: FanConfig) -> Result<bool, String> {
+    let (url, headers, body) = test_connection_request(&cfg);
+    let mut req = reqwest::Client::new()
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&body);
+    for (k, v) in &headers {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    Ok(resp.status().is_success())
+}
+
+/// 按 api_type 构造 test_connection 的最小请求（url/headers/body）。
+/// 语义与引擎 fan-core build_llm_request 对齐（NR-T4 P1 修复：接管 anthropic
+/// profile 后测试连接必须走 Messages 协议，否则 base_url 无 /v1 时 404 误报失败）。
+/// openai    → openai_chat_url(endpoint)、Authorization: Bearer {key}、
+///             body {"model","messages","max_tokens":1}
+/// anthropic → anthropic_messages_url(endpoint)、x-api-key: {key} +
+///             anthropic-version: 2023-06-01、body 同构
+fn test_connection_request(cfg: &FanConfig) -> (String, Vec<(String, String)>, serde_json::Value) {
     let body = serde_json::json!({
         "model": cfg.model,
-        "messages": [{"role": "user", "content": "reply OK"}],
-        "max_tokens": 10
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
     });
-    let resp = reqwest::Client::new()
-        .post(&cfg.endpoint)
-        .header("Authorization", format!("Bearer {}", cfg.api_key))
-        .header("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(30))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(resp.status().is_success())
+    if cfg.api_type == "anthropic" {
+        let headers = vec![
+            ("x-api-key".to_string(), cfg.api_key.clone()),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        (anthropic_messages_url(&cfg.endpoint), headers, body)
+    } else {
+        // openai / 未知类型（兼容旧配置默认）
+        let headers = vec![
+            ("Authorization".to_string(), format!("Bearer {}", cfg.api_key)),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        (openai_chat_url(&cfg.endpoint), headers, body)
+    }
+}
+
+/// openai Chat Completions 端点 URL 规范化（与 fan-core build_llm_request 语义一致）：
+/// - 已含 /chat/completions → 原样
+/// - 已含 /v1 → 拼 /chat/completions（CC Switch OPENAI_BASE_URL 形态，如 https://api.deepseek.com/v1）
+/// - 否则 → 拼 /v1/chat/completions
+fn openai_chat_url(endpoint: &str) -> String {
+    let ep = endpoint.trim_end_matches('/');
+    if ep.is_empty() {
+        return ep.to_string();
+    }
+    if ep.ends_with("/chat/completions") {
+        ep.to_string()
+    } else if ep.ends_with("/v1") {
+        format!("{}/chat/completions", ep)
+    } else {
+        format!("{}/v1/chat/completions", ep)
+    }
+}
+
+/// anthropic Messages 端点 URL：endpoint 无 /v1 时拼 /v1/messages，已有不重复。
+/// 尾斜杠先去掉，避免拼出 //v1/messages
+fn anthropic_messages_url(endpoint: &str) -> String {
+    let ep = endpoint.trim_end_matches('/');
+    if ep.ends_with("/v1/messages") {
+        ep.to_string()
+    } else if ep.ends_with("/v1") {
+        format!("{}/messages", ep)
+    } else {
+        format!("{}/v1/messages", ep)
+    }
 }
 
 /// 用系统文件管理器打开目录（macOS Finder / Windows Explorer / Linux xdg-open）。
@@ -514,5 +570,111 @@ mod tests {
     fn udp_envs_inject_fan_no_udp_when_disabled() {
         assert_eq!(udp_envs(false), vec![("FAN_NO_UDP", "1")]);
         assert!(udp_envs(true).is_empty());
+    }
+
+    // ---------- NR-T4 P1 修复：test_connection 按 api_type 分支 ----------
+    // 构造语义与引擎 fan-core build_llm_request 对齐（src-tauri 独立实现）。
+
+    fn openai_cfg() -> FanConfig {
+        FanConfig {
+            threads: None,
+            include: vec![],
+            exclude: vec![],
+            endpoint: "https://api.example.com/v1/chat/completions".into(),
+            api_key: "sk-test".into(),
+            model: "gpt-4o-mini".into(),
+            api_type: "openai".into(),
+        }
+    }
+
+    fn anthropic_cfg() -> FanConfig {
+        FanConfig {
+            threads: None,
+            include: vec![],
+            exclude: vec![],
+            endpoint: "http://10.33.105.218:3200".into(),
+            api_key: "sk-anth".into(),
+            model: "claude-sonnet-4-8".into(),
+            api_type: "anthropic".into(),
+        }
+    }
+
+    /// api_type=openai：url 原样、Authorization Bearer、body model/messages/max_tokens
+    #[test]
+    fn test_connection_request_openai() {
+        let (url, headers, body) = test_connection_request(&openai_cfg());
+        assert_eq!(url, "https://api.example.com/v1/chat/completions");
+        assert!(headers.contains(&("Authorization".to_string(), "Bearer sk-test".to_string())));
+        assert!(headers.contains(&("Content-Type".to_string(), "application/json".to_string())));
+        assert_eq!(body["model"], "gpt-4o-mini");
+        assert_eq!(body["messages"][0]["content"], "ping");
+        assert_eq!(body["max_tokens"], 1);
+    }
+
+    /// api_type=anthropic：url 拼 /v1/messages、x-api-key + anthropic-version、
+    /// body model/messages/max_tokens（无 temperature / Authorization）
+    #[test]
+    fn test_connection_request_anthropic() {
+        let (url, headers, body) = test_connection_request(&anthropic_cfg());
+        assert_eq!(url, "http://10.33.105.218:3200/v1/messages");
+        assert!(headers.contains(&("x-api-key".to_string(), "sk-anth".to_string())));
+        assert!(headers.contains(&("anthropic-version".to_string(), "2023-06-01".to_string())));
+        assert!(!headers.iter().any(|(k, _)| k == "Authorization"));
+        assert_eq!(body["model"], "claude-sonnet-4-8");
+        assert_eq!(body["messages"][0]["content"], "ping");
+        assert_eq!(body["max_tokens"], 1);
+    }
+
+    /// openai_chat_url 三种形态：已含 /chat/completions → 原样；含 /v1 → 拼；
+    /// 否则 → 拼 /v1/chat/completions；尾斜杠不产生 //。
+    #[test]
+    fn openai_chat_url_three_forms() {
+        // CC Switch OPENAI_BASE_URL 形态
+        assert_eq!(
+            openai_chat_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        // 已含完整路径 → 原样
+        assert_eq!(
+            openai_chat_url("https://api.example.com/v1/chat/completions"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        // 裸主机 → 拼 /v1/chat/completions
+        assert_eq!(
+            openai_chat_url("https://api.example.com"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        // 尾斜杠
+        assert_eq!(
+            openai_chat_url("https://api.deepseek.com/v1/"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+    }
+
+    /// anthropic_messages_url：无 /v1 → 拼 /v1/messages；含 /v1 → 拼 /messages；
+    /// 已含完整端点 → 原样；尾斜杠不拼出 //v1/messages
+    #[test]
+    fn anthropic_messages_url_three_forms() {
+        // 真实接管形态：base_url 无 /v1
+        assert_eq!(
+            anthropic_messages_url("http://10.33.105.218:3200"),
+            "http://10.33.105.218:3200/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("http://x:3200/v1/"),
+            "http://x:3200/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("http://x:3200/"),
+            "http://x:3200/v1/messages"
+        );
     }
 }
