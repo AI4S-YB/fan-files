@@ -84,6 +84,22 @@ describe("HomePage", () => {
     expect(screen.getByText("资产")).toBeInTheDocument();
   });
 
+  // GUI-T5 修复 [规格 §八]: Stats.approximate 为真时统计卡数字加 ~ 前缀（近似值标记）
+  it("prefixes stat counts with ~ when approximate", async () => {
+    mockedApi.fetchStats.mockResolvedValue({
+      datasets_upper_bound: 1453,
+      files_upper_bound: 109796,
+      assets_upper_bound: 5000,
+      linked_files_upper_bound: 100000,
+      last_indexed_at: 1787000000,
+      approximate: true,
+    });
+    render(<HomePage onGoSettings={onGoSettings} />);
+    expect(await screen.findByText("~1,453")).toBeInTheDocument();
+    expect(screen.getByText("~109,796")).toBeInTheDocument();
+    expect(screen.getByText("~5,000")).toBeInTheDocument();
+  });
+
   it("does not re-subscribe ScanPanel when stats refresh re-renders (stable onDone)", async () => {
     // 每次调用返回新对象：mockResolvedValue 复用同一引用会让 setStats 因
     // Object.is 相同而 bail out、重渲染根本不会发生，测不到重订阅行为。

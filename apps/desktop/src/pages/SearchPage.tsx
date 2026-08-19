@@ -9,6 +9,9 @@ import {
 } from "../api";
 import DataTable from "../components/DataTable";
 import DatasetDetailModal from "../components/DatasetDetailModal";
+import SharePanel from "../components/SharePanel";
+import ResumeDialog from "../components/ResumeDialog";
+import { useShareTransfer } from "../hooks/useShareTransfer";
 
 export default function SearchPage() {
   const [q, setQ] = useState("");
@@ -20,6 +23,18 @@ export default function SearchPage() {
   // GUI-T4: 结果详情弹层（复用 DatasetDetailModal）
   const [detail, setDetail] = useState<DatasetDetail | null>(null);
   const [files, setFiles] = useState<FileSummary[]>([]);
+  // GUI-T5: 共享状态提升到页面级（弹层关闭后传输仍被跟踪），与数据集页同构
+  const {
+    share,
+    shareEvents,
+    shareRaw,
+    shareName,
+    shareResume,
+    startShare,
+    cancelShare,
+    continueResume,
+    rejectResume,
+  } = useShareTransfer();
 
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -77,8 +92,37 @@ export default function SearchPage() {
           emptyText="没有找到匹配的数据集 — 试试换关键词（如：水稻基因组）"
         />
       )}
+      {/* 页面级共享面板（弹层关闭后传输仍可跟踪/取消；弹层打开时面板在弹层内展示） */}
+      {share.status !== "idle" && !detail && (
+        <SharePanel
+          name={shareName}
+          code={share.status === "code" ? share.code : undefined}
+          events={shareEvents}
+          log={shareRaw}
+          onCancel={() => void cancelShare()}
+        />
+      )}
       {detail && (
-        <DatasetDetailModal detail={detail} files={files} onClose={() => setDetail(null)} />
+        <DatasetDetailModal
+          detail={detail}
+          files={files}
+          onClose={() => setDetail(null)}
+          share={share}
+          shareEvents={shareEvents}
+          shareRaw={shareRaw}
+          shareName={shareName}
+          onShareStart={(path) => void startShare(path, detail.name)}
+          onShareCancel={() => void cancelShare()}
+        />
+      )}
+      {/* 共享侧续传确认弹窗（share://progress resume 事件触发；继续=关弹窗，引擎已自动续传） */}
+      {shareResume && (
+        <ResumeDialog
+          done={shareResume.done}
+          total={shareResume.total}
+          onContinue={continueResume}
+          onReject={rejectResume}
+        />
       )}
     </div>
   );

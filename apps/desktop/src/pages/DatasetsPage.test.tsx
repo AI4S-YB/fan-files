@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import DatasetsPage from "./DatasetsPage";
 import * as api from "../api";
@@ -399,5 +399,171 @@ describe("DatasetsPage", () => {
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("open_path", { path: "/data/inbox" })
     );
+  });
+
+  // GUI-T5 修复 [回归 1]: 共享完成不再自动刷新传输历史。
+  // share://done（页面级监听）→ loadHistory()，与接收完成对称。
+  it("refreshes transfer history when a share completes", async () => {
+    const historyEntry = {
+      direction: "send",
+      dataset: "Oryza_sativa_v1",
+      code: "8-purple-hammer",
+      status: "ok",
+      bytes_sent: 1000,
+      bytes_received: 0,
+      time: 1787000000,
+    };
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([]) // 挂载时 transfer_history
+      .mockResolvedValueOnce(null) // share_dataset
+      .mockResolvedValueOnce([historyEntry]) // 共享完成后 loadHistory 刷新
+      .mockResolvedValue(null);
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.click(screen.getByText("Oryza_sativa_v1")); // 打开详情弹层
+    // openDetail 异步（await fetchDatasetDetail），先等弹层渲染出共享按钮
+    fireEvent.click(await screen.findByRole("button", { name: /共享/ }));
+    eventMock.emit("share://done", 0);
+    // 共享完成的传输自动出现在"传输历史"表（无需手动刷新）
+    expect(await screen.findByText(/传输历史（1）/)).toBeInTheDocument();
+    expect(screen.getByText("📤 发送")).toBeInTheDocument();
+    expect(screen.getByText("✓ 成功")).toBeInTheDocument();
+  });
+
+  // GUI-T5 修复 [回归 2]: 共享传输中关闭弹层不丢跟踪——
+  // 共享状态/share:// 监听已提升到页面级，弹层关闭后页面级共享面板接管
+  //（配对码/进度/取消入口仍在），传输继续被跟踪。
+  it("keeps tracking a share after the detail modal closes", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([]) // 挂载时 transfer_history
+      .mockResolvedValue(null); // share_dataset / cancel_transfer 等
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.click(screen.getByText("Oryza_sativa_v1")); // 打开详情弹层
+    fireEvent.click(await screen.findByRole("button", { name: /共享/ }));
+    eventMock.emit("share://code", "8-purple-hammer");
+    expect(await screen.findByText("8-purple-hammer")).toBeInTheDocument();
+    // 关闭弹层（点击遮罩）
+    const modalTitle = screen
+      .getAllByText("Oryza_sativa_v1")
+      .find((el) => el.closest(".modal"));
+    fireEvent.click(modalTitle!.closest(".modal") as HTMLElement);
+    // 页面级共享面板接管：配对码仍在，进度事件继续驱动面板
+    expect(await screen.findByText("8-purple-hammer")).toBeInTheDocument();
+    eventMock.emit(
+      "share://progress",
+      JSON.stringify({ type: "progress", sent: 512, total: 1024, pct: 50, chunks: 1 })
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50")
+    );
+    // 取消入口保留在页面级
+    fireEvent.click(screen.getByRole("button", { name: /取消传输/ }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("cancel_transfer"));
+  });
+
+  // GUI-T5 修复 [回归 3]: 搜索框 Enter 提交的 loading 防护——
+  // 按钮 disabled 拦不住键盘路径，连输两词会并发请求；Enter 时 loading 则忽略。
+  it("ignores Enter submit while a page request is in flight", async () => {
+    let resolvePage!: (p: typeof pageOne) => void;
+    mockedApi.fetchDatasets.mockReturnValue(
+      new Promise((r) => {
+        resolvePage = r;
+      }) as never
+    );
+    render(<DatasetsPage />);
+    const input = screen.getByPlaceholderText(/搜索名称/);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "搜索" })).toBeDisabled()
+    );
+    fireEvent.change(input, { target: { value: "rice" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    // 请求在途期间 Enter 不触发第二次请求（仅挂载那次）
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(mockedApi.fetchDatasets).toHaveBeenCalledTimes(1);
+    resolvePage(pageOne);
+    await screen.findByText("Oryza_sativa_v1");
+    // loading 结束后 Enter 正常提交搜索词
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(mockedApi.fetchDatasets).toHaveBeenLastCalledWith({
+        cursor: undefined,
+        limit: 50,
+        type: undefined,
+        q: "rice",
+      })
+    );
+  });
+
+  // GUI-T5: 共享侧 resume 事件 → 页面级续传确认弹窗（原在弹层内，随共享状态上移）；
+  // 拒绝 → cancel_transfer
+  it("shows the share resume confirm dialog and rejecting invokes cancel_transfer", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([]) // 挂载时 transfer_history
+      .mockResolvedValue(null);
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.click(screen.getByText("Oryza_sativa_v1"));
+    fireEvent.click(await screen.findByRole("button", { name: /共享/ }));
+    eventMock.emit(
+      "share://progress",
+      JSON.stringify({ type: "resume", done: 34, total: 120 })
+    );
+    expect(await screen.findByText(/发现未完成传输/)).toBeInTheDocument();
+    expect(screen.getByText(/已收 34\/120/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "放弃并取消" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("cancel_transfer"));
+    expect(screen.queryByText(/发现未完成传输/)).not.toBeInTheDocument();
+  });
+
+  // GUI-T5: 共享侧续传确认 → 只关闭弹窗（引擎已自动续传），不触发取消
+  it("confirming the share resume only closes the dialog", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([])
+      .mockResolvedValue(null);
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.click(screen.getByText("Oryza_sativa_v1"));
+    fireEvent.click(await screen.findByRole("button", { name: /共享/ }));
+    eventMock.emit(
+      "share://progress",
+      JSON.stringify({ type: "resume", done: 34, total: 120 })
+    );
+    await screen.findByText(/发现未完成传输/);
+    fireEvent.click(screen.getByRole("button", { name: "继续续传" }));
+    await waitFor(() =>
+      expect(screen.queryByText(/发现未完成传输/)).not.toBeInTheDocument()
+    );
+    expect(invoke).not.toHaveBeenCalledWith("cancel_transfer");
+  });
+
+  // GUI-T5: 共享侧续传确认弹窗 60s 无响应自动关闭（规格 §九：超时默认继续续传）
+  it("auto-closes the share resume dialog after 60s without a response", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce([])
+      .mockResolvedValue(null);
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent.click(screen.getByText("Oryza_sativa_v1"));
+    fireEvent.click(await screen.findByRole("button", { name: /共享/ }));
+    vi.useFakeTimers();
+    try {
+      act(() => {
+        eventMock.emit(
+          "share://progress",
+          JSON.stringify({ type: "resume", done: 34, total: 120 })
+        );
+      });
+      expect(screen.getByText(/发现未完成传输/)).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(60_000);
+      });
+      expect(screen.queryByText(/发现未完成传输/)).not.toBeInTheDocument();
+      expect(invoke).not.toHaveBeenCalledWith("cancel_transfer");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

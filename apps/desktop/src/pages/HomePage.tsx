@@ -42,6 +42,10 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
   }, []);
 
   const lastScan = stats ? formatLastScan(stats.last_indexed_at) : "—";
+  // GUI-T5 修复 [规格 §八]: Stats.approximate 为真时统计卡数字加 ~ 前缀
+  //（增量索引统计为近似值；最近扫描时间不受影响）
+  const approx = stats?.approximate ? "~" : "";
+  const countTitle = stats?.approximate ? "近似值（增量索引统计）" : undefined;
 
   return (
     <div className="page">
@@ -56,17 +60,17 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
       ) : (
         <>
           <div className="stat-cards">
-            <div className="stat-card">
-              <b>{stats ? stats.datasets_upper_bound.toLocaleString() : "—"}</b>
+            <div className="stat-card" title={countTitle}>
+              <b>{stats ? `${approx}${stats.datasets_upper_bound.toLocaleString()}` : "—"}</b>
               <span>数据集</span>
             </div>
             {/* GUI-T4: 统计卡补全资产数（Stats.assets_upper_bound 由后端聚合） */}
-            <div className="stat-card">
-              <b>{stats ? stats.assets_upper_bound.toLocaleString() : "—"}</b>
+            <div className="stat-card" title={countTitle}>
+              <b>{stats ? `${approx}${stats.assets_upper_bound.toLocaleString()}` : "—"}</b>
               <span>资产</span>
             </div>
-            <div className="stat-card">
-              <b>{stats ? stats.files_upper_bound.toLocaleString() : "—"}</b>
+            <div className="stat-card" title={countTitle}>
+              <b>{stats ? `${approx}${stats.files_upper_bound.toLocaleString()}` : "—"}</b>
               <span>文件</span>
             </div>
             <div className="stat-card">

@@ -12,7 +12,10 @@ import {
 } from "../api";
 import DataTable from "../components/DataTable";
 import DatasetDetailModal from "../components/DatasetDetailModal";
+import SharePanel from "../components/SharePanel";
+import ResumeDialog from "../components/ResumeDialog";
 import TransferPanel, { type TransferEvent } from "../components/TransferPanel";
+import { useShareTransfer } from "../hooks/useShareTransfer";
 
 // meta.type_counts 缺失时（老后端/空库）回退到固定类型集
 const FALLBACK_TYPES = ["genome", "transcriptome", "variant", "other"];
@@ -109,11 +112,26 @@ export default function DatasetsPage() {
     }
   }
 
-  // 挂载时加载历史；接收完成后刷新（共享完成的刷新在弹层内）
+  // 挂载时加载历史；接收完成后刷新（共享完成由页面级 useShareTransfer 的 onDone 刷新）
   useEffect(() => {
     void loadHistory();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiveStatus === "done-ok"]);
+
+  // GUI-T5 修复 [回归 2]: 共享状态与 share:// 监听提升到页面级（useShareTransfer）——
+  // 弹层关闭后传输仍被跟踪（页面级共享面板接管进度/取消入口）。
+  // onDone → 刷新传输历史，与接收完成对称（修复 [回归 1]）。
+  const {
+    share,
+    shareEvents,
+    shareRaw,
+    shareName,
+    shareResume,
+    startShare,
+    cancelShare,
+    continueResume: continueShareResume,
+    rejectResume: rejectShareResume,
+  } = useShareTransfer({ onDone: () => void loadHistory() });
 
   // 监听接收事件流（receive://progress / done / error）。progress 为 JSONL 行：
   // JSON.parse 成功 → 分发到面板；失败（人类输出等）→ 仅进原始日志。
@@ -318,6 +336,17 @@ export default function DatasetsPage() {
           </div>
         )}
       </div>
+      {/* GUI-T5 修复: 页面级共享面板（与接收侧对称）——弹层关闭后传输仍可跟踪/取消；
+          弹层打开时面板在弹层内展示（此处用 !detail 隐藏避免双份） */}
+      {share.status !== "idle" && !detail && (
+        <SharePanel
+          name={shareName}
+          code={share.status === "code" ? share.code : undefined}
+          events={shareEvents}
+          log={shareRaw}
+          onCancel={() => void cancelShare()}
+        />
+      )}
       {/* P2P 传输历史 */}
       {transferHistory.length > 0 && (
         <details className="history-panel">
@@ -358,7 +387,8 @@ export default function DatasetsPage() {
             placeholder="搜索名称/关键词…"
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && submitSearch()}
+            // GUI-T5 修复 [回归 3]: Enter 键盘路径补 loading 防护（按钮 disabled 拦不住 Enter）
+            onKeyDown={(e) => e.key === "Enter" && !loading && submitSearch()}
             aria-label="搜索数据集"
           />
           <button className="primary" disabled={loading} onClick={submitSearch}>
@@ -399,29 +429,37 @@ export default function DatasetsPage() {
           下一页
         </button>
       </div>
-      {/* GUI-T4: 详情弹层提取为共享组件（详情+资产+文件+共享按钮，share:// 逻辑自持） */}
+      {/* GUI-T5: 详情弹层为纯展示组件（共享状态/监听在页面级 useShareTransfer） */}
       {detail && (
-        <DatasetDetailModal detail={detail} files={files} onClose={() => setDetail(null)} />
+        <DatasetDetailModal
+          detail={detail}
+          files={files}
+          onClose={() => setDetail(null)}
+          share={share}
+          shareEvents={shareEvents}
+          shareRaw={shareRaw}
+          shareName={shareName}
+          onShareStart={(path) => void startShare(path, detail.name)}
+          onShareCancel={() => void cancelShare()}
+        />
       )}
       {/* 续传确认弹窗（接收侧 resume 事件触发；继续=关弹窗，引擎已自动续传） */}
       {resumeAsk && (
-        <div className="modal" onClick={continueResume}>
-          <div className="modal-body" onClick={(e) => e.stopPropagation()}>
-            <h3>续传确认</h3>
-            <p>
-              发现未完成传输，已收 {resumeAsk.done}/{resumeAsk.total}（
-              {Math.round((resumeAsk.done / resumeAsk.total) * 100)}%），是否续传？
-            </p>
-            <div className="modal-actions">
-              <button className="primary" onClick={continueResume}>
-                继续续传
-              </button>
-              <button className="secondary" onClick={rejectResume}>
-                放弃并取消
-              </button>
-            </div>
-          </div>
-        </div>
+        <ResumeDialog
+          done={resumeAsk.done}
+          total={resumeAsk.total}
+          onContinue={continueResume}
+          onReject={rejectResume}
+        />
+      )}
+      {/* 续传确认弹窗（共享侧 share://progress resume 事件触发；继续=关弹窗，引擎已自动续传） */}
+      {shareResume && (
+        <ResumeDialog
+          done={shareResume.done}
+          total={shareResume.total}
+          onContinue={continueShareResume}
+          onReject={rejectShareResume}
+        />
       )}
     </div>
   );
