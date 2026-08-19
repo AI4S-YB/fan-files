@@ -20,6 +20,14 @@
 //! 收到对端打洞包即学到对端真实源地址（对称 NAT 下与通告地址不同）。指纹不匹配
 //! → 中止报错，绝不降级 relay（安全问题，见规格 §七）。
 //! 环境开关 `FAN_NO_UDP=1` 禁用打洞，直接走 relay。
+//!
+//! ## 分块续传（能力 v3：FileMeta/ChunkStatus）
+//!
+//! QUIC 建连后，双方经 wormhole 交换分块头：发送方发 `file-meta`（文件名、大小、
+//! 文件级 SHA-256、块大小/块数），接收方查本地清单（`.fan-files/partial/<hash16>.
+//! chunks.json`）回 `chunk-status`（已完成块集合），发送方只传缺失块 → 断线续传。
+//! 完成后接收方做文件级 SHA-256 校验，通过才 rename 到目标路径并清理清单。
+//! 清单不匹配（文件已变化）→ 空回执 = 全量传输。
 
 use crate::commands::chunked;
 use fan_core::config::{dirs_fan, DataLayer, Config};
@@ -75,6 +83,17 @@ enum UdpMsg {
     /// 发送方收到后立即降级 relay（不等 accept 超时 15s）。
     /// 相位对称：双方各多收发 1 条消息，v1 降级仍对齐。
     Abort,
+    /// 发送方 → 接收方：文件元数据（分块传输头，在 QUIC 建连后、数据流之前交换）。
+    /// sha256 = 文件级 SHA-256 hex（前 16 字符作清单键 hash16）。
+    FileMeta {
+        name: String,
+        size: u64,
+        sha256: String,
+        chunk_size: u64,
+        chunk_count: u32,
+    },
+    /// 接收方 → 发送方：已完成块集合（清单回执；空 = 全量传输）
+    ChunkStatus { done: Vec<u32> },
 }
 
 /// 一条直连候选（ICE-lite 风格）
@@ -106,17 +125,8 @@ struct UdpDirect {
     peer: std::net::SocketAddr,
 }
 
-/// 打洞成功后 QUIC 侧的传输头（双方通过 QUIC 双向流交换）
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct QuicHeader {
-    /// 原文件名（tar 包或单文件）
-    filename: String,
-    /// 文件字节数
-    filesize: u64,
-}
-
-/// QUIC 数据块大小（magic-wormhole v1 用 16KB；QUIC 自带流控，64KB 分块即可）
-const QUIC_CHUNK: usize = 64 * 1024;
+/// 多流并发传块的 worker 流数（每流一块 4MB 块）
+const QUIC_CHUNK_CONCURRENCY: usize = 4;
 
 /// 获取本机公网地址（UDP STUN，与打洞同一 socket 保证端口映射一致）
 fn local_public_addr(sock: &std::net::UdpSocket) -> Option<std::net::SocketAddr> {
@@ -131,9 +141,11 @@ fn app_config() -> magic_wormhole::AppConfig<serde_json::Value> {
     // 而本方直接走 v1 发 transit，对端消费掉 transit 后 v1 死锁。
     let mut abilities = vec!["transfer-v1"];
     if !udp_disabled() {
-        // 能力名带协议版本：UdpMsg v2（候选列表）与 v1（单 addr）互不兼容，
-        // 用不同能力名让新旧端在协商层即区分，避免 hello 解析失败 + 相位错乱
-        abilities.push("udp-hole-punch-v2");
+        // 能力名带协议版本：UdpMsg v3（候选列表 + FileMeta/ChunkStatus 分块续传）
+        // 与 v2/v1 互不兼容，用不同能力名让新旧端在协商层即区分：
+        // 新端发 v3 hello 给旧端（v2 能力名不匹配）→ peer_supports_udp 为 false
+        // → 双方干净地走 v1 relay（协商层隔离，无相位错乱）。
+        abilities.push("udp-hole-punch-v3");
     }
     magic_wormhole::AppConfig {
         id: APP_CONFIG.id.clone(),
@@ -146,20 +158,20 @@ fn app_config() -> magic_wormhole::AppConfig<serde_json::Value> {
     }
 }
 
-/// 对端是否声明支持 UDP 打洞 v2（候选列表协议）
+/// 对端是否声明支持 UDP 打洞 v3（候选列表 + FileMeta/ChunkStatus 分块续传）
 /// 版本消息在 wormhole connect 时已交换，无需额外消息。
-/// **能力名带版本**：v1（单 addr）与 v2（candidates）互不兼容，必须精确匹配
-/// "udp-hole-punch-v2"——否则新版发 hello 给旧版会被解析失败并导致相位错乱。
+/// **能力名带版本**：v1（单 addr）/ v2（候选列表）与 v3（分块续传）互不兼容，
+/// 必须精确匹配 "udp-hole-punch-v3"——旧端能力名不匹配 → false → 走 v1 relay。
 fn peer_supports_udp(wormhole: &Wormhole) -> bool {
     let v = wormhole.peer_version();
     // 新版：{"app-version": {"abilities": [...]}}
     let app = v.get("app-version");
     if let Some(a) = app.and_then(|a| a.get("abilities")).and_then(|a| a.as_array()) {
-        return a.iter().any(|s| s.as_str() == Some("udp-hole-punch-v2"));
+        return a.iter().any(|s| s.as_str() == Some("udp-hole-punch-v3"));
     }
     // 旧版 fan-files：直接就是 transfer::AppVersion 序列化（abilities 数组）
     if let Some(a) = v.get("abilities").and_then(|a| a.as_array()) {
-        return a.iter().any(|s| s.as_str() == Some("udp-hole-punch-v2"));
+        return a.iter().any(|s| s.as_str() == Some("udp-hole-punch-v3"));
     }
     false
 }
@@ -176,13 +188,14 @@ fn punch_on_socket(
     // 从对方候选列表里找 srflx（打洞目标 = 公网反射地址）
     let cands = match peer_msg {
         UdpMsg::Hello { candidates, .. } | UdpMsg::Ack { candidates, .. } => candidates,
-        UdpMsg::Abort => return None,
+        // Abort / FileMeta / ChunkStatus：非打洞阶段消息，视为无打洞意图
+        UdpMsg::Abort | UdpMsg::FileMeta { .. } | UdpMsg::ChunkStatus { .. } => return None,
     };
     let srflx = cands.iter().find(|c| c.kind == "srflx")?;
     let peer_addr: std::net::SocketAddr = srflx.addr.parse().ok()?;
     let nonce = match peer_msg {
         UdpMsg::Hello { nonce, .. } | UdpMsg::Ack { nonce, .. } => *nonce,
-        UdpMsg::Abort => return None,
+        UdpMsg::Abort | UdpMsg::FileMeta { .. } | UdpMsg::ChunkStatus { .. } => return None,
     };
     // 对方 STUN 失败时会通告空候选 → 立即降级
     if peer_addr.ip().is_unspecified() {
@@ -201,170 +214,61 @@ fn punch_on_socket(
     })
 }
 
-/// QUIC 发送端（发送方）：open_bi → 写头 → 流式发送 + SHA-256 → 等对端确认
-async fn quic_send_file(
-    conn: &quinn::Connection,
-    path: &str,
-    display_name: &str,
-    progress: impl FnMut(u64, u64),
-) -> Result<u64, String> {
-    use futures_lite::io::AsyncReadExt;
+/// 文件级 SHA-256（64KB 增量读，不整文件载入内存——大文件安全）
+fn sha256_file(path: &std::path::Path) -> Result<String, String> {
     use sha2::Digest;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| format!("open_bi: {e}"))?;
-    let file = async_fs::File::open(path)
-        .await
-        .map_err(|e| format!("打开文件 {}: {}", path, e))?;
-    let filesize = file
-        .metadata()
-        .await
-        .map_err(|e| format!("文件元数据: {}", e))?
-        .len();
-    // 头
-    let header = QuicHeader {
-        filename: display_name.to_string(),
-        filesize,
-    };
-    let header_json = serde_json::to_vec(&header).map_err(|e| format!("头序列化: {e}"))?;
-    send.write_all(&(header_json.len() as u32).to_be_bytes())
-        .await
-        .map_err(|e| format!("写头长度: {e}"))?;
-    send.write_all(&header_json)
-        .await
-        .map_err(|e| format!("写头: {e}"))?;
-    // 数据（64KB 分块）
+    let mut f = std::fs::File::open(path).map_err(|e| format!("打开 {}: {}", path.display(), e))?;
     let mut hasher = sha2::Sha256::new();
-    let mut sent = 0u64;
-    let mut progress = progress;
-    progress(0, filesize);
-    let mut buf = vec![0u8; QUIC_CHUNK];
-    let mut reader = file;
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = reader
-            .read(&mut buf)
-            .await
-            .map_err(|e| format!("读文件: {e}"))?;
+        let n = std::io::Read::read(&mut f, &mut buf)
+            .map_err(|e| format!("读 {}: {}", path.display(), e))?;
         if n == 0 {
             break;
         }
-        send.write_all(&(n as u32).to_be_bytes())
-            .await
-            .map_err(|e| format!("写块长: {e}"))?;
-        send.write_all(&buf[..n])
-            .await
-            .map_err(|e| format!("写块: {e}"))?;
-        sent += n as u64;
         hasher.update(&buf[..n]);
-        progress(sent, filesize);
     }
-    // EOF 帧（len=0）
-    send.write_all(&0u32.to_be_bytes())
-        .await
-        .map_err(|e| format!("写 EOF: {e}"))?;
-    // SHA-256 结果
-    let digest = hasher.finalize();
-    let digest_hex = digest.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-    let hash_json = serde_json::to_vec(&digest_hex).map_err(|e| format!("hash 序列化: {e}"))?;
-    send.write_all(&(hash_json.len() as u32).to_be_bytes())
-        .await
-        .map_err(|e| format!("写 hash 长: {e}"))?;
-    send.write_all(&hash_json)
-        .await
-        .map_err(|e| format!("写 hash: {e}"))?;
-    send.finish().map_err(|e| format!("finish: {e}"))?;
-    // 等对端确认：0x6b = 对端 SHA-256 校验通过。EOF（对端失败未写 ack）≠ 成功。
-    let mut ack_buf = [0u8; 1];
-    match recv.read(&mut ack_buf).await {
-        Ok(Some(0x6b)) => {}
-        Ok(_) => return Err("对端未确认（SHA-256 校验失败或接收出错）".into()),
-        Err(e) => return Err(format!("等确认失败: {e}")),
-    }
-    Ok(sent)
+    Ok(hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>())
 }
 
-/// QUIC 接收端（接收方）：accept_bi → 读头 → 流式接收 + SHA-256 → 校验 → 确认
-/// `output` 解析与 v1 的 get 一致：目录 → 目录/文件名；文件 → 该路径；None → ./文件名
-async fn quic_recv_file(
-    conn: &quinn::Connection,
+
+/// 收尾：文件级 SHA-256 校验 partial → rename 到目标路径 → 清理清单。
+/// 目标路径语义与 v1 get 一致：目录 → 目录/文件名；文件 → 该路径；None → 当前目录/文件名。
+/// rename 优先，跨文件系统（EXDEV）降级为拷贝。返回最终文件路径。
+fn finalize_partial(
+    hash16: &str,
+    file_name: &str,
+    expected_sha256: &str,
     output: &Option<String>,
-    progress: impl FnMut(u64, u64),
-) -> Result<(String, u64), String> {
-    use futures_lite::io::AsyncWriteExt;
-    use sha2::Digest;
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| format!("accept_bi: {e}"))?;
-    // 读头
-    let len = read_frame_len(&mut recv).await?;
-    if len == 0 || len > 1024 * 1024 {
-        return Err(format!("头长度异常: {len}"));
+) -> Result<std::path::PathBuf, String> {
+    let part = chunked::partial_path(hash16);
+    // 文件级 SHA-256（增量读，不整文件载入内存）
+    let digest = sha256_file(&part).map_err(|e| format!("校验 partial 失败: {e}"))?;
+    if digest != expected_sha256 {
+        return Err(format!(
+            "文件级 SHA-256 校验失败: peer={expected_sha256} local={digest}"
+        ));
     }
-    let mut header_buf = vec![0u8; len];
-    recv.read_exact(&mut header_buf)
-        .await
-        .map_err(|e| format!("读头: {e}"))?;
-    let header: QuicHeader = serde_json::from_slice(&header_buf).map_err(|e| format!("解析头: {e}"))?;
-    // 目标路径：--output 指定（目录→目录/文件名，文件→该路径），否则当前目录 + 原文件名
     let target_path: PathBuf = match output {
-        Some(p) if PathBuf::from(p).is_dir() => PathBuf::from(p).join(&header.filename),
+        Some(p) if PathBuf::from(p).is_dir() => PathBuf::from(p).join(file_name),
         Some(p) => PathBuf::from(p),
-        None => PathBuf::from(&header.filename),
+        None => PathBuf::from(file_name),
     };
     if let Some(parent) = target_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let mut file = async_fs::File::create(&target_path)
-        .await
-        .map_err(|e| format!("创建文件 {}: {}", target_path.display(), e))?;
-    let mut hasher = sha2::Sha256::new();
-    let mut received = 0u64;
-    let mut progress = progress;
-    progress(0, header.filesize);
-    // 数据帧（len=0 = EOF）
-    let mut buf = vec![0u8; QUIC_CHUNK];
-    loop {
-        let n = read_frame_len(&mut recv).await?;
-        if n == 0 {
-            break; // EOF
+    match std::fs::rename(&part, &target_path) {
+        Ok(()) => {}
+        Err(e) => {
+            // 跨文件系统（EXDEV）：降级拷贝后删 partial
+            eprintln!("  ⚠ rename 失败（{e}），降级拷贝");
+            std::fs::copy(&part, &target_path)
+                .map_err(|e| format!("拷贝到 {}: {}", target_path.display(), e))?;
+            let _ = std::fs::remove_file(&part);
         }
-        // L3：块长上限 64MB（防恶意/损坏 peer 声明超大块长导致 OOM；正常 64KB 分块）
-        if n > 64 * 1024 * 1024 {
-            return Err(format!("数据块长度异常: {n}"));
-        }
-        if n > buf.len() {
-            buf.resize(n, 0);
-        }
-        recv.read_exact(&mut buf[..n])
-            .await
-            .map_err(|e| format!("读块: {e}"))?;
-        file.write_all(&buf[..n])
-            .await
-            .map_err(|e| format!("写文件: {e}"))?;
-        received += n as u64;
-        hasher.update(&buf[..n]);
-        progress(received, header.filesize);
     }
-    file.close().await.map_err(|e| format!("关文件: {e}"))?;
-    // 读 SHA-256
-    let len = read_frame_len(&mut recv).await?;
-    if len == 0 || len > 1024 {
-        return Err(format!("hash 长度异常: {len}"));
-    }
-    let mut hash_buf = vec![0u8; len];
-    recv.read_exact(&mut hash_buf)
-        .await
-        .map_err(|e| format!("读 hash: {e}"))?;
-    let peer_digest: String = serde_json::from_slice(&hash_buf).map_err(|e| format!("解析 hash: {e}"))?;
-    let our_digest = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
-    if peer_digest != our_digest {
-        return Err(format!("SHA-256 校验失败: peer={} local={}", peer_digest, our_digest));
-    }
-    // 确认（close 触发对端 recv 返回）
-    send.write_all(&[0x6b]).await.map_err(|e| format!("写确认: {e}"))?;
-    Ok((header.filename, received))
+    chunked::clear_manifest(hash16);
+    Ok(target_path)
 }
 
 // ---------- QUIC 多流并发分块传输（阶段 1，Task 2） ----------
@@ -390,9 +294,14 @@ async fn quic_send_chunks(
 ) -> Result<u64, String> {
     use futures_lite::io::AsyncReadExt;
     use sha2::Digest;
-    let total_bytes: u64 = plan.iter().map(|c| c.size).sum();
     if !std::path::Path::new(path).exists() {
         return Err(format!("发送文件不存在: {path}"));
+    }
+    // 续传语义：进度总量 = 本次缺失块字节数（清单已完成块不计入）
+    let total_bytes: u64 = missing.iter().map(|i| plan[*i as usize].size).sum();
+    // 清单显示全部块已完成 → 无需传输（接收方自己会校验并收尾）
+    if missing.is_empty() {
+        return Ok(0);
     }
     let pending: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
         std::sync::Arc::new(std::sync::Mutex::new(missing.to_vec()));
@@ -518,7 +427,9 @@ async fn quic_send_chunks(
 /// 更新清单（done 集合，原子持久化）。多流共享同一文件句柄，用 Mutex 串行化
 /// seek+write——POSIX 下同一文件描述符的游标是共享的，不加锁并发 seek+write
 /// 会互相抢占游标写错位置（不同 offset 的写入本身无冲突）。
-/// 返回 (收到块数, 收到字节数)。
+/// `initial_done`：续传时清单里已完成的块（首次传输传空）。已完成块不计入
+/// 本次进度/字节数（防二次计数）；重复收到已记账块（ack 丢失重发）→ 回 0x6b
+/// 不重写。返回 (总完成块数, 本次收到字节数)。
 async fn quic_recv_chunks(
     conn: &quinn::Connection,
     hash16: &str,
@@ -526,6 +437,7 @@ async fn quic_recv_chunks(
     file_size: u64,
     chunk_size: u64,
     chunk_count: u32,
+    initial_done: &[u32],
     progress: impl FnMut(u64, u64) + Clone + Send + 'static,
 ) -> Result<(u32, u64), String> {
     use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
@@ -541,12 +453,24 @@ async fn quic_recv_chunks(
         .map_err(|e| format!("打开 partial 文件 {}: {}", part_path.display(), e))?;
     let file_arc: std::sync::Arc<std::sync::Mutex<std::fs::File>> =
         std::sync::Arc::new(std::sync::Mutex::new(file));
+    // 初始 done = 清单已收块（续传断点；越界索引防御性过滤）。done 含初始集合，
+    // 后续清单保存与完成度判断（done.len() >= chunk_count）自动涵盖续传语义。
+    let plan = chunked::chunk_plan(file_size, chunk_size);
     let done: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        std::sync::Arc::new(std::sync::Mutex::new(
+            initial_done.iter().copied().filter(|i| *i < chunk_count).collect(),
+        ));
+    // 初始已收字节（进度基线）与本次期望字节（= 缺失块总量）
+    let initial_bytes: u64 = plan
+        .iter()
+        .filter(|c| done.lock().unwrap().contains(&c.index))
+        .map(|c| c.size)
+        .sum();
+    let expected_bytes: u64 = file_size.saturating_sub(initial_bytes);
     let total_received: std::sync::Arc<std::sync::atomic::AtomicU64> =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut progress = progress;
-    progress(0, file_size);
+    progress(initial_bytes, file_size);
 
     let mut handles = Vec::new();
     loop {
@@ -595,6 +519,12 @@ async fn quic_recv_chunks(
                 let _ = send.write_all(&[0x65]).await; // 协议异常 → nack
                 return;
             }
+            // 重复块（ack 丢失重发 / 续传边界）：已记账的块直接回 0x6b 不重写、
+            // 不计数（防二次计数——total_received 与清单 done 均为幂等集合）
+            if done.lock().unwrap().contains(&idx) {
+                let _ = send.write_all(&[0x6b]).await;
+                return;
+            }
             let mut buf = vec![0u8; size as usize];
             if recv.read_exact(&mut buf).await.is_err() {
                 return; // 断流：不确认，发送方自会重试
@@ -629,7 +559,10 @@ async fn quic_recv_chunks(
                 done: d.iter().copied().collect(),
             };
             let _ = chunked::save_manifest(&hash16, &m);
-            progress(total_received.load(std::sync::atomic::Ordering::Relaxed), file_size);
+            progress(
+                initial_bytes + total_received.load(std::sync::atomic::Ordering::Relaxed),
+                file_size,
+            );
         }));
     }
     for h in handles {
@@ -637,21 +570,18 @@ async fn quic_recv_chunks(
     }
     let chunks = done.lock().unwrap().len() as u32;
     let bytes = total_received.load(std::sync::atomic::Ordering::Relaxed);
-    if bytes != file_size {
+    // 续传语义：完成度看总块数（含清单初始块），字节数看本次缺失块
+    if chunks != chunk_count {
         return Err(format!(
-            "收到 {bytes} 字节 ≠ 期望 {file_size}（{chunks}/{chunk_count} 块，可能断线）"
+            "仅收到 {chunks}/{chunk_count} 块（可能断线，清单已保留可续传）"
+        ));
+    }
+    if bytes != expected_bytes {
+        return Err(format!(
+            "本次收到 {bytes} 字节 ≠ 期望 {expected_bytes}（{chunks}/{chunk_count} 块，可能断线）"
         ));
     }
     Ok((chunks, bytes))
-}
-
-/// 读一个 QUIC 帧的长度（4 字节大端）
-async fn read_frame_len(recv: &mut quinn::RecvStream) -> Result<usize, String> {
-    let mut b = [0u8; 4];
-    recv.read_exact(&mut b)
-        .await
-        .map_err(|e| format!("读帧长: {e}"))?;
-    Ok(u32::from_be_bytes(b) as usize)
 }
 
 /// 限时收一条 UDP 握手消息。
@@ -677,6 +607,60 @@ async fn recv_udp_msg(wormhole: &mut Wormhole, timeout: Duration, what: &str) ->
     res
 }
 
+/// QUIC 建连后的接收方流程（host / srflx 两路径共用）：
+/// 收 FileMeta（wormhole）→ 查清单 → 回 ChunkStatus → 收缺失块写 partial →
+/// 文件级 SHA-256 校验 → rename 到目标路径 → 清理清单。返回 (文件名, 本次收到字节)。
+async fn quic_recv_resume(
+    conn: &quinn::Connection,
+    wormhole: &mut Wormhole,
+    output: &Option<String>,
+    progress: impl FnMut(u64, u64) + Clone + Send + 'static,
+) -> Result<(String, u64), String> {
+    // ① 收 FileMeta（发送方在 QUIC 建连后即发）
+    let (name, size, sha256, chunk_size, chunk_count) =
+        match recv_udp_msg(wormhole, Duration::from_secs(15), "file-meta").await? {
+            Some(UdpMsg::FileMeta { name, size, sha256, chunk_size, chunk_count }) => {
+                (name, size, sha256, chunk_size, chunk_count)
+            }
+            Some(_) => return Err("收到意外的 UDP 握手消息".into()),
+            None => return Err("file-meta 超时".into()),
+        };
+    // ② 清单比对：hash16 = 文件级 SHA-256 前 16 字符；清单匹配（size/chunk_size
+    //    一致）→ 已收块集合；不匹配 → 空（全量传输）
+    let hash16: String = sha256.chars().take(16).collect();
+    let done = match chunked::load_manifest(&hash16) {
+        Some(m) if m.file_size == size && m.chunk_size == chunk_size => m.done,
+        _ => Vec::new(),
+    };
+    if !done.is_empty() {
+        eprintln!("  ♻ 清单命中 {} 块，续传缺失块（总 {} 块）", done.len(), chunk_count);
+    }
+    // ③ 回 ChunkStatus（清单回执；空 = 全量传输）
+    wormhole
+        .send_json(&UdpMsg::ChunkStatus { done: done.clone() })
+        .await
+        .map_err(|e| format!("send chunk-status: {e}"))?;
+    // ④ 多流收缺失块（写 partial + 逐块更新清单）
+    let (chunks, bytes) = quic_recv_chunks(
+        conn, &hash16, &name, size, chunk_size, chunk_count, &done, progress,
+    )
+    .await?;
+    eprintln!("  ✅ 收满 {chunks} 块（本次 {bytes} 字节），文件级校验…");
+    // ⑤ 文件级 SHA-256 校验 → rename → 清理清单
+    let target = match finalize_partial(&hash16, &name, &sha256, output) {
+        Ok(t) => t,
+        Err(e) => {
+            // 文件级校验失败 = partial 与清单不一致（数据可疑），清理清单让重试
+            // 走全量传输（自愈），避免清单死锁（永远缺同样的块）
+            eprintln!("  ⚠ 收尾失败，清理清单以便下次全量重传");
+            chunked::clear_manifest(&hash16);
+            return Err(e);
+        }
+    };
+    eprintln!("  ✅ 文件级 SHA-256 校验通过，已保存: {}", target.display());
+    Ok((name, bytes))
+}
+
 /// UDP 直连发送（发送方 = QUIC 服务端，ICE-lite 多候选监听）：
 /// 收集 host + srflx 候选 → hello（完整候选）→ ack → 多端 quic_listen → accept 循环
 async fn udp_send_path(
@@ -689,6 +673,17 @@ async fn udp_send_path(
     send_target: &str,
     display_name: &str,
 ) -> Result<u64, String> {
+    // 预备：文件级 SHA-256 + 分块计划（Task 3 FileMeta 头）。
+    // 提前算好而不是建连后再算——建连后接收方只等 15s file-meta，大文件哈希
+    // 耗时可能超时；增量读 64KB 更新 hasher，不整文件载入内存。
+    eprintln!("  🔎 计算文件级 SHA-256（增量读，大文件较慢）…");
+    let filesize = std::fs::metadata(send_target)
+        .map_err(|e| format!("文件元数据: {e}"))?
+        .len();
+    let sha256 = sha256_file(std::path::Path::new(send_target))?;
+    let plan = chunked::chunk_plan(filesize, chunked::DEFAULT_CHUNK_SIZE);
+    let chunk_size = plan.first().map(|c| c.size).unwrap_or(0);
+
     // ① 收集候选：
     //    - host：每个本地 IPv4 接口绑一个 socket（ip:0 随机端口），同网段对端免打洞直连
     //    - srflx：0.0.0.0:0 + UDP STUN（同 socket 保证端口映射一致）
@@ -823,7 +818,32 @@ async fn udp_send_path(
                     eprintln!("  ⚠ 拒绝未知来源连接: {remote}（不在对方通告候选内）");
                     continue;
                 }
-                let sent = quic_send_file(&conn, send_target, display_name, |done, total| {
+                // Task 3：QUIC 建连后经 wormhole 交换 FileMeta/ChunkStatus（分块续传）。
+                // 顺序固定：QUIC 建连 → 发 FileMeta → 收 ChunkStatus（清单回执）→
+                // 多流只传缺失块。FileMeta 必须建连后才发——接收方 accept 到连接
+                // 才需要文件信息（wormhole 通道双方一直连着，可随时发）。
+                wormhole
+                    .send_json(&UdpMsg::FileMeta {
+                        name: display_name.to_string(),
+                        size: filesize,
+                        sha256: sha256.clone(),
+                        chunk_size,
+                        chunk_count: plan.len() as u32,
+                    })
+                    .await
+                    .map_err(|e| format!("send file-meta: {e}"))?;
+                // 收清单回执 → 缺失块 = 全量块 − 已收块（空回执 = 全量传输）
+                let done = match recv_udp_msg(wormhole, Duration::from_secs(15), "chunk-status").await? {
+                    Some(UdpMsg::ChunkStatus { done }) => done,
+                    Some(_) => return Err("收到意外的 UDP 握手消息".into()),
+                    None => return Err("chunk-status 超时".into()),
+                };
+                let done_set: std::collections::BTreeSet<u32> = done.into_iter().collect();
+                let missing = chunked::missing_chunks(plan.len(), &done_set);
+                if !done_set.is_empty() {
+                    eprintln!("  ♻ 清单回执 {} 块已完成，续传缺失 {} 块", done_set.len(), missing.len());
+                }
+                let sent = quic_send_chunks(&conn, send_target, &plan, &missing, QUIC_CHUNK_CONCURRENCY, |done, total| {
                     if total > 0 {
                         eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
                     }
@@ -954,7 +974,7 @@ async fn udp_get_path(
                     eprintln!("  🔗 尝试 host 直连 {} → {}", sock.local_addr().map(|a| a.to_string()).unwrap_or_default(), addr);
                     match crate::commands::quic_link::quic_connect(sock, addr, expected_fp.clone(), Duration::from_secs(2)).await {
                         Ok((ep, conn)) => {
-                            let r = quic_recv_file(&conn, output, |d, t| {
+                            let r = quic_recv_resume(&conn, wormhole, output, |d, t| {
                                 if t > 0 { eprintln!("\r  进度: {}/{} ({:.0}%)", d, t, d as f64 / t as f64 * 100.0); }
                             }).await;
                             conn.close(0u32.into(), b"done");
@@ -980,7 +1000,7 @@ async fn udp_get_path(
                     Some(direct) => {
                         match crate::commands::quic_link::quic_connect(direct.sock, direct.peer, expected_fp.clone(), Duration::from_secs(10)).await {
                             Ok((ep, conn)) => {
-                                let r = quic_recv_file(&conn, output, |d, t| {
+                                let r = quic_recv_resume(&conn, wormhole, output, |d, t| {
                                     if t > 0 { eprintln!("\r  进度: {}/{} ({:.0}%)", d, t, d as f64 / t as f64 * 100.0); }
                                 }).await;
                                 conn.close(0u32.into(), b"done");
@@ -1278,7 +1298,7 @@ fn get(config: &Config, layer: &DataLayer, code_str: &str, output: Option<String
             // 接收方：限时等 udp-hello（旧版发送方不会发 hello，超时即降级）
             match recv_udp_msg(&mut wormhole, Duration::from_secs(15), "udp-hello").await {
                 Ok(Some(hello @ UdpMsg::Hello { .. })) => {
-                    // UDP 路径：目标路径在 quic_recv_file 内部解析（含文件名）
+                    // UDP 路径：目标路径在 quic_recv_resume 内部解析（含文件名）
                     match udp_get_path(&mut wormhole, &hello, "receiver", &output).await {
                         Ok((file_name, received)) => {
                             println!("\n  ✅ UDP 直连接收完成，SHA-256 校验通过（{} 字节）", received);
@@ -1554,7 +1574,7 @@ mod tests {
                     let (endpoint, conn) = crate::commands::quic_link::quic_connect(client_sock, addr, fp, Duration::from_secs(10)).await?;
                     let p = rcv_progress.clone();
                     let (chunks, bytes) = quic_recv_chunks(&conn, hash16, "fan-chunk-test.bin",
-                        8 * 1024 * 1024, chunked::DEFAULT_CHUNK_SIZE, 2,
+                        8 * 1024 * 1024, chunked::DEFAULT_CHUNK_SIZE, 2, &[],
                         move |d, t| { p.lock().unwrap().push((d, t)); }).await?;
                     assert_eq!(chunks, 2, "应收满 2 块");
                     assert_eq!(bytes, 8 * 1024 * 1024, "收到字节数应等于文件大小");
@@ -1587,5 +1607,245 @@ mod tests {
         assert!(part_matches, "partial 文件内容应与原文件一致（块级 SHA-256 + offset 写入）");
         assert!(snd_ok, "发送方进度应累计到总字节: {:?}", snd_progress.lock().unwrap());
         assert!(rcv_ok, "接收方进度应累计到总字节: {:?}", rcv_progress.lock().unwrap());
+    }
+
+    /// FileMeta/ChunkStatus 消息序列化 roundtrip（kebab-case 标签 + 字段重命名）
+    #[test]
+    fn udp_msg_file_meta_chunk_status_roundtrip() {
+        let meta = UdpMsg::FileMeta {
+            name: "dataset.tar".into(),
+            size: 10 * 1024 * 1024,
+            sha256: "ab".repeat(32),
+            chunk_size: chunked::DEFAULT_CHUNK_SIZE,
+            chunk_count: 3,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"file-meta\""), "kebab-case 标签应为 file-meta: {json}");
+        // 注：serde 的 enum rename_all 只影响变体名（type 标签），结构体字段保持
+        // 原样（chunk_size）；双方用同一 derive，线上格式一致即可
+        assert!(json.contains("\"chunk_size\""), "字段名保持 snake_case: {json}");
+        let back: UdpMsg = serde_json::from_str(&json).unwrap();
+        match back {
+            UdpMsg::FileMeta { name, size, sha256, chunk_size, chunk_count } => {
+                assert_eq!(name, "dataset.tar");
+                assert_eq!(size, 10 * 1024 * 1024);
+                assert_eq!(sha256.len(), 64);
+                assert_eq!(chunk_size, chunked::DEFAULT_CHUNK_SIZE);
+                assert_eq!(chunk_count, 3);
+            }
+            _ => panic!("应为 FileMeta"),
+        }
+        let st = UdpMsg::ChunkStatus { done: vec![0, 1, 3] };
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(json.contains("\"chunk-status\""), "kebab-case 标签应为 chunk-status: {json}");
+        let back: UdpMsg = serde_json::from_str(&json).unwrap();
+        match back {
+            UdpMsg::ChunkStatus { done } => assert_eq!(done, vec![0, 1, 3]),
+            _ => panic!("应为 ChunkStatus"),
+        }
+    }
+
+    /// 模拟 wormhole 的消息通道：std mpsc + try_recv 轮询（不阻塞 async executor）
+    async fn chan_recv(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Result<Vec<u8>, String> {
+        loop {
+            if let Ok(v) = rx.try_recv() {
+                return Ok(v);
+            }
+            async_io::Timer::after(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// 断线续传回环（同机双 endpoint × 2 轮）：
+    /// 第 1 轮模拟断线：发送方只传前 2 块（清单 done=[0,1]，partial = 前 8MB）后关闭
+    /// 连接，接收方 accept 循环发现连接关闭（4 块未收满）→ 断线错误——清单已持久化。
+    /// 第 2 轮完整续传流程：发送方算文件级 SHA-256 → FileMeta → 接收方查清单回
+    /// ChunkStatus{done:[0,1]} → 发送方只传缺失块 [2,3]（进度止于 8MB 而非 16MB）→
+    /// 接收方收满后文件级校验 → rename → 清理清单。断言最终文件 == 原文件。
+    #[test]
+    fn quic_chunked_resume_skips_done_chunks() {
+        let tmp = std::env::temp_dir().join("fan-resume-test.bin");
+        let data = vec![0xCDu8; 16 * 1024 * 1024];
+        std::fs::write(&tmp, &data).unwrap();
+        let tmp_str = tmp.to_string_lossy().to_string();
+        let sha = sha256_file(&tmp).unwrap();
+        let hash16: String = sha.chars().take(16).collect();
+        let output = std::env::temp_dir().join("fan-resume-out.bin");
+        let _ = std::fs::remove_file(&output);
+        chunked::clear_manifest(&hash16); // 防上次运行残留
+        let file_size = 16 * 1024 * 1024u64;
+
+        let (cert, key, fp) = crate::commands::quic_link::gen_cert_with_fingerprint();
+
+        // ---------- 第 1 轮：模拟断线（发送方只传前 2 块后关闭连接） ----------
+        let server_sock1 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server_sock1.set_nonblocking(true).unwrap();
+        let addr1 = server_sock1.local_addr().unwrap();
+        let client_sock1 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_sock1.set_nonblocking(true).unwrap();
+
+        let r1 = async_std::task::block_on(async {
+            let server1 = crate::commands::quic_link::quic_listen(server_sock1, cert.clone(), key.clone_key())
+                .await.expect("server1 endpoint");
+            let srv = futures_lite::future::or(
+                async {
+                    let incoming = server1.accept().await.ok_or("server1 accept 超时")?;
+                    let conn = incoming.await.map_err(|e| format!("incoming handshake: {e}"))?;
+                    let plan = chunked::chunk_plan(file_size, chunked::DEFAULT_CHUNK_SIZE);
+                    assert_eq!(plan.len(), 4, "16MB/4MB 应为 4 块");
+                    // 模拟断线：只传前 2 块，传完即断
+                    let sent = quic_send_chunks(&conn, &tmp_str, &plan, &[0, 1], 2, |_, _| {}).await?;
+                    assert_eq!(sent, 8 * 1024 * 1024, "首轮应只传前 8MB");
+                    conn.close(0u32.into(), b"disconnect");
+                    let _ = conn.closed().await;
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(30)).await;
+                    Err("server1 30s 超时".to_string())
+                },
+            );
+            let cli = futures_lite::future::or(
+                async {
+                    let (ep, conn) = crate::commands::quic_link::quic_connect(
+                        client_sock1, addr1, fp.clone(), Duration::from_secs(10)).await?;
+                    // 收满 2 块后连接关闭 → 断线路径（done=2 < 4 未收满 → Err）
+                    let r = quic_recv_chunks(&conn, &hash16, "fan-resume-test.bin",
+                        file_size, chunked::DEFAULT_CHUNK_SIZE, 4, &[], |_, _| {}).await;
+                    conn.close(0u32.into(), b"done");
+                    drop(ep);
+                    r.map(|_| ()).map_err(|e| format!("接收方应报断线: {e}"))
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(30)).await;
+                    Err("client1 30s 超时".to_string())
+                },
+            );
+            let (srv_res, cli_res) = futures_lite::future::zip(srv, cli).await;
+            srv_res?;
+            cli_res
+        });
+        assert!(r1.is_err(), "第 1 轮应模拟断线失败（未收满 4 块）: {r1:?}");
+        // 断线后清单应已持久化 done=[0,1]
+        let m = chunked::load_manifest(&hash16).expect("断线后清单应存在");
+        assert_eq!(m.done, vec![0, 1], "断线后清单应记录前两块");
+        assert_eq!(m.file_size, file_size);
+        assert_eq!(m.chunk_size, chunked::DEFAULT_CHUNK_SIZE);
+
+        // ---------- 第 2 轮：完整续传流程（FileMeta/ChunkStatus 经通道模拟 wormhole） ----------
+        let server_sock2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server_sock2.set_nonblocking(true).unwrap();
+        let addr2 = server_sock2.local_addr().unwrap();
+        let client_sock2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_sock2.set_nonblocking(true).unwrap();
+        let (meta_tx, meta_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (status_tx, status_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let snd_progress: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>> = Default::default();
+        let rcv_progress: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>> = Default::default();
+        let output_str = output.to_string_lossy().to_string();
+
+        let result = async_std::task::block_on(async {
+            let server2 = crate::commands::quic_link::quic_listen(server_sock2, cert, key)
+                .await.expect("server2 endpoint");
+            // 发送方：算文件级 SHA-256 → 分块 → FileMeta → 等 ChunkStatus → 只传缺失块
+            let srv = futures_lite::future::or(
+                async {
+                    let incoming = server2.accept().await.ok_or("server2 accept 超时")?;
+                    let conn = incoming.await.map_err(|e| format!("incoming handshake: {e}"))?;
+                    let s = sha256_file(std::path::Path::new(&tmp_str))?;
+                    assert_eq!(&s[..16], hash16, "hash16 应为文件级 SHA-256 前 16 字符");
+                    let plan = chunked::chunk_plan(file_size, chunked::DEFAULT_CHUNK_SIZE);
+                    let meta = UdpMsg::FileMeta {
+                        name: "fan-resume-test.bin".into(),
+                        size: file_size,
+                        sha256: s,
+                        chunk_size: chunked::DEFAULT_CHUNK_SIZE,
+                        chunk_count: plan.len() as u32,
+                    };
+                    let meta_json = serde_json::to_vec(&meta).map_err(|e| format!("FileMeta 序列化: {e}"))?;
+                    meta_tx.send(meta_json).map_err(|e| format!("meta 转发: {e}"))?;
+                    // 收 ChunkStatus（清单回执）
+                    let status_json = chan_recv(&status_rx).await?;
+                    let status: UdpMsg = serde_json::from_slice(&status_json)
+                        .map_err(|e| format!("ChunkStatus 解析: {e}"))?;
+                    let done: std::collections::BTreeSet<u32> = match status {
+                        UdpMsg::ChunkStatus { done } => done.into_iter().collect(),
+                        _ => return Err("应收到 ChunkStatus".into()),
+                    };
+                    let missing = chunked::missing_chunks(plan.len(), &done);
+                    assert_eq!(missing, vec![2, 3], "清单回执后应只缺 2、3 块");
+                    let p = snd_progress.clone();
+                    let sent = quic_send_chunks(&conn, &tmp_str, &plan, &missing, 2,
+                        move |d, t| { p.lock().unwrap().push((d, t)); }).await?;
+                    assert_eq!(sent, 8 * 1024 * 1024, "续传应只传 8MB");
+                    conn.close(0u32.into(), b"resume done");
+                    let _ = conn.closed().await;
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(30)).await;
+                    Err("server2 30s 超时".to_string())
+                },
+            );
+            // 接收方：收 FileMeta → 查清单 → 回 ChunkStatus → 收缺失块 → 校验 + 收尾
+            let cli = futures_lite::future::or(
+                async {
+                    let (ep, conn) = crate::commands::quic_link::quic_connect(
+                        client_sock2, addr2, fp.clone(), Duration::from_secs(10)).await?;
+                    let meta_json = chan_recv(&meta_rx).await?;
+                    let meta: UdpMsg = serde_json::from_slice(&meta_json)
+                        .map_err(|e| format!("FileMeta 解析: {e}"))?;
+                    let (name, size, s, chunk_size, chunk_count) = match meta {
+                        UdpMsg::FileMeta { name, size, sha256, chunk_size, chunk_count } =>
+                            (name, size, sha256, chunk_size, chunk_count),
+                        _ => return Err("应收到 FileMeta".into()),
+                    };
+                    let hash16: String = s.chars().take(16).collect();
+                    // 查清单：匹配 → 已收块；不匹配 → 空（全量）
+                    let done = match chunked::load_manifest(&hash16) {
+                        Some(m) if m.file_size == size && m.chunk_size == chunk_size => m.done,
+                        _ => Vec::new(),
+                    };
+                    assert_eq!(done, vec![0, 1], "清单应命中前两块");
+                    let st = UdpMsg::ChunkStatus { done: done.clone() };
+                    let st_json = serde_json::to_vec(&st).map_err(|e| format!("ChunkStatus 序列化: {e}"))?;
+                    status_tx.send(st_json).map_err(|e| format!("status 转发: {e}"))?;
+                    let p = rcv_progress.clone();
+                    let (chunks, bytes) = quic_recv_chunks(&conn, &hash16, &name, size,
+                        chunk_size, chunk_count, &done,
+                        move |d, t| { p.lock().unwrap().push((d, t)); }).await?;
+                    assert_eq!(chunks, 4, "应收满 4 块（含清单中的 2 块）");
+                    assert_eq!(bytes, 8 * 1024 * 1024, "本次连接应只收到 8MB 新块");
+                    let target = finalize_partial(&hash16, &name, &s, &Some(output_str.clone()))?;
+                    assert_eq!(target, output, "应输出到 --output 指定路径");
+                    conn.close(0u32.into(), b"done");
+                    drop(ep);
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(30)).await;
+                    Err("client2 30s 超时".to_string())
+                },
+            );
+            let (srv_res, cli_res) = futures_lite::future::zip(srv, cli).await;
+            srv_res?;
+            cli_res
+        });
+
+        // ---------- 断言：续传只传缺失块 + 最终文件完整 ----------
+        assert!(result.is_ok(), "续传应成功: {result:?}");
+        assert_eq!(sha256_file(&output).unwrap(), sha, "续传结果应与原文件一致（文件级 SHA-256）");
+        assert!(chunked::load_manifest(&hash16).is_none(), "收尾后清单应清理");
+        assert!(!chunked::partial_path(&hash16).exists(), "收尾后 partial 应移除");
+        let snd_last = snd_progress.lock().unwrap().last().copied();
+        assert_eq!(snd_last, Some((8 * 1024 * 1024, 8 * 1024 * 1024)),
+            "发送方进度应止于 8MB（只传缺失块）: {:?}", snd_progress.lock().unwrap());
+        let rcv_last = rcv_progress.lock().unwrap().last().copied();
+        assert_eq!(rcv_last, Some((16 * 1024 * 1024, 16 * 1024 * 1024)),
+            "接收方进度应含清单中已收的 8MB: {:?}", rcv_progress.lock().unwrap());
+
+        // 清理
+        chunked::clear_manifest(&hash16);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&output);
     }
 }
