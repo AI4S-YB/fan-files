@@ -28,6 +28,9 @@
 //! chunks.json`）回 `chunk-status`（已完成块集合），发送方只传缺失块 → 断线续传。
 //! 完成后接收方做文件级 SHA-256 校验，通过才 rename 到目标路径并清理清单。
 //! 清单不匹配（文件已变化）→ 空回执 = 全量传输。
+//! 发送方文件级 SHA-256 在后台线程计算（与打洞/accept 并行）——hello 先于哈希发出，
+//! 大文件哈希不再挤占接收方 15s udp-hello 窗口；FileMeta 等哈希就绪后再发（此时
+//! 哈希通常早已完成），哈希失败/超时 → 本端降级 relay，绝不迟到污染对方消息流。
 
 use crate::commands::chunked;
 use fan_core::config::{dirs_fan, DataLayer, Config};
@@ -292,7 +295,6 @@ async fn quic_send_chunks(
     concurrency: usize,
     progress: impl FnMut(u64, u64) + Clone + Send + 'static,
 ) -> Result<u64, String> {
-    use futures_lite::io::AsyncReadExt;
     use sha2::Digest;
     if !std::path::Path::new(path).exists() {
         return Err(format!("发送文件不存在: {path}"));
@@ -440,7 +442,6 @@ async fn quic_recv_chunks(
     initial_done: &[u32],
     progress: impl FnMut(u64, u64) + Clone + Send + 'static,
 ) -> Result<(u32, u64), String> {
-    use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
     use sha2::Digest;
     let part_path = chunked::partial_path(hash16);
     if let Some(parent) = part_path.parent() {
@@ -625,6 +626,16 @@ async fn quic_recv_resume(
             Some(_) => return Err("收到意外的 UDP 握手消息".into()),
             None => return Err("file-meta 超时".into()),
         };
+    // 清单自洽校验：chunk_count 必须等于本地分块计划块数（防恶意/损坏的 FileMeta
+    // 声称少于实际块数——块数不足会让 accept 循环提前结束，partial 缺尾部数据，
+    // 文件级校验虽能兜底，但应尽早报错而非走完整个传输）。chunk_plan 自适应放大
+    // 块大小（>512 块），发送方发的 chunk_size 已是放大后的值，双方结果一致。
+    let expect_chunks = chunked::chunk_plan(size, chunk_size).len() as u32;
+    if chunk_count != expect_chunks {
+        return Err(format!(
+            "FileMeta chunk_count={chunk_count} 与分块计划不一致（应为 {expect_chunks}）"
+        ));
+    }
     // ② 清单比对：hash16 = 文件级 SHA-256 前 16 字符；清单匹配（size/chunk_size
     //    一致）→ 已收块集合；不匹配 → 空（全量传输）
     let hash16: String = sha256.chars().take(16).collect();
@@ -673,16 +684,22 @@ async fn udp_send_path(
     send_target: &str,
     display_name: &str,
 ) -> Result<u64, String> {
-    // 预备：文件级 SHA-256 + 分块计划（Task 3 FileMeta 头）。
-    // 提前算好而不是建连后再算——建连后接收方只等 15s file-meta，大文件哈希
-    // 耗时可能超时；增量读 64KB 更新 hasher，不整文件载入内存。
-    eprintln!("  🔎 计算文件级 SHA-256（增量读，大文件较慢）…");
+    // 预备：文件大小 + 分块计划（纯内存计算，快）
     let filesize = std::fs::metadata(send_target)
         .map_err(|e| format!("文件元数据: {e}"))?
         .len();
-    let sha256 = sha256_file(std::path::Path::new(send_target))?;
     let plan = chunked::chunk_plan(filesize, chunked::DEFAULT_CHUNK_SIZE);
     let chunk_size = plan.first().map(|c| c.size).unwrap_or(0);
+    // 文件级 SHA-256 放入后台线程（64KB 增量读）——与候选收集/hello/打洞/accept
+    // 并行。大文件（>20-30GB）哈希可能超过 13s，不能阻塞在 hello 之前：否则接收方
+    // 15s 等 udp-hello 超时降级 v1，迟到的 hello 污染 v1 消息流 → 硬失败。
+    // 哈希失败（文件读错）→ 通道收 Err → 本端发 Abort 降级 relay。
+    eprintln!("  🔎 后台计算文件级 SHA-256（与打洞并行，不阻塞 hello）…");
+    let (hash_tx, hash_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let hash_path = send_target.to_string();
+    std::thread::spawn(move || {
+        let _ = hash_tx.send(sha256_file(std::path::Path::new(&hash_path)));
+    });
 
     // ① 收集候选：
     //    - host：每个本地 IPv4 接口绑一个 socket（ip:0 随机端口），同网段对端免打洞直连
@@ -773,6 +790,8 @@ async fn udp_send_path(
     //    await 驱动握手（带 5s 超时，防恶意连接挂死循环）；握手失败继续轮询。
     //    同时非阻塞监听 wormhole：对方发 Abort（候选全失败）→ 立即降级，不等超时。
     //    20s > 接收方全候选预算（host ≤2s×N + 打洞 3s + 握手 10s），保证 Abort 必达。
+    //    哈希等待预算：13s（< 接收方 15s file-meta 窗口，见下方哈希等待注释）。
+    let hash_deadline = std::time::Instant::now() + Duration::from_secs(13);
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         // 先收打洞线程送来的 srflx endpoint（非阻塞）
@@ -822,11 +841,38 @@ async fn udp_send_path(
                 // 顺序固定：QUIC 建连 → 发 FileMeta → 收 ChunkStatus（清单回执）→
                 // 多流只传缺失块。FileMeta 必须建连后才发——接收方 accept 到连接
                 // 才需要文件信息（wormhole 通道双方一直连着，可随时发）。
+                // Task 4：FileMeta 前先等后台哈希线程结果（哈希与打洞/accept 并行，
+                // 此时通常早已完成；非阻塞轮询防卡 executor）。超时 13s < 接收方 15s
+                // file-meta 窗口——哈希超时则本端先降级 relay，FileMeta 绝不迟到
+                // 污染对方已降级的 v1 消息流。
+                let sha256 = loop {
+                    match hash_rx.try_recv() {
+                        Ok(Ok(s)) => break s,
+                        Ok(Err(e)) => {
+                            // 文件读错：哈希失败即发 Abort 通知接收方立即降级（此时
+                            // 对方大概率仍在等 file-meta，Abort 被当作非 FileMeta 消息
+                            // → 报错 → 降级 relay，消息相位对齐）
+                            eprintln!("  ⚠ 文件级 SHA-256 计算失败: {e}");
+                            let _ = wormhole.send_json(&UdpMsg::Abort).await;
+                            return Err(format!("文件级 SHA-256 计算失败: {e}"));
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return Err("哈希线程异常退出".into());
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if std::time::Instant::now() >= hash_deadline {
+                                eprintln!("  ⚠ 等待文件哈希超时（>13s），降级 relay");
+                                return Err("hash-timeout".into());
+                            }
+                            async_io::Timer::after(Duration::from_millis(50)).await;
+                        }
+                    }
+                };
                 wormhole
                     .send_json(&UdpMsg::FileMeta {
                         name: display_name.to_string(),
                         size: filesize,
-                        sha256: sha256.clone(),
+                        sha256,
                         chunk_size,
                         chunk_count: plan.len() as u32,
                     })
@@ -1607,6 +1653,169 @@ mod tests {
         assert!(part_matches, "partial 文件内容应与原文件一致（块级 SHA-256 + offset 写入）");
         assert!(snd_ok, "发送方进度应累计到总字节: {:?}", snd_progress.lock().unwrap());
         assert!(rcv_ok, "接收方进度应累计到总字节: {:?}", rcv_progress.lock().unwrap());
+    }
+
+    /// 单块文件（3MB < 4MB 块）统一走分块路径：FileMeta/ChunkStatus/1 块完整传输。
+    /// 验证 chunk_count=1 时 chunks 路径与多块路径行为一致（回环 + 文件级校验 +
+    /// finalize rename）。协议顺序与生产一致：QUIC 建连 → 发 FileMeta → 收
+    /// ChunkStatus（空）→ 传唯一一块 → 接收方文件级 SHA-256 校验收尾。
+    #[test]
+    fn quic_single_chunk_file_roundtrip() {
+        let tmp = std::env::temp_dir().join("fan-single-chunk.bin");
+        let data = vec![0x5Au8; 3 * 1024 * 1024];
+        std::fs::write(&tmp, &data).unwrap();
+        let tmp_str = tmp.to_string_lossy().to_string();
+        let sha = sha256_file(&tmp).unwrap();
+        let hash16: String = sha.chars().take(16).collect();
+        let output = std::env::temp_dir().join("fan-single-chunk-out.bin");
+        let _ = std::fs::remove_file(&output);
+        chunked::clear_manifest(&hash16); // 防上次运行残留
+        let file_size = 3 * 1024 * 1024u64;
+
+        let (cert, key, fp) = crate::commands::quic_link::gen_cert_with_fingerprint();
+        let server_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server_sock.set_nonblocking(true).unwrap();
+        let addr = server_sock.local_addr().unwrap();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_sock.set_nonblocking(true).unwrap();
+        let (meta_tx, meta_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (status_tx, status_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let output_str = output.to_string_lossy().to_string();
+
+        let result = async_std::task::block_on(async {
+            let server = crate::commands::quic_link::quic_listen(server_sock, cert, key)
+                .await.expect("server endpoint");
+            // 发送方：FileMeta（chunk_count=1）→ 等 ChunkStatus（空）→ 传唯一一块
+            let srv = futures_lite::future::or(
+                async {
+                    let incoming = server.accept().await.ok_or("server accept 超时")?;
+                    let conn = incoming.await.map_err(|e| format!("incoming handshake: {e}"))?;
+                    let plan = chunked::chunk_plan(file_size, chunked::DEFAULT_CHUNK_SIZE);
+                    assert_eq!(plan.len(), 1, "3MB/4MB 应为 1 块");
+                    let meta = UdpMsg::FileMeta {
+                        name: "fan-single-chunk.bin".into(),
+                        size: file_size,
+                        sha256: sha.clone(),
+                        chunk_size: chunked::DEFAULT_CHUNK_SIZE,
+                        chunk_count: 1,
+                    };
+                    let meta_json = serde_json::to_vec(&meta).map_err(|e| format!("FileMeta 序列化: {e}"))?;
+                    meta_tx.send(meta_json).map_err(|e| format!("meta 转发: {e}"))?;
+                    let status_json = chan_recv(&status_rx).await?;
+                    let status: UdpMsg = serde_json::from_slice(&status_json)
+                        .map_err(|e| format!("ChunkStatus 解析: {e}"))?;
+                    let done: std::collections::BTreeSet<u32> = match status {
+                        UdpMsg::ChunkStatus { done } => done.into_iter().collect(),
+                        _ => return Err("应收到 ChunkStatus".into()),
+                    };
+                    assert!(done.is_empty(), "首次传输应无已收块");
+                    let missing = chunked::missing_chunks(plan.len(), &done);
+                    assert_eq!(missing, vec![0], "单块文件应只缺第 0 块");
+                    let sent = quic_send_chunks(&conn, &tmp_str, &plan, &missing, 2, |_, _| {}).await?;
+                    assert_eq!(sent, 3 * 1024 * 1024, "单块应传完整文件字节数");
+                    conn.close(0u32.into(), b"single done");
+                    let _ = conn.closed().await;
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(30)).await;
+                    Err("server 30s 超时".to_string())
+                },
+            );
+            // 接收方：收 FileMeta → 回 ChunkStatus → 收 1 块 → 文件级校验 + 收尾
+            let cli = futures_lite::future::or(
+                async {
+                    let (ep, conn) = crate::commands::quic_link::quic_connect(
+                        client_sock, addr, fp, Duration::from_secs(10)).await?;
+                    let meta_json = chan_recv(&meta_rx).await?;
+                    let meta: UdpMsg = serde_json::from_slice(&meta_json)
+                        .map_err(|e| format!("FileMeta 解析: {e}"))?;
+                    let (name, size, s, chunk_size, chunk_count) = match meta {
+                        UdpMsg::FileMeta { name, size, sha256, chunk_size, chunk_count } =>
+                            (name, size, sha256, chunk_size, chunk_count),
+                        _ => return Err("应收到 FileMeta".into()),
+                    };
+                    assert_eq!(chunk_count, 1, "单块文件 chunk_count 应为 1");
+                    // 与 quic_recv_resume 相同的自洽校验（Task 4 C1）
+                    let expect_chunks = chunked::chunk_plan(size, chunk_size).len() as u32;
+                    assert_eq!(chunk_count, expect_chunks, "chunk_count 应与分块计划一致");
+                    let hash16: String = s.chars().take(16).collect();
+                    let st = UdpMsg::ChunkStatus { done: Vec::new() };
+                    let st_json = serde_json::to_vec(&st).map_err(|e| format!("ChunkStatus 序列化: {e}"))?;
+                    status_tx.send(st_json).map_err(|e| format!("status 转发: {e}"))?;
+                    let (chunks, bytes) = quic_recv_chunks(&conn, &hash16, &name, size,
+                        chunk_size, chunk_count, &[], |_, _| {}).await?;
+                    assert_eq!(chunks, 1, "应收满 1 块");
+                    assert_eq!(bytes, 3 * 1024 * 1024, "应收完整文件字节数");
+                    let target = finalize_partial(&hash16, &name, &s, &Some(output_str.clone()))?;
+                    assert_eq!(target, output, "应输出到 --output 指定路径");
+                    conn.close(0u32.into(), b"done");
+                    drop(ep);
+                    Ok::<(), String>(())
+                },
+                async {
+                    async_io::Timer::after(Duration::from_secs(30)).await;
+                    Err("client 30s 超时".to_string())
+                },
+            );
+            let (srv_res, cli_res) = futures_lite::future::zip(srv, cli).await;
+            srv_res?;
+            cli_res
+        });
+
+        assert!(result.is_ok(), "单块分块传输应成功: {result:?}");
+        assert_eq!(sha256_file(&output).unwrap(), sha, "单块传输结果应与原文件一致（文件级 SHA-256）");
+        assert!(chunked::load_manifest(&hash16).is_none(), "收尾后清单应清理");
+        assert!(!chunked::partial_path(&hash16).exists(), "收尾后 partial 应移除");
+        // 清理
+        chunked::clear_manifest(&hash16);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&output);
+    }
+
+    /// 后台哈希通道（Task 4 A）：模拟 udp_send_path 的哈希线程启动方式——spawn
+    /// 线程算 SHA-256 经 mpsc 送回，主线程 try_recv 轮询（与 accept 循环内等哈希
+    /// 的写法一致，Empty 分支不阻塞）。断言：结果与同步计算一致、轮询期间主线程
+    /// 不被卡死、失败路径（文件不存在）经通道收到 Err（对应发 Abort 降级分支）。
+    #[test]
+    fn background_hash_thread_channel_roundtrip() {
+        // 中等文件（8MB）：哈希线程与主线程并行，模拟大文件哈希不阻塞 hello 的场景
+        let tmp = std::env::temp_dir().join("fan-bg-hash.bin");
+        let data = vec![0x3Cu8; 8 * 1024 * 1024];
+        std::fs::write(&tmp, &data).unwrap();
+        let expected = sha256_file(&tmp).unwrap();
+
+        let (hash_tx, hash_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let hash_path = tmp.to_string_lossy().to_string();
+        std::thread::spawn(move || {
+            let _ = hash_tx.send(sha256_file(std::path::Path::new(&hash_path)));
+        });
+        // try_recv 轮询（与 udp_send_path 等哈希逻辑同构）：Empty 分支立即重试，
+        // 主线程绝不阻塞；哈希完成后收到正确结果
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let got = loop {
+            match hash_rx.try_recv() {
+                Ok(Ok(s)) => break s,
+                Ok(Err(e)) => panic!("哈希线程不应失败: {e}"),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("哈希线程异常退出"),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    assert!(std::time::Instant::now() < deadline, "等后台哈希超时");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+        assert_eq!(got, expected, "后台哈希结果应与同步计算一致");
+
+        // 失败路径：文件不存在 → 通道收到 Err（udp_send_path 据此发 Abort 降级）
+        let (hash_tx, hash_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let missing = std::env::temp_dir().join("fan-bg-hash-missing.bin");
+        std::thread::spawn(move || {
+            let _ = hash_tx.send(sha256_file(std::path::Path::new(&missing)));
+        });
+        let res = hash_rx.recv_timeout(Duration::from_secs(30)).expect("哈希线程应送回结果");
+        assert!(res.is_err(), "不存在的文件应返回 Err（触发 Abort 降级）");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// FileMeta/ChunkStatus 消息序列化 roundtrip（kebab-case 标签 + 字段重命名）
