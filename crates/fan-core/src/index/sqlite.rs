@@ -28,7 +28,10 @@ impl SqliteStore {
 
     pub fn open_read_only(data_dir: &Path) -> rusqlite::Result<Self> {
         let db_path = data_dir.join("index.db");
-        let uri = format!("file:{}?mode=ro&immutable=1", db_path.to_string_lossy());
+        // Do not use `immutable=1` here. The daemon writes in WAL mode, and an
+        // immutable connection ignores the WAL file, so live readers can miss
+        // both schema changes and freshly indexed rows until a checkpoint.
+        let uri = format!("file:{}?mode=ro", db_path.to_string_lossy());
         let conn = Connection::open_with_flags(
             uri,
             OpenFlags::SQLITE_OPEN_READ_ONLY

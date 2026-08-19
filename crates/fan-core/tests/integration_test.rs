@@ -224,3 +224,29 @@ fn test_sqlite_read_only_connection_rejects_writes() {
     );
     assert!(result.is_err());
 }
+
+#[test]
+fn test_sqlite_read_only_connection_sees_live_wal_data() {
+    use fan_core::index::sqlite::SqliteStore;
+    use fan_core::types::RawFileInfo;
+    use std::path::PathBuf;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let writer = SqliteStore::open(tmp.path()).unwrap();
+    let info = RawFileInfo {
+        path: PathBuf::from("/data/live.fastq"),
+        source_server: "server58".into(),
+        size: 128,
+        mtime_secs: 1715299200,
+        hash_sha256: None,
+        magic_bytes: vec![],
+        mime_type: "text/plain".into(),
+    };
+    writer.upsert(&info, None).unwrap();
+
+    // Keep the writer alive so the committed row remains in the live WAL.
+    let reader = SqliteStore::open_read_only(tmp.path()).unwrap();
+    let entry = reader.get_by_path(&info.path).unwrap().unwrap();
+    assert_eq!(entry.size, 128);
+    assert_eq!(reader.status().unwrap().total_files, 1);
+}
