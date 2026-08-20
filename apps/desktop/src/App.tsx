@@ -6,6 +6,7 @@ import HomePage from "./pages/HomePage";
 import DatasetsPage from "./pages/DatasetsPage";
 import SearchPage from "./pages/SearchPage";
 import SettingsPage from "./pages/SettingsPage";
+import ToastProvider from "./components/Toast";
 import { setApiBase } from "./api";
 import "./App.css";
 
@@ -50,15 +51,17 @@ export default function App() {
   };
 
   return (
-    <div className="app">
-      <Sidebar page={page} onSelect={setPage} />
-      <main className="content">
-        <EngineBanner error={engineError} onRetry={retryEngine} />
-        {page === "home" && <HomePage onGoSettings={() => setPage("settings")} />}
-        {page === "datasets" && <DatasetsPage />}
-        {page === "search" && <SearchPage />}
-        {page === "settings" && <SettingsPage />}
-      </main>
-    </div>
+    <ToastProvider>
+      <div className="app">
+        <Sidebar page={page} onSelect={setPage} />
+        <main className="content">
+          <EngineBanner error={engineError} onRetry={retryEngine} />
+          {page === "home" && <HomePage onGoSettings={() => setPage("settings")} />}
+          {page === "datasets" && <DatasetsPage />}
+          {page === "search" && <SearchPage />}
+          {page === "settings" && <SettingsPage />}
+        </main>
+      </div>
+    </ToastProvider>
   );
 }

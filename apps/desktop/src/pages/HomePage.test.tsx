@@ -116,8 +116,10 @@ describe("HomePage", () => {
     // 模拟扫描完成：done(0) → onDone=refreshStats → setStats 触发重渲染。
     // onDone 身份稳定（useCallback）时 ScanPanel 不重订阅，listen 仍为 3 次；
     // 若 refreshStats 每次渲染都换新函数，重渲染会触发 +3 次重订阅。
+    // SF-T2 起 ScanPanel 完成后还会自拉一次 fetchStats 拼 toast 文案：共 3 次
+    //（1 挂载 + 1 onDone + 1 toast 文案）。
     emit("scan://done", 0);
-    await waitFor(() => expect(mockedApi.fetchStats).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mockedApi.fetchStats).toHaveBeenCalledTimes(3));
     // 再 flush 一轮 act，让重渲染触发的（潜在）被动 effect 重订阅落地后再断言
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0));

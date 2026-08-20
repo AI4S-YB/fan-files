@@ -30,7 +30,11 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
   const refreshStats = useCallback(() => {
     fetchStats()
       .then(setStats)
-      .catch(() => setStats(null));
+      .catch((e) => {
+        // 静默失败：不阻塞界面（保留旧统计为空态），仅打印便于排查
+        console.error("fetchStats failed:", e);
+        setStats(null);
+      });
   }, []);
 
   useEffect(() => {
