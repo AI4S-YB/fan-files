@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SettingsPage from "./SettingsPage";
 
@@ -204,11 +204,14 @@ describe("SettingsPage", () => {
     await waitFor(() => expect(screen.getByDisplayValue("/data/received")).toBeInTheDocument());
   });
 
-  // NR-T4: 从 CC Switch 接管 → read_cc_switch → 填充 endpoint/api_key/model/api_type
-  it("takes over CC Switch config and fills the model form", async () => {
+  // SF-T4: 从 CC Switch 接管——1 个 profile → 直接 read_cc_switch_profile 填充表单，不弹窗
+  it("fills directly from a single CC Switch profile without opening the dialog", async () => {
     vi.mocked(invoke)
       .mockResolvedValueOnce(DEFAULT_CFG)
       .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValueOnce([
+        { name: "haikou-flash", api_type: "anthropic", model: "claude-sonnet-4-8" },
+      ])
       .mockResolvedValueOnce({
         api_type: "anthropic",
         base_url: "http://10.33.105.218:3200",
@@ -217,26 +220,103 @@ describe("SettingsPage", () => {
       });
     render(<SettingsPage />);
     fireEvent.click(await screen.findByRole("button", { name: "从 CC Switch 接管" }));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("read_cc_switch"));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("read_cc_switch_profile", { name: "haikou-flash" })
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Endpoint")).toHaveValue("http://10.33.105.218:3200");
     expect(screen.getByLabelText("API Key")).toHaveValue("sk-cc");
     expect(screen.getByLabelText("模型名称")).toHaveValue("claude-sonnet-4-8");
     expect(screen.getByLabelText("API 类型")).toHaveValue("anthropic");
-    expect(screen.getByText(/已从 CC Switch 接管：Anthropic/)).toBeInTheDocument();
+    expect(screen.getByText(/已从 CC Switch 接管：haikou-flash/)).toBeInTheDocument();
   });
 
-  // NR-T4: 无 CC Switch 配置 → 显示错误提示（read_cc_switch 的 Err 原样展示）
-  it("shows error when CC Switch config is not found", async () => {
+  // SF-T4: 无 profile → 提示"未找到 CC Switch 配置"，不弹窗、不读取
+  it("shows 未找到 CC Switch 配置 when no profiles and does not open the dialog", async () => {
     vi.mocked(invoke)
       .mockResolvedValueOnce(DEFAULT_CFG)
       .mockResolvedValueOnce(TRANSFER_CFG)
-      .mockRejectedValueOnce(new Error("未找到 CC Switch 配置"));
+      .mockResolvedValueOnce([]);
     render(<SettingsPage />);
     fireEvent.click(await screen.findByRole("button", { name: "从 CC Switch 接管" }));
     await waitFor(() =>
       expect(screen.getByText(/未找到 CC Switch 配置/)).toBeInTheDocument()
     );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(invoke).not.toHaveBeenCalledWith("read_cc_switch_profile", expect.anything());
     expect(screen.getByLabelText("Endpoint")).toHaveValue("");
+  });
+
+  // SF-T4: 多个 profile → 弹窗列出（名称 + 协议徽标 + 模型名），选中后填充
+  it("lists multiple profiles in the picker dialog and fills the form on selection", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValueOnce([
+        { name: "haikou-flash", api_type: "anthropic", model: "claude-sonnet-4-8" },
+        { name: "official-pro", api_type: "openai", model: "deepseek-chat" },
+      ])
+      .mockResolvedValueOnce({
+        api_type: "openai",
+        base_url: "https://api.deepseek.com/v1",
+        api_key: "sk-official",
+        model: "deepseek-chat",
+      });
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "从 CC Switch 接管" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("list_cc_switch_profiles"));
+    // 弹窗内两个 profile：名称 + 协议徽标 + 模型名
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("haikou-flash")).toBeInTheDocument();
+    expect(within(dialog).getByText("Anthropic")).toBeInTheDocument();
+    expect(within(dialog).getByText("claude-sonnet-4-8")).toBeInTheDocument();
+    expect(within(dialog).getByText("official-pro")).toBeInTheDocument();
+    expect(within(dialog).getByText("OpenAI")).toBeInTheDocument();
+    expect(within(dialog).getByText("deepseek-chat")).toBeInTheDocument();
+    // 点选 official-pro → read_cc_switch_profile("official-pro") → 表单填充 + 来源提示
+    fireEvent.click(within(dialog).getByRole("button", { name: /official-pro/ }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("read_cc_switch_profile", { name: "official-pro" })
+    );
+    expect(screen.getByLabelText("Endpoint")).toHaveValue("https://api.deepseek.com/v1");
+    expect(screen.getByLabelText("API Key")).toHaveValue("sk-official");
+    expect(screen.getByLabelText("模型名称")).toHaveValue("deepseek-chat");
+    expect(screen.getByLabelText("API 类型")).toHaveValue("openai");
+    expect(screen.getByText(/已从 CC Switch 接管：official-pro/)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  // SF-T4: 弹窗取消 → 不填充表单、不调用读取
+  it("closes the picker without filling the form on cancel", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockResolvedValueOnce([
+        { name: "haikou-flash", api_type: "anthropic", model: "claude-sonnet-4-8" },
+        { name: "official-pro", api_type: "openai", model: "deepseek-chat" },
+      ]);
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "从 CC Switch 接管" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(invoke).not.toHaveBeenCalledWith("read_cc_switch_profile", expect.anything());
+    expect(screen.getByLabelText("Endpoint")).toHaveValue("");
+    expect(screen.queryByText(/已从 CC Switch 接管/)).not.toBeInTheDocument();
+  });
+
+  // SF-T4: list 命令本身失败（如二进制缺失）→ 错误展示，不弹窗
+  it("shows the list error when list_cc_switch_profiles fails", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(DEFAULT_CFG)
+      .mockResolvedValueOnce(TRANSFER_CFG)
+      .mockRejectedValueOnce(new Error("读取 CC Switch 配置失败"));
+    render(<SettingsPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "从 CC Switch 接管" }));
+    await waitFor(() =>
+      expect(screen.getByText(/读取 CC Switch 配置失败/)).toBeInTheDocument()
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   // NR-T4: API 类型下拉切换后保存 → write_config 的 cfg 含 api_type

@@ -42,7 +42,9 @@ pub fn run() {
             commands::receive_dataset,
             commands::cancel_transfer,
             commands::transfer_history,
-            commands::read_cc_switch
+            commands::read_cc_switch,
+            commands::list_cc_switch_profiles,
+            commands::read_cc_switch_profile
         ])
         .setup(|app| {
             use tauri::{

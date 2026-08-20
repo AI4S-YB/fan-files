@@ -214,6 +214,54 @@ pub(crate) fn read_cc_switch() -> Result<serde_json::Value, String> {
     serde_json::from_str(&stdout).map_err(|e| format!("解析 CC Switch 配置失败: {e}"))
 }
 
+/// 内部：spawn 任意 fan-files 二进制的 `config cc-switch <args>` 子命令并解析 stdout JSON。
+/// `exit_failure_is_missing=true`：子进程非 0 退出 → Err("未找到 CC Switch 配置")
+/// （引擎 --profile 未找到时输出 {"error":"not-found"} 且退出码 1）；
+/// false → 忽略退出码只解析 stdout（--list 恒 0 退出，含空数组 []）。
+/// 二进制路径注入参数：测试用假脚本验证 argv/退出码/解析语义，不依赖真实二进制。
+fn run_cc_switch_json(
+    bin: &Path,
+    args: &[&str],
+    exit_failure_is_missing: bool,
+) -> Result<serde_json::Value, String> {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("config").arg("cc-switch");
+    for a in args {
+        cmd.arg(a);
+    }
+    let out = cmd.output().map_err(|e| format!("读取 CC Switch 配置失败: {e}"))?;
+    if exit_failure_is_missing && !out.status.success() {
+        return Err("未找到 CC Switch 配置".into());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).map_err(|e| format!("解析 CC Switch 配置失败: {e}"))
+}
+
+/// 列出 CC Switch 全部 profile 摘要（spawn `fan-files config cc-switch --list`）。
+/// 返回 [{"name","api_type","model"},...]（按目录名排序）；无配置 → 空数组，
+/// 前端据此分流：0 个提示 / 1 个直接接管 / 多个弹窗选择。
+#[tauri::command]
+pub(crate) fn list_cc_switch_profiles() -> Result<Vec<serde_json::Value>, String> {
+    let value = run_cc_switch_json(
+        &crate::engine::sidecar_bin("fan-files"),
+        &["--list"],
+        false,
+    )?;
+    serde_json::from_value(value).map_err(|e| format!("解析 CC Switch 配置失败: {e}"))
+}
+
+/// 读取指定 CC Switch profile 的 LLM 端点（spawn `fan-files config cc-switch --profile <name>`）。
+/// 返回 {"api_type","base_url","api_key","model"}；profile 不存在（引擎退出码 1）→
+/// Err("未找到 CC Switch 配置")。供前端弹窗选中后填充表单。
+#[tauri::command]
+pub(crate) fn read_cc_switch_profile(name: String) -> Result<serde_json::Value, String> {
+    run_cc_switch_json(
+        &crate::engine::sidecar_bin("fan-files"),
+        &["--profile", name.as_str()],
+        true,
+    )
+}
+
 /// share 实际监听端口（可能因冲突回退，前端用它动态设置 API base）。
 #[tauri::command]
 pub(crate) fn get_share_port() -> u16 {
@@ -682,5 +730,115 @@ mod tests {
             anthropic_messages_url("http://x:3200/"),
             "http://x:3200/v1/messages"
         );
+    }
+
+    // ---------- SF-T4: cc-switch profile 列表与按名读取（run_cc_switch_json 层）----------
+    // 不 spawn 真实 fan-files 二进制：临时目录写一个模拟脚本，验证 argv 构造、
+    // 退出码→Err 语义与 JSON 解析。脚本按 $3 分发：--list 恒 0 退出；--profile
+    // 有值 0 退出 / None 时输出 not-found 并退出 1（与引擎 config.rs cc_switch 对齐）。
+
+    #[cfg(unix)]
+    fn write_fake_cc_switch_bin(
+        dir: &std::path::Path,
+        list_json: &str,
+        profile_json: Option<&str>,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fan-files-fake");
+        let profile_branch = match profile_json {
+            Some(j) => format!("printf '%s' '{}'; exit 0", j),
+            None => "printf '%s' '{\"error\":\"not-found\"}'; exit 1".to_string(),
+        };
+        let script = format!(
+            "#!/bin/sh\ncase \"$3\" in\n  --list) printf '%s' '{}'; exit 0 ;;\n  --profile) {} ;;\n  *) exit 1 ;;\nesac\n",
+            list_json, profile_branch
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    fn fake_cc_switch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fan-cc-fake-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// --list：2 个 profile → 解析出 name/api_type/model 数组
+    #[cfg(unix)]
+    #[test]
+    fn list_cc_switch_profiles_parses_summary_array() {
+        let dir = fake_cc_switch_dir("list");
+        let bin = write_fake_cc_switch_bin(
+            &dir,
+            r#"[{"name":"haikou-flash","api_type":"anthropic","model":"claude-sonnet-4-8"},{"name":"official-pro","api_type":"openai","model":"deepseek-chat"}]"#,
+            Some("{}"),
+        );
+        let value = run_cc_switch_json(&bin, &["--list"], false).unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_value(value).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["name"].as_str(), Some("haikou-flash"));
+        assert_eq!(list[0]["api_type"].as_str(), Some("anthropic"));
+        assert_eq!(list[0]["model"].as_str(), Some("claude-sonnet-4-8"));
+        assert_eq!(list[1]["name"].as_str(), Some("official-pro"));
+        assert_eq!(list[1]["api_type"].as_str(), Some("openai"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// --list：0 个 profile → 空数组且 Ok（引擎 --list 恒 0 退出，不做 not-found 判定）
+    #[cfg(unix)]
+    #[test]
+    fn list_cc_switch_profiles_empty_is_ok() {
+        let dir = fake_cc_switch_dir("empty");
+        let bin = write_fake_cc_switch_bin(&dir, "[]", Some("{}"));
+        let value = run_cc_switch_json(&bin, &["--list"], false).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// --profile <name>：解析出完整 LlmEndpoint（api_type/base_url/api_key/model）
+    #[cfg(unix)]
+    #[test]
+    fn read_cc_switch_profile_parses_endpoint() {
+        let dir = fake_cc_switch_dir("profile");
+        let bin = write_fake_cc_switch_bin(
+            &dir,
+            "[]",
+            Some(r#"{"api_type":"openai","base_url":"https://api.deepseek.com/v1","api_key":"sk-x","model":"deepseek-chat"}"#),
+        );
+        let value = run_cc_switch_json(&bin, &["--profile", "official-pro"], true).unwrap();
+        assert_eq!(value["api_type"].as_str(), Some("openai"));
+        assert_eq!(value["base_url"].as_str(), Some("https://api.deepseek.com/v1"));
+        assert_eq!(value["api_key"].as_str(), Some("sk-x"));
+        assert_eq!(value["model"].as_str(), Some("deepseek-chat"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// --profile <name> 不存在（退出码 1）→ Err("未找到 CC Switch 配置")
+    #[cfg(unix)]
+    #[test]
+    fn read_cc_switch_profile_missing_is_err() {
+        let dir = fake_cc_switch_dir("missing");
+        let bin = write_fake_cc_switch_bin(&dir, "[]", None);
+        let err = run_cc_switch_json(&bin, &["--profile", "nope"], true).unwrap_err();
+        assert_eq!(err, "未找到 CC Switch 配置");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// --profile 0 退出但 stdout 非 JSON → 解析错误（不误报 not-found）
+    #[cfg(unix)]
+    #[test]
+    fn read_cc_switch_profile_bad_json_is_parse_err() {
+        let dir = fake_cc_switch_dir("badjson");
+        let bin = write_fake_cc_switch_bin(&dir, "[]", Some("not json"));
+        let err = run_cc_switch_json(&bin, &["--profile", "x"], true).unwrap_err();
+        assert!(err.starts_with("解析 CC Switch 配置失败"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

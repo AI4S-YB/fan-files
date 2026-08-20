@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import ProfilePicker from "../components/ProfilePicker";
+import type { CcProfile } from "../components/ProfilePicker";
 
 // 与后端 T5 read_config 命令返回的形状一致（见 src-tauri FanConfig）。
 // threads 不进 UI，但必须保留在接口以透传保存（否则 GUI 保存会把文件的 threads 键删掉）。
@@ -56,10 +58,13 @@ export default function SettingsPage() {
   const [testError, setTestError] = useState<string | null>(null);
   const [testRunning, setTestRunning] = useState(false);
   const [updateText, setUpdateText] = useState<string | null>(null);
-  // CC Switch 接管（read_cc_switch → 填充模型配置表单）
+  // CC Switch 接管（list_cc_switch_profiles → 0 个提示 / 1 个直接填充 / 多个弹窗选择）
   const [ccRunning, setCcRunning] = useState(false);
   const [ccSource, setCcSource] = useState<string | null>(null);
   const [ccError, setCcError] = useState<string | null>(null);
+  // SF-T4: 多 profile 选择弹窗（列表来自 list_cc_switch_profiles，选中后 read_cc_switch_profile）
+  const [pickerProfiles, setPickerProfiles] = useState<CcProfile[]>([]);
+  const [pickerOpen, setPickerOpen] = useState(false);
   // 传输参数（[transfer] 段，独立加载/保存）
   const [transfer, setTransfer] = useState<TransferCfg>(DEFAULT_TRANSFER);
   const [transferSaved, setTransferSaved] = useState(false);
@@ -152,14 +157,38 @@ export default function SettingsPage() {
     }
   };
 
-  // NR-T4: 从 CC Switch 接管——读取当前激活 profile 的 LLM 端点并填充表单
-  // （api_type/endpoint/api_key/model 一并带入；来源提示显示协议类型）
+  // SF-T4: 从 CC Switch 接管——先列 profile 再分流：
+  // 0 个 → 提示"未找到 CC Switch 配置"；1 个 → 直接读取填充；
+  // 多个 → 弹窗（ProfilePicker）列出名称+协议徽标+模型，选中后读取填充。
   const takeoverCcSwitch = async () => {
     setCcRunning(true);
     setCcError(null);
     setCcSource(null);
     try {
-      const ep = await invoke<CcEndpoint>("read_cc_switch");
+      const profiles = await invoke<CcProfile[]>("list_cc_switch_profiles");
+      if (profiles.length === 0) {
+        setCcError("未找到 CC Switch 配置");
+      } else if (profiles.length === 1) {
+        await applyCcProfile(profiles[0].name);
+      } else {
+        setPickerProfiles(profiles);
+        setPickerOpen(true);
+      }
+    } catch (e) {
+      setCcError(String(e));
+    } finally {
+      setCcRunning(false);
+    }
+  };
+
+  // 读取指定 profile 的 LLM 端点并填充表单（1 个直接走 / 弹窗选中后共用），
+  // api_type/endpoint/api_key/model 一并带入；来源提示显示 profile 名。
+  const applyCcProfile = async (name: string) => {
+    setPickerOpen(false);
+    setCcRunning(true);
+    setCcError(null);
+    try {
+      const ep = await invoke<CcEndpoint>("read_cc_switch_profile", { name });
       setCfg((c) => ({
         ...c,
         endpoint: ep.base_url,
@@ -169,7 +198,7 @@ export default function SettingsPage() {
       }));
       setSaved(false);
       setError(null);
-      setCcSource(ep.api_type === "anthropic" ? "Anthropic" : "OpenAI 兼容");
+      setCcSource(name);
     } catch (e) {
       setCcError(String(e));
     } finally {
@@ -338,6 +367,16 @@ export default function SettingsPage() {
           )}
           {ccError && <span className="feedback-err">{ccError}</span>}
         </div>
+        {/* SF-T4: 多个 profile 时的选择弹窗（取消不填充） */}
+        {pickerOpen && (
+          <ProfilePicker
+            profiles={pickerProfiles}
+            onSelect={(name) => {
+              void applyCcProfile(name);
+            }}
+            onClose={() => setPickerOpen(false)}
+          />
+        )}
         <label className="field" htmlFor="api-type">
           <span>API 类型</span>
           <select
