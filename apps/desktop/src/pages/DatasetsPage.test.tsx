@@ -622,4 +622,29 @@ describe("DatasetsPage", () => {
       })
     );
   });
+
+  // SF-T3: 扫描完成（App 广播 fan-scan-done 全局事件）→ 列表回第一页重新加载，
+  // 且分页历史栈清空（扫描入库的新数据集立即可见）
+  it("reloads the first page when a scan completes (fan-scan-done)", async () => {
+    render(<DatasetsPage />);
+    await screen.findByText("Oryza_sativa_v1");
+    expect(mockedApi.fetchDatasets).toHaveBeenCalledTimes(1);
+    // 先翻到第二页（推进历史栈），再触发扫描完成 → 应回第一页
+    mockedApi.fetchDatasets.mockResolvedValueOnce({
+      data: [{ ...summary1, id: 51, name: "Second_page_dataset" }],
+      meta: { limit: 50, next_cursor: null, has_more: false },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    await screen.findByText("Second_page_dataset");
+    fireEvent(window, new CustomEvent("fan-scan-done"));
+    await waitFor(() => expect(mockedApi.fetchDatasets).toHaveBeenCalledTimes(3));
+    // 重置回第一页：cursor undefined，历史栈清空（上一页禁用）
+    expect(mockedApi.fetchDatasets).toHaveBeenLastCalledWith({
+      cursor: undefined,
+      limit: 50,
+      type: undefined,
+    });
+    expect(await screen.findByText("Oryza_sativa_v1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "上一页" })).toBeDisabled();
+  });
 });

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Sidebar, Page } from "./components/Sidebar";
 import EngineBanner from "./components/EngineBanner";
 import HomePage from "./pages/HomePage";
@@ -35,6 +36,19 @@ export default function App() {
     return () => {
       cancelled = true;
       clearInterval(timer);
+    };
+  }, []);
+
+  // SF-T3: 扫描完成（scan://done payload=0）→ 广播 fan-scan-done 全局事件。
+  // 广播放 App 层：页面级订阅会随页面切换卸载（ScanPanel 在首页，扫描完成时
+  // 用户可能已切到数据集/搜索页），App 常驻最稳。ScanPanel 自己的监听不受影响
+  //（toast + 首页统计刷新照旧，两条独立订阅）。
+  useEffect(() => {
+    const un = listen<number>("scan://done", (e) => {
+      if (e.payload === 0) window.dispatchEvent(new CustomEvent("fan-scan-done"));
+    });
+    return () => {
+      un.then((u) => u());
     };
   }, []);
 

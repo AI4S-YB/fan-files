@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import App from "./App";
 import * as api from "./api";
@@ -11,10 +11,24 @@ vi.mock("./api", async (importOriginal) => {
 });
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 // T17：App 挂载 HomePage → ScanPanel 订阅 scan:// 事件，jsdom 无 Tauri IPC，
-// 必须 mock 掉。
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(() => Promise.resolve(() => {})),
-}));
+// 必须 mock 掉。SF-T3：捕获监听器以便测试注入 scan://done 断言 fan-scan-done 广播。
+const eventMock = vi.hoisted(() => {
+  const listeners = new Map<string, ((e: { payload: unknown }) => void)[]>();
+  return {
+    listeners,
+    listen: (event: string, cb: (e: { payload: unknown }) => void) => {
+      const arr = listeners.get(event) ?? [];
+      arr.push(cb);
+      listeners.set(event, arr);
+      return Promise.resolve(() => undefined);
+    },
+    emit: (event: string, payload: unknown) => {
+      for (const cb of listeners.get(event) ?? []) cb({ payload });
+    },
+    clear: () => listeners.clear(),
+  };
+});
+vi.mock("@tauri-apps/api/event", () => ({ listen: eventMock.listen }));
 
 import { invoke } from "@tauri-apps/api/core";
 
@@ -48,6 +62,7 @@ function mockInvoke(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  eventMock.clear();
   mockInvoke();
   vi.mocked(api.fetchStats).mockResolvedValue(null as never);
 });
@@ -87,6 +102,24 @@ describe("App shell", () => {
     expect(
       await screen.findByRole("button", { name: "保存配置" })
     ).toBeInTheDocument();
+  });
+
+  // SF-T3: App 级 scan://done 监听 → 广播 fan-scan-done 全局事件（页面联动刷新）。
+  // 只广播成功（payload=0）；失败退出码不广播。
+  it("broadcasts fan-scan-done when scan://done succeeds (payload 0)", async () => {
+    let heard = 0;
+    const onScan = () => heard++;
+    window.addEventListener("fan-scan-done", onScan);
+    try {
+      render(<App />);
+      await screen.findByText("🔄 重新扫描");
+      act(() => eventMock.emit("scan://done", 0));
+      expect(heard).toBe(1);
+      act(() => eventMock.emit("scan://done", 1));
+      expect(heard).toBe(1);
+    } finally {
+      window.removeEventListener("fan-scan-done", onScan);
+    }
   });
 });
 

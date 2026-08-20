@@ -121,10 +121,22 @@ function toParams(q: DatasetQuery): string {
   return params.toString();
 }
 
+// HTTP 非 2xx 时抛出，带 status 供调用方区分：
+// - 带 status 的 ApiError → 引擎在线但返回错误（chat-search 503 = LLM 未配置/失败）
+// - fetch 网络错误（引擎未启动/连接拒绝）→ 原生 TypeError，无 status
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super(`HTTP ${status}`);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 // Envelope 包装：{ data: T }
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(`${base}${path}`);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (!r.ok) throw new ApiError(r.status);
   const body = await r.json();
   return body.data as T;
 }
@@ -132,7 +144,7 @@ async function get<T>(path: string): Promise<T> {
 // 分页 Envelope：{ data: T[], meta: PageMeta }
 async function getPage<T>(path: string): Promise<PageEnvelope<T>> {
   const r = await fetch(`${base}${path}`);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (!r.ok) throw new ApiError(r.status);
   return (await r.json()) as PageEnvelope<T>;
 }
 
@@ -143,7 +155,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (!r.ok) throw new ApiError(r.status);
   const data = await r.json();
   return data.data as T;
 }

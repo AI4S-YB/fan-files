@@ -272,6 +272,17 @@ export default function DatasetsPage() {
     void load(undefined, type, submittedQ, sort);
   }, [type, submittedQ, sort]);
 
+  // SF-T3: 扫描完成（App 广播 fan-scan-done）→ 清历史栈回第一页重新加载，
+  // 新扫描入库的数据集立即可见。依赖筛选状态以复用最新查询条件。
+  useEffect(() => {
+    const onScanDone = () => {
+      setHistory([]);
+      void load(undefined, type, submittedQ, sort);
+    };
+    window.addEventListener("fan-scan-done", onScanDone);
+    return () => window.removeEventListener("fan-scan-done", onScanDone);
+  }, [type, submittedQ, sort]);
+
   // 提交搜索：空白词视作"无过滤"（q 省略）；与已提交词相同则跳过重复请求
   function submitSearch() {
     const next = q.trim() || undefined;

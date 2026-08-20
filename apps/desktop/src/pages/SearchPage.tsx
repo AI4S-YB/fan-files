@@ -45,6 +45,8 @@ export default function SearchPage() {
   // rows === null 表示"尚未搜索"；[] 表示"搜索过但没有结果"
   const [rows, setRows] = useState<DatasetSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // SF-T3: 扫描完成（fan-scan-done）→ 旧结果可能过期，清空并提示重新搜索
+  const [scanUpdated, setScanUpdated] = useState(false);
   // 请求序号（last-write-wins）：连发两次搜索时，旧响应返回后不覆盖新结果
   const seq = useRef(0);
   // NR-T5: 共享有效期（小时），默认 168 = 引擎默认 7 天；弹层选择后随共享传递
@@ -81,11 +83,26 @@ export default function SearchPage() {
     };
   }, []);
 
+  // SF-T3: 扫描完成（App 广播 fan-scan-done）→ 清空结果与对话（结果可能过期），
+  // 提示用户重新搜索/提问
+  useEffect(() => {
+    const onScanDone = () => {
+      setRows(null);
+      setError(null);
+      setTurns([]);
+      setChatError(null);
+      setScanUpdated(true);
+    };
+    window.addEventListener("fan-scan-done", onScanDone);
+    return () => window.removeEventListener("fan-scan-done", onScanDone);
+  }, []);
+
   // 基础搜索（无模型 / 降级后可用）
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     // 客户端校验：q 为空不发起请求（后端空 q 会 400）
     if (!q.trim()) return;
+    setScanUpdated(false);
     const id = ++seq.current;
     try {
       const result = await searchDatasets(q.trim());
@@ -99,12 +116,14 @@ export default function SearchPage() {
     }
   }
 
-  // 对话提问：LLM 生成查询 → 结果；LLM 失败（503/网络错）→ 降级基础搜索 + 提示。
+  // 对话提问：LLM 生成查询 → 结果；LLM 层失败（HTTP 错误，如 503）→ 降级基础搜索 + 提示；
+  // 引擎不可达（fetch 网络错误，无 status）→ 直接报错，不做无意义的降级。
   // 多轮：历史消息（turns）随 messages 传递，当前问题走 question 参数。
   async function ask(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const question = chatInput.trim();
     if (!question || chatPending) return;
+    setScanUpdated(false);
     setTurns((t) => [...t, { role: "user", content: question }]);
     setChatInput("");
     setChatPending(true);
@@ -121,15 +140,21 @@ export default function SearchPage() {
           results: resp.results,
         },
       ]);
-    } catch {
-      // LLM 失败 → 降级基础搜索（本机搜索仍可用）；降级提示随该回合展示
-      try {
-        const results = await searchDatasets(question);
-        setTurns((t) => [
-          ...t,
-          { role: "assistant", content: `找到 ${results.length} 个数据集`, results, fallback: true },
-        ]);
-      } catch {
+    } catch (err) {
+      // SF-T3 修复: 用 error.status 区分"引擎返回的 HTTP 错误"（LLM 层失败 → 降级）
+      // 与"引擎不可达"（fetch 网络错误是原生 TypeError，无 status → 直接报错）
+      if (typeof (err as { status?: unknown } | null)?.status === "number") {
+        // LLM 失败 → 降级基础搜索（本机搜索仍可用）；降级提示随该回合展示
+        try {
+          const results = await searchDatasets(question);
+          setTurns((t) => [
+            ...t,
+            { role: "assistant", content: `找到 ${results.length} 个数据集`, results, fallback: true },
+          ]);
+        } catch {
+          setChatError("搜索失败，请检查引擎状态");
+        }
+      } else {
         setChatError("搜索失败，请检查引擎状态");
       }
     } finally {
@@ -158,6 +183,7 @@ export default function SearchPage() {
       {llmConfigured ? (
         /* NR-T5: 对话模式（有模型）：消息气泡列表 + 输入框，可多轮追问 */
         <>
+          {scanUpdated && <div className="search-hint">数据已更新，请重新搜索</div>}
           <div className="chat-list">
             {turns.length === 0 && (
               <div className="empty">
@@ -221,6 +247,7 @@ export default function SearchPage() {
             />
             <button type="submit" className="primary">搜索</button>
           </form>
+          {scanUpdated && <div className="search-hint">数据已更新，请重新搜索</div>}
           {error && <div className="search-error">{error}</div>}
           {rows === null ? (
             <div className="empty">输入关键词或自然语言描述，搜索你的数据集</div>

@@ -254,7 +254,8 @@ describe("SearchPage", () => {
 
   it("falls back to basic search with a hint when the llm call fails", async () => {
     vi.mocked(invoke).mockResolvedValue(llmCfg);
-    mockedApi.chatSearch.mockRejectedValue(new Error("HTTP 503"));
+    // SF-T3 契约：HTTP 错误经 api.ts 抛出时带 status（ApiError）——503 = LLM 层失败 → 降级
+    mockedApi.chatSearch.mockRejectedValue(Object.assign(new Error("HTTP 503"), { status: 503 }));
     mockedApi.searchDatasets.mockResolvedValue([result1]);
     render(<SearchPage />);
     const input = await screen.findByPlaceholderText(/用自然语言描述/);
@@ -263,5 +264,64 @@ describe("SearchPage", () => {
     expect(await screen.findByText(/模型调用失败，已切换基础搜索/)).toBeInTheDocument();
     expect(mockedApi.searchDatasets).toHaveBeenCalledWith("水稻");
     expect(screen.getByText("Oryza_sativa_v1")).toBeInTheDocument();
+  });
+
+  // SF-T3: 引擎未启动/连接拒绝（fetch 网络错误，无 status）→ 直接报错，
+  // 不做无意义的降级搜索（引擎都不可达，基础搜索必然同样失败）
+  it("shows engine error without falling back when chatSearch fails with a network error", async () => {
+    vi.mocked(invoke).mockResolvedValue(llmCfg);
+    mockedApi.chatSearch.mockRejectedValue(new TypeError("Failed to fetch"));
+    render(<SearchPage />);
+    const input = await screen.findByPlaceholderText(/用自然语言描述/);
+    fireEvent.change(input, { target: { value: "水稻" } });
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    expect(await screen.findByText(/搜索失败，请检查引擎状态/)).toBeInTheDocument();
+    expect(mockedApi.searchDatasets).not.toHaveBeenCalled();
+    expect(screen.queryByText(/模型调用失败/)).not.toBeInTheDocument();
+  });
+
+  // SF-T3: 扫描完成（App 广播 fan-scan-done）→ 旧结果可能过期：清空结果 + 提示重新搜索；
+  // 重新搜索后提示消失
+  it("clears results and shows a refresh hint when a scan completes", async () => {
+    mockedApi.searchDatasets.mockResolvedValue([result1]);
+    render(<SearchPage />);
+    fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "水稻" } });
+    fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent(window, new CustomEvent("fan-scan-done"));
+    expect(await screen.findByText(/数据已更新，请重新搜索/)).toBeInTheDocument();
+    // 结果清空 → 回到"尚未搜索"空态
+    expect(screen.queryByText("Oryza_sativa_v1")).not.toBeInTheDocument();
+    expect(screen.getByText(/输入关键词或自然语言描述/)).toBeInTheDocument();
+    // 重新搜索后提示消失
+    fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "水稻" } });
+    fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
+    await screen.findByText("Oryza_sativa_v1");
+    expect(screen.queryByText(/数据已更新，请重新搜索/)).not.toBeInTheDocument();
+  });
+
+  // SF-T3: 对话模式同样响应扫描完成——清空对话（结果可能过期），提示重新提问
+  it("clears the conversation when a scan completes in chat mode", async () => {
+    vi.mocked(invoke).mockResolvedValue(llmCfg);
+    mockedApi.chatSearch.mockResolvedValue({
+      query: { keywords: ["水稻", "基因组"], type: "genome" },
+      results: [result1],
+    });
+    render(<SearchPage />);
+    const input = await screen.findByPlaceholderText(/用自然语言描述/);
+    fireEvent.change(input, { target: { value: "帮我找水稻基因组" } });
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await screen.findByText("Oryza_sativa_v1");
+    fireEvent(window, new CustomEvent("fan-scan-done"));
+    expect(await screen.findByText(/数据已更新，请重新搜索/)).toBeInTheDocument();
+    expect(screen.queryByText("Oryza_sativa_v1")).not.toBeInTheDocument();
+    expect(screen.queryByText("帮我找水稻基因组")).not.toBeInTheDocument();
+    // 重新提问后提示消失（历史已清空，首轮不带上下文）
+    fireEvent.change(input, { target: { value: "再找转录组" } });
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() =>
+      expect(mockedApi.chatSearch).toHaveBeenLastCalledWith([], "再找转录组")
+    );
+    await waitFor(() => expect(screen.queryByText(/数据已更新/)).not.toBeInTheDocument());
   });
 });
