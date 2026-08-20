@@ -122,9 +122,16 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Output the active CC Switch profile's LLM endpoint as JSON
+    /// Output CC Switch LLM endpoint as JSON (active profile; --list all profiles; --profile <name> select)
     /// ({"api_type","base_url","api_key","model"}; none found → {"error":"not-found"} + exit 1)
-    CcSwitch,
+    CcSwitch {
+        /// List all profiles as JSON array [{"name","api_type","model"},...]
+        #[arg(long)]
+        list: bool,
+        /// Read a specific profile by name
+        #[arg(long)]
+        profile: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -312,7 +319,7 @@ fn main() {
             ServersAction::Watch { name } => commands::servers::watch_remote(&name),
         },
         Commands::Config(action) => match action {
-            ConfigAction::CcSwitch => commands::config::cc_switch(),
+            ConfigAction::CcSwitch { list, profile } => commands::config::cc_switch(list, profile),
         },
     }
 }

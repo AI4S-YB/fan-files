@@ -12,11 +12,81 @@ pub struct LlmEndpoint {
     pub model: String,
 }
 
+/// profile 摘要（列表用）
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProfileInfo {
+    pub name: String,
+    pub api_type: String,   // "openai" | "anthropic"；无匹配协议 → 空串
+    pub model: String,      // env 模型或顶层 model，无则空
+}
+
 /// 读取 CC Switch 当前激活 profile 的 API 配置。
 /// 目录：默认 ~/.cc-switch；FAN_CC_SWITCH_DIR 环境变量可覆盖（测试用）。
 /// 返回 None = 未找到/格式变化（调用方报"未找到 CC Switch 配置"）。
 pub fn cc_switch_endpoint() -> Option<LlmEndpoint> {
-    parse_cc_switch_dir(&cc_switch_dir())
+    // state.json → 当前激活 profile（还可能有 lastSyncedAt 等字段，忽略）→ 按名读取
+    let state: serde_json::Value = read_json(&cc_switch_dir().join("state.json"))?;
+    let profile = state.get("activeProfile")?.as_str()?;
+    cc_switch_endpoint_for(profile)
+}
+
+/// 指定 profile 的完整端点（name 不存在 / 无有效配置 → None）。
+/// 协议识别逻辑与默认读取相同（anthropic env 优先 → openai → 顶层兜底）。
+pub fn cc_switch_endpoint_for(name: &str) -> Option<LlmEndpoint> {
+    let settings =
+        read_json(&cc_switch_dir().join("profiles").join(name).join("settings.json"))?;
+    parse_profile_settings(&settings)
+}
+
+/// 遍历 profiles/ 目录，返回全部 profile 摘要（按目录名排序）。
+/// settings.json 无法读取 / 不是 JSON 对象的目录跳过。
+pub fn cc_switch_profiles() -> Vec<ProfileInfo> {
+    let profiles_dir = cc_switch_dir().join("profiles");
+    let Ok(entries) = std::fs::read_dir(&profiles_dir) else { return Vec::new(); };
+
+    // 收集目录名（忽略非目录项 / 非 UTF-8 名称），排序保证输出稳定
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(settings) = read_json(&profiles_dir.join(&name).join("settings.json")) else { continue };
+        let (api_type, model) = profile_summary(&settings);
+        out.push(ProfileInfo { name, api_type, model });
+    }
+    out
+}
+
+/// 从单个 profile 的 settings 提取 api_type 与 model（列表摘要用）。
+/// 协议判定与 parse_profile_settings 一致；不满足任何协议 → api_type 空串（profile 仍列出）。
+fn profile_summary(settings: &serde_json::Value) -> (String, String) {
+    let env = settings.get("env").cloned().unwrap_or(serde_json::Value::Null);
+    let env_str = |k: &str| env.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    // model：env 模型（anthropic/openai 任一）优先，其次顶层 model，无则空
+    let model = env_str("ANTHROPIC_MODEL")
+        .or_else(|| env_str("OPENAI_MODEL"))
+        .filter(|m| !m.is_empty())
+        .or_else(|| settings.get("model").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_default();
+
+    let api_type = if env_str("ANTHROPIC_BASE_URL").is_some()
+        && env_str("ANTHROPIC_AUTH_TOKEN").is_some()
+    {
+        "anthropic"
+    } else if env_str("OPENAI_API_KEY").is_some() {
+        "openai"
+    } else if settings.get("baseURL").and_then(|v| v.as_str()).is_some()
+        && settings.get("apiKey").and_then(|v| v.as_str()).is_some()
+    {
+        "openai"
+    } else {
+        ""
+    };
+    (api_type.into(), model)
 }
 
 /// 从指定目录读取 CC Switch 配置（独立于环境变量，便于测试复用）
@@ -28,6 +98,12 @@ fn parse_cc_switch_dir(dir: &Path) -> Option<LlmEndpoint> {
     // 2. profiles/<profile>/settings.json → 顶层 env 对象（也可能有顶层 model）
     let settings: serde_json::Value =
         read_json(&dir.join("profiles").join(profile).join("settings.json"))?;
+    parse_profile_settings(&settings)
+}
+
+/// 从单个 profile 的 settings.json 解析出完整端点（共享协议识别，供默认/指定读取复用）。
+/// 识别顺序：anthropic env（BASE_URL + AUTH_TOKEN）→ openai env → 顶层 baseURL/apiKey 兜底
+fn parse_profile_settings(settings: &serde_json::Value) -> Option<LlmEndpoint> {
     let env = settings.get("env").cloned().unwrap_or(serde_json::Value::Null);
     let top_model = settings.get("model").and_then(|m| m.as_str()).map(str::to_string);
     let env_str = |k: &str| env.get(k).and_then(|v| v.as_str()).map(str::to_string);
@@ -104,6 +180,9 @@ fn cc_switch_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 环境变量在并行测试间是共享的：所有读写 FAN_CC_SWITCH_DIR 的测试串行执行
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn write(dir: &Path, rel: &str, content: &str) {
         let p = dir.join(rel);
@@ -254,6 +333,7 @@ mod tests {
     /// FAN_CC_SWITCH_DIR 环境变量覆盖默认目录（默认路径逻辑）
     #[test]
     fn env_var_overrides_default_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "state.json", r#"{"activeProfile":"p"}"#);
         write(dir.path(), "profiles/p/settings.json", r#"{
@@ -268,6 +348,88 @@ mod tests {
         unsafe {
             std::env::remove_var("FAN_CC_SWITCH_DIR");
         }
+    }
+
+    /// 遍历 profiles/ 目录：按目录名排序，返回全部 profile 摘要（api_type/model 正确）
+    #[test]
+    fn list_profiles_enumerates_all() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // 真实环境形态：两个 anthropic profile（中转 haikou-flash + 直连 official-pro）
+        write(dir.path(), "state.json", r#"{"activeProfile":"haikou-flash"}"#);
+        write(dir.path(), "profiles/haikou-flash/settings.json", r#"{
+            "model": "claude-sonnet-4-8",
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "sk-a",
+                "ANTHROPIC_BASE_URL": "http://10.33.105.218:3200",
+                "ANTHROPIC_MODEL": "claude-sonnet-4-8"
+            }
+        }"#);
+        write(dir.path(), "profiles/official-pro/settings.json", r#"{
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "sk-b",
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_MODEL": "deepseek-v3"
+            }
+        }"#);
+        unsafe { std::env::set_var("FAN_CC_SWITCH_DIR", dir.path()); }
+
+        let list = cc_switch_profiles();
+        assert_eq!(list.len(), 2, "应枚举出 2 个 profile");
+        assert_eq!(list[0].name, "haikou-flash");
+        assert_eq!(list[0].api_type, "anthropic");
+        assert_eq!(list[0].model, "claude-sonnet-4-8");
+        assert_eq!(list[1].name, "official-pro");
+        assert_eq!(list[1].api_type, "anthropic");
+        assert_eq!(list[1].model, "deepseek-v3");
+        unsafe { std::env::remove_var("FAN_CC_SWITCH_DIR"); }
+    }
+
+    /// 指定 profile 读取：cc_switch_endpoint_for(name) → 该 profile 端点；不存在 → None
+    #[test]
+    fn endpoint_for_named_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "profiles/official-pro/settings.json", r#"{
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "sk-b",
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_MODEL": "deepseek-v3"
+            }
+        }"#);
+        unsafe { std::env::set_var("FAN_CC_SWITCH_DIR", dir.path()); }
+
+        let ep = cc_switch_endpoint_for("official-pro").expect("应读到 official-pro 端点");
+        assert_eq!(ep.api_type, "anthropic");
+        assert_eq!(ep.base_url, "https://api.deepseek.com/anthropic");
+        assert_eq!(ep.api_key, "sk-b");
+        assert_eq!(ep.model, "deepseek-v3");
+        // 不存在的 profile → None
+        assert!(cc_switch_endpoint_for("nonexistent").is_none());
+        unsafe { std::env::remove_var("FAN_CC_SWITCH_DIR"); }
+    }
+
+    /// 默认读取 = 激活 profile：cc_switch_endpoint() == cc_switch_endpoint_for(activeProfile)
+    #[test]
+    fn endpoint_defaults_to_active() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "state.json", r#"{"activeProfile":"haikou-flash"}"#);
+        write(dir.path(), "profiles/haikou-flash/settings.json", r#"{
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "sk-a",
+                "ANTHROPIC_BASE_URL": "http://10.33.105.218:3200",
+                "ANTHROPIC_MODEL": "claude-sonnet-4-8"
+            }
+        }"#);
+        unsafe { std::env::set_var("FAN_CC_SWITCH_DIR", dir.path()); }
+
+        assert_eq!(
+            cc_switch_endpoint(),
+            cc_switch_endpoint_for("haikou-flash"),
+            "默认端点应等于 activeProfile 指定读取"
+        );
+        unsafe { std::env::remove_var("FAN_CC_SWITCH_DIR"); }
     }
 }
 
