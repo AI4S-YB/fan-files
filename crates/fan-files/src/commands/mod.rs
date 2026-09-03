@@ -1,3 +1,5 @@
+pub mod chunked;
+pub mod config;
 pub mod daemon;
 pub mod datasets;
 pub mod discover;
@@ -16,3 +18,6 @@ pub mod update;
 pub mod correct;
 pub mod rebuild_index;
 pub mod snapshot;
+pub mod transfer;
+pub mod udp_punch;
+pub mod quic_link;

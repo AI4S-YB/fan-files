@@ -20,3 +20,10 @@ deleted_keep_days = 30
 
 [schedule]
 full_sync = "03:00"
+
+# P2P 传输（transfer send / get）参数；CLI 参数（--chunk-size/--concurrency）优先于此处
+[transfer]
+chunk_size_mb = 4      # 分块大小（MB）
+concurrency = 4        # 并发传输数
+# receive_dir = "/data/inbox"  # 接收目录（缺省 = 当前目录）
+udp_enabled = true     # 是否启用 UDP 打洞直连（false 等价 FAN_NO_UDP=1）

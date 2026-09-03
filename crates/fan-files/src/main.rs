@@ -103,12 +103,35 @@ enum Commands {
         /// Re-infer only (skip scan, re-run Phase C with current rules)
         #[arg(long)]
         re_infer: bool,
+        /// Scan only local [scan].include dirs, ignore remote [servers.*]
+        #[arg(long)]
+        local_only: bool,
     },
     /// Interactive setup wizard
     Init,
+    /// P2P data transfer (magic-wormhole): send / get / log
+    #[command(subcommand)]
+    Transfer(TransferAction),
     /// Manage registered servers
     #[command(subcommand)]
     Servers(ServersAction),
+    /// Configuration queries (JSON output for GUI)
+    #[command(subcommand)]
+    Config(ConfigAction),
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Output CC Switch LLM endpoint as JSON (active profile; --list all profiles; --profile <name> select)
+    /// ({"api_type","base_url","api_key","model"}; none found → {"error":"not-found"} + exit 1)
+    CcSwitch {
+        /// List all profiles as JSON array [{"name","api_type","model"},...]
+        #[arg(long)]
+        list: bool,
+        /// Read a specific profile by name
+        #[arg(long)]
+        profile: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -168,8 +191,51 @@ enum ServersAction {
     },
 }
 
+#[derive(Subcommand)]
+enum TransferAction {
+    /// 数据方：分享一个 dataset 或目录，输出一次性配对码
+    Send {
+        /// dataset 名称（来自索引）或本地路径
+        dataset: String,
+        /// 配对码有效期（小时，默认 7 天 = 168）
+        #[arg(long, default_value_t = commands::transfer::DEFAULT_TTL_HOURS)]
+        ttl_hours: u64,
+        /// 块大小（字节，默认 config [transfer].chunk_size_mb × 1MB）
+        #[arg(long)]
+        chunk_size: Option<u64>,
+        /// 并发传输数（默认 config [transfer].concurrency）
+        #[arg(long)]
+        concurrency: Option<usize>,
+    },
+    /// 请求方：凭配对码接收数据
+    Get {
+        /// 配对码（如 8-purple-hammer）
+        code: String,
+        /// 输出路径（默认当前目录 + 原文件名，或 [transfer].receive_dir）
+        #[arg(long)]
+        output: Option<String>,
+        /// 块大小（字节；接收方由发送方 FileMeta 决定，仅记录）
+        #[arg(long)]
+        chunk_size: Option<u64>,
+        /// 并发接收数（默认 config [transfer].concurrency）
+        #[arg(long)]
+        concurrency: Option<usize>,
+    },
+    /// 查看审计日志
+    Log {
+        /// 输出 JSON（GUI 用）
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn main() {
-    tracing_subscriber::fmt::init();
+    // FAN_JSON_PROGRESS=1（JSONL 事件模式）：日志走 stderr，stdout 保持纯 JSONL
+    if std::env::var("FAN_JSON_PROGRESS").map(|v| v == "1").unwrap_or(false) {
+        tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
     let cli = Cli::parse();
 
     // Async version check (non-blocking)
@@ -219,9 +285,11 @@ fn main() {
         Commands::Pending { clear } => commands::pending::run(clear),
         Commands::Update => commands::update::run(),
         Commands::Uninstall => commands::uninstall::run(),
-        Commands::Discover { precise, re_infer } => {
+        Commands::Discover { precise, re_infer, local_only } => {
             if re_infer {
                 commands::discover::run_re_infer(&config, &layer, precise);
+            } else if local_only {
+                commands::discover::run_local(&config, &layer, precise);
             } else {
                 commands::discover::run(&config, &layer, precise);
             }
@@ -230,6 +298,14 @@ fn main() {
             commands::correct::run(dataset, asset, new_type);
         },
         Commands::Init => commands::init::run(&config, &layer),
+        Commands::Transfer(action) => commands::transfer::run(&config, &layer, match action {
+            TransferAction::Send { dataset, ttl_hours, chunk_size, concurrency } =>
+                commands::transfer::TransferAction::Send { dataset, ttl_hours, chunk_size, concurrency },
+            TransferAction::Get { code, output, chunk_size, concurrency } =>
+                commands::transfer::TransferAction::Get { code, output, chunk_size, concurrency },
+            TransferAction::Log { json } =>
+                commands::transfer::TransferAction::Log { json },
+        }),
         Commands::Snapshots(action) => match action {
             SnapshotAction::List => commands::snapshot::list(&config, &layer),
             SnapshotAction::Diff { id1, id2 } => commands::snapshot::diff(&config, &layer, id1, id2),
@@ -241,6 +317,9 @@ fn main() {
             ServersAction::Remove { name } => commands::servers::remove(&name),
             ServersAction::Scan { name, agent } => commands::servers::scan_one_inner(&name, agent),
             ServersAction::Watch { name } => commands::servers::watch_remote(&name),
+        },
+        Commands::Config(action) => match action {
+            ConfigAction::CcSwitch { list, profile } => commands::config::cc_switch(list, profile),
         },
     }
 }

@@ -14,26 +14,37 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub fn run(config: &Config, layer: &DataLayer, precise: bool) {
-    run_inner(config, layer, precise, false);
+    run_inner(config, layer, precise, false, false);
 }
 
 pub fn run_re_infer(config: &Config, layer: &DataLayer, precise: bool) {
-    run_inner(config, layer, precise, true);
+    run_inner(config, layer, precise, true, false);
 }
 
-fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) {
+/// GUI 桌面壳专用：只扫本机 [scan].include 目录，忽略远程 [servers.*]。
+pub fn run_local(config: &Config, layer: &DataLayer, precise: bool) {
+    run_inner(config, layer, precise, false, true);
+}
+
+fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool, local_only: bool) {
     let llm_client = LlmClient::new(config.llm.clone());
     if !llm_client.is_configured() {
         eprintln!("LLM not configured. Set [llm] in config.toml.");
         return;
     }
 
-    let servers = config.enabled_servers();
-    let scan_roots: Vec<&str> = servers.iter()
-        .flat_map(|(_, cfg)| cfg.scan_roots.iter().map(|s| s.as_str()))
-        .collect();
+    // GUI 桌面壳只扫本机目录，忽略远程 [servers.*] 配置，
+    // 否则 enabled_servers() 会返回远程 scan_roots，导致在本地扫不存在的路径。
+    let scan_roots: Vec<String> = if local_only || config.enabled_servers().is_empty() {
+        config.scan.include.clone()
+    } else {
+        let servers = config.enabled_servers();
+        servers.iter()
+            .flat_map(|(_, cfg)| cfg.scan_roots.iter().cloned())
+            .collect()
+    };
     if scan_roots.is_empty() {
-        eprintln!("No scan roots configured. Use 'fan-files servers add' first.");
+        eprintln!("No scan roots configured. Use 'fan-files servers add' or set [scan] include.");
         return;
     }
 
@@ -209,7 +220,7 @@ fn run_inner(config: &Config, layer: &DataLayer, precise: bool, re_infer: bool) 
     eprintln!("  Inferring datasets from {} candidates...", candidates.len());
     match infer_hierarchical::run_dataset_asset_inference(
         &index.sqlite, &llm_client, &index.tantivy, config.threads,
-        scan_roots.first().unwrap_or(&""),
+        scan_roots.first().map(|s| s.as_str()).unwrap_or(""),
         &candidates
     ) {
         Ok(n) => eprintln!("  → {} datasets created", n),

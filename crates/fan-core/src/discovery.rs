@@ -667,10 +667,10 @@ fn llm_classify_bottom_up(
 
     eprintln!("  Bottom-Up: asking LLM to classify annotated tree...");
     let response: serde_json::Value = crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 2)?;
-    let content = response["choices"][0]["message"]["content"]
-        .as_str().ok_or("No content")?;
+    let content = crate::llm::extract_llm_text(&llm_client.config, &response)
+        .ok_or("No content")?;
 
-    let output: serde_json::Value = serde_json::from_str(content)?;
+    let output: serde_json::Value = serde_json::from_str(&content)?;
     let targets: Vec<String> = output["scan_targets"].as_array()
         .map(|a| a.iter().filter_map(|v| v["path"].as_str().map(String::from)).collect())
         .unwrap_or_default();
@@ -720,9 +720,9 @@ fn llm_classify_bottom_up(
         eprintln!("  Bottom-Up: container classification chunk {}/{} ({} containers)...",
             ci + 1, chunks.len(), chunk.len());
         let cresp: serde_json::Value = crate::llm::llm_api_call_with_retry(&llm_client.config, &cbody, 2)?;
-        let ccontent = cresp["choices"][0]["message"]["content"]
-            .as_str().ok_or("No content")?;
-        let coutput: serde_json::Value = serde_json::from_str(ccontent)?;
+        let ccontent = crate::llm::extract_llm_text(&llm_client.config, &cresp)
+            .ok_or("No content")?;
+        let coutput: serde_json::Value = serde_json::from_str(&ccontent)?;
         if let Some(arr) = coutput["container_roles"].as_array() {
             for v in arr {
                 let path = v["path"].as_str().unwrap_or("").to_string();
@@ -867,10 +867,10 @@ pub fn run_phase_a(
 
     eprintln!("  Phase A: asking LLM to classify...");
     let response: serde_json::Value = crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 3)?;
-    let content = response["choices"][0]["message"]["content"]
-        .as_str().ok_or("No content")?;
+    let content = crate::llm::extract_llm_text(&llm_client.config, &response)
+        .ok_or("No content")?;
 
-    let output: serde_json::Value = serde_json::from_str(content)?;
+    let output: serde_json::Value = serde_json::from_str(&content)?;
 
     let targets: Vec<String> = output["scan_targets"].as_array()
         .map(|a| a.iter().filter_map(|v| v["path"].as_str().map(String::from)).collect())
@@ -931,8 +931,8 @@ pub fn run_recursive_phase_a(
 
             match crate::llm::llm_api_call_with_retry(&llm_client.config, &body, 2) {
                 Ok(response) => {
-                    let content = response["choices"][0]["message"]["content"].as_str().unwrap_or("");
-                    if let Ok(output) = serde_json::from_str::<serde_json::Value>(content) {
+                    let content = crate::llm::extract_llm_text(&llm_client.config, &response).unwrap_or_default();
+                    if let Ok(output) = serde_json::from_str::<serde_json::Value>(&content) {
                         if let Some(arr) = output["scan_targets"].as_array() {
                             for v in arr {
                                 if let Some(p) = v["path"].as_str() {

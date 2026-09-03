@@ -1,0 +1,35 @@
+[workspace]
+
+[package]
+name = "fan-files-desktop"
+version = "0.1.0"
+description = "fan-files desktop shell (Tauri 2)"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "fan_files_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# io-util: T17 scan_now 逐行读 discover 的 stderr（BufReader::lines）
+# macros: T2 share/receive 并发读 stdout（JSONL 事件）与 stderr（配对码），
+#         避免任一管道写满阻塞子进程（tokio::join!）
+tokio = { version = "1", features = ["process", "rt-multi-thread", "sync", "time", "io-util", "macros"] }
+
