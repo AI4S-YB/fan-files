@@ -2741,14 +2741,26 @@ fn get(
         let file_name = req.file_name();
         eprintln!("  收到: {}", file_name);
 
-        // 目标路径：--output 指定（文件或目录），否则当前目录 + 原文件名
+        // 目标路径：--output 指定（已存在的目录→ 写入目录；否则→ 写入该文件路径）
         let target_path: PathBuf = match &output {
-            Some(p) if PathBuf::from(p).is_dir() => PathBuf::from(p).join(&file_name),
-            Some(p) => PathBuf::from(p),
+            Some(p) => {
+                let path = PathBuf::from(p);
+                if path.is_dir() { path.join(&file_name) } else { path }
+            }
             None => PathBuf::from(&file_name),
         };
+        // 显式 --output 指向一个不存在的路径：把父目录先创建出来（用户想写到
+        // 任意目录/文件名），但中间路径里有同名的现存目录才报错。
         if let Some(parent) = target_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if !parent.as_os_str().is_empty() {
+                if parent.exists() && !parent.is_dir() {
+                    return Err(format!(
+                        "输出路径的父目录 {} 存在但不是目录",
+                        parent.display()
+                    ));
+                }
+                let _ = std::fs::create_dir_all(parent);
+            }
         }
 
         // v1 accept 需要 writer（AsyncWrite）写出到文件

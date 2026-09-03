@@ -135,13 +135,25 @@ pub fn stun_query(sock: &UdpSocket, timeout: Duration) -> Option<SocketAddr> {
             None => continue,
         };
         // 组 STUN Binding Request：type=0x0001, len=0, magic cookie, 12B transaction id
+        // STUN RFC5389 §6 要求 96 bit 随机/会话特定 TID，避免攻击者伪造响应。
+        // 旧实现用 `as_nanos()` 仅 8 字节（且可预测）→ 全 12 字节用 mix 熵：
+        // 纳秒时间戳 + 栈变量地址 + 静态计数器（线程安全）。
         let tid: [u8; 12] = {
-            let now = std::time::SystemTime::now()
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
+            let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let a = (&n as *const u64 as usize) as u64;
+            let mix = n
+                .wrapping_mul(0x9E3779B97F4A7C15)
+                .wrapping_add(c.rotate_left(17))
+                .wrapping_add(a);
             let mut t = [0u8; 12];
-            t[..8].copy_from_slice(&now.to_be_bytes());
+            t[..8].copy_from_slice(&mix.to_be_bytes());
+            t[8..].copy_from_slice(&c.to_be_bytes());
             t
         };
         let mut req = [0u8; 20];
