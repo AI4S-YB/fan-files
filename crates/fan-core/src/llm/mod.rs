@@ -5,6 +5,8 @@ use prompt::{LlmOutput, system_prompt};
 use std::time::Duration;
 use tracing::info;
 
+const LLM_REQUEST_TIMEOUT_SECS: u64 = 180;
+
 pub struct LlmClient {
     pub config: LlmConfig,
 }
@@ -208,7 +210,7 @@ pub(crate) fn llm_api_call_with_retry(
             url, config.model, attempt + 1, max_retries
         );
         let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(1800))
+            .timeout(Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS))
             .build();
         let mut req = agent.post(&url);
         for (k, v) in &headers {
@@ -228,6 +230,18 @@ pub(crate) fn llm_api_call_with_retry(
                 return response.into_json()
                     .map_err(|e| format!("Failed to parse LLM response: {}", e).into());
             }
+            Err(ureq::Error::Status(code, _))
+                if config.api_type != "anthropic"
+                    && (code == 400 || code == 422)
+                    && attempt + 1 < max_retries =>
+            {
+                // Some OpenAI-compatible gateways pass a minimal connection
+                // test but reject response_format or a large max_tokens value.
+                // Retry once in broadly compatible JSON-by-prompt mode.
+                relax_openai_json_mode(&mut body);
+                last_err = format!("status code {code}; retrying in compatibility mode");
+                continue;
+            }
             Err(ureq::Error::Transport(e)) => {
                 last_err = format!("transport: {}", e);
                 continue; // retry on connection errors
@@ -239,6 +253,19 @@ pub(crate) fn llm_api_call_with_retry(
         }
     }
     Err(format!("LLM API call failed after {} retries: {}", max_retries, last_err).into())
+}
+
+fn relax_openai_json_mode(body: &mut serde_json::Value) {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("response_format");
+        if object
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|value| value > 4096)
+        {
+            object.insert("max_tokens".into(), serde_json::json!(4096));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -445,6 +472,19 @@ mod tests {
         assert!(req.contains("\"max_tokens\":4096"), "req: {}", req);
         assert!(req.contains("\"model\":\"claude-sonnet-4-8\""), "req: {}", req);
         assert_eq!(result["content"][0]["text"], "c, d");
+    }
+
+    #[test]
+    fn openai_compatibility_mode_removes_strict_json_and_caps_tokens() {
+        let mut body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 16384
+        });
+        relax_openai_json_mode(&mut body);
+        assert!(body.get("response_format").is_none());
+        assert_eq!(body["max_tokens"], 4096);
+        assert!(body.get("messages").is_some());
     }
 
     // ---- 测试辅助：一次性 HTTP 服务器，返回 (闭包结果, 捕获的原始请求) ----

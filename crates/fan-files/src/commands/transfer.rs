@@ -52,9 +52,9 @@
 //!   注意：release profile 为 `panic = "abort"`，catch_unwind 仅在 debug 构建
 //!   生效——release 下该 panic 仍会终止进程（库层无法拦截，见 CR 记录）。
 //! - 每码超时：接收方 `request_file` 30s（弃置码不永久挂起）、`accept` 300s；
-//!   发送方每块 `send_file` 60s（cancel 定时器 + flag 区分真假成功——库层把取消
-//!   映射为 Ok(())，接收方崩溃/不 get 时不再永久挂起）；主通道 600s 整体超时
-//!   （发送方与接收方对称）；槽位等待与收尾等待均有 deadline，超时放弃 detach
+//!   发送方按块大小计算 120–900s 空闲超时并由进度刷新（cancel + flag 区分真假成功）；
+//!   主通道按剩余数据量计算 10 分钟–24 小时整体超时（发送方与接收方对称）；
+//!   槽位等待与收尾等待均有 deadline，超时放弃 detach
 //!   的 worker 线程（清单保留可续传），不无条件 join。
 
 use crate::commands::chunked;
@@ -73,6 +73,100 @@ const RENDEZVOUS_URL: &str = "wss://hub.moilab.net/wormhole/v1";
 const TRANSIT_RELAY: &str = "tcp://47.94.142.52:4001";
 /// 配对码默认有效期（小时）：7 天（main.rs --ttl-hours 默认值与接收方过期码提示共用）
 pub const DEFAULT_TTL_HOURS: u64 = 168;
+
+/// Large directory archives need time to finish their initial SHA-256 pass.
+/// The hash starts before the pairing code is claimed, so five minutes after
+/// pairing is a conservative upper bound without penalising the common case.
+const FILE_META_TIMEOUT: Duration = Duration::from_secs(300);
+const RELAY_MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const RELAY_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
+const RELAY_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
+const RELAY_MIN_OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
+const RELAY_MAX_OVERALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// File metadata prepared once per send attempt. SHA-256 is calculated in the
+/// background as soon as packaging finishes, then reused by direct and relay
+/// transports instead of reading a large archive twice after fallback.
+#[derive(Clone)]
+struct PreparedTransfer {
+    path: String,
+    display_name: String,
+    size: u64,
+    sha256: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+}
+
+impl PreparedTransfer {
+    fn start(path: String, display_name: String) -> Result<Self, String> {
+        let size = std::fs::metadata(&path)
+            .map_err(|e| format!("文件元数据: {e}"))?
+            .len();
+        let sha256 = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result = sha256.clone();
+        let hash_path = path.clone();
+        std::thread::spawn(move || {
+            let hash = sha256_file(std::path::Path::new(&hash_path));
+            if let Ok(mut slot) = result.lock() {
+                *slot = Some(hash);
+            }
+        });
+        Ok(Self { path, display_name, size, sha256 })
+    }
+
+    async fn wait_sha256(&self) -> Result<String, String> {
+        let deadline = std::time::Instant::now() + FILE_META_TIMEOUT;
+        loop {
+            if let Ok(slot) = self.sha256.lock() {
+                if let Some(result) = slot.as_ref() {
+                    return result.clone();
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "文件级 SHA-256 计算超过 {}s",
+                    FILE_META_TIMEOUT.as_secs()
+                ));
+            }
+            async_io::Timer::after(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+fn relay_chunk_idle_timeout(chunk_size: u64) -> Duration {
+    let transfer_secs = chunk_size.div_ceil(RELAY_MIN_BYTES_PER_SEC);
+    let secs = transfer_secs
+        .saturating_add(30)
+        .max(RELAY_MIN_IDLE_TIMEOUT.as_secs())
+        .min(RELAY_MAX_IDLE_TIMEOUT.as_secs());
+    Duration::from_secs(secs)
+}
+
+fn relay_overall_timeout(total_bytes: u64, concurrency: usize) -> Duration {
+    let aggregate_rate = RELAY_MIN_BYTES_PER_SEC.saturating_mul(concurrency.max(1) as u64);
+    let secs = total_bytes
+        .div_ceil(aggregate_rate)
+        .saturating_add(300)
+        .max(RELAY_MIN_OVERALL_TIMEOUT.as_secs())
+        .min(RELAY_MAX_OVERALL_TIMEOUT.as_secs());
+    Duration::from_secs(secs)
+}
+
+async fn wait_for_relay_idle(
+    heartbeat: std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
+    timeout: Duration,
+    timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    loop {
+        async_io::Timer::after(Duration::from_secs(1)).await;
+        let idle = heartbeat
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or(timeout);
+        if idle >= timeout {
+            timed_out.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+    }
+}
 
 fn relay_hints() -> Vec<transit::RelayHint> {
     match url::Url::parse(TRANSIT_RELAY) {
@@ -754,7 +848,7 @@ async fn quic_recv_resume(
 ) -> Result<(String, u64), String> {
     // ① 收 FileMeta（发送方在 QUIC 建连后即发）
     let (name, size, sha256, chunk_size, chunk_count) =
-        match recv_udp_msg(wormhole, Duration::from_secs(15), "file-meta").await? {
+        match recv_udp_msg(wormhole, FILE_META_TIMEOUT, "file-meta").await? {
             Some(UdpMsg::FileMeta { name, size, sha256, chunk_size, chunk_count }) => {
                 (name, size, sha256, chunk_size, chunk_count)
             }
@@ -884,10 +978,8 @@ impl futures_lite::io::AsyncWrite for OffsetWriter {
 /// 块数据为内存缓冲（4MB 级）——send_file 接受任意 AsyncRead，无需临时文件；
 /// 块级 SHA-256 由 magic-wormhole v1 协议自带（offer 内 digest 校验）。
 ///
-/// **每块 60s 整体超时**（与接收方对称）：整个会话（建连 + 配对 + 发送）受 60s
-/// deadline 约束；send_file 的 cancel 定时器到点触发库层优雅取消（向对端发错误
-/// 消息 + 关会话）。此前 cancel=pending——接收方崩溃/不 get 时 worker 在 send_file
-/// 永久挂起、发送方永不退出（实测复现），现在 ≤60s 判失败 → 重试 ≤3 次 → 整体退出。
+/// **按块大小计算空闲超时**：会话里程碑和有效载荷进度都会刷新 heartbeat；
+/// 连续 120–900s 无进度才触发取消。此前固定 60s 会误杀 64MB 慢速 relay 块。
 /// 注意库层把"取消"映射为 send_file 返回 Ok(())（handle_run_result 的 Cancelled
 /// 分支），必须用 flag 区分定时器已触发与真实成功，否则超时会被误判为块已送达。
 async fn relay_send_one_chunk(
@@ -896,15 +988,22 @@ async fn relay_send_one_chunk(
     buf: &[u8],
     index: u32,
 ) -> Result<(), String> {
-    // 超时标志：cancel 定时器到点置位（库层取消后 send_file 返回 Ok(())，靠它
-    // 区分真假成功）。外层 race 兜底建连/配对阶段（cancel 只覆盖 send_file 内部）。
+    // Idle timeout is refreshed by session milestones and payload progress.
+    // This protects dead peers while allowing a large chunk to take longer
+    // than the old fixed 60 second wall-clock deadline.
+    let idle_timeout = relay_chunk_idle_timeout(buf.len() as u64);
     let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = timed_out.clone();
+    let heartbeat = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let outer_flag = timed_out.clone();
+    let outer_heartbeat = heartbeat.clone();
     let res = futures_lite::future::or(
         async {
             let mailbox = MailboxConnection::create(app_config(), 3)
                 .await
                 .map_err(|e| format!("创建 relay 会话: {e}"))?;
+            if let Ok(mut last) = heartbeat.lock() {
+                *last = std::time::Instant::now();
+            }
             let code = mailbox.code().to_string();
             code_tx
                 .send(RelayCodeMsg::Relay { index, code })
@@ -912,11 +1011,16 @@ async fn relay_send_one_chunk(
             let wormhole = Wormhole::connect(mailbox)
                 .await
                 .map_err(|e| format!("Wormhole 连接: {e}"))?;
+            if let Ok(mut last) = heartbeat.lock() {
+                *last = std::time::Instant::now();
+            }
             let mut cursor = async_std::io::Cursor::new(buf.to_vec());
-            let cancel = async move {
-                async_io::Timer::after(Duration::from_secs(60)).await;
-                flag.store(true, std::sync::atomic::Ordering::Release);
-            };
+            let cancel = wait_for_relay_idle(
+                heartbeat.clone(),
+                idle_timeout,
+                timed_out.clone(),
+            );
+            let progress_heartbeat = heartbeat.clone();
             transfer::send_file(
                 wormhole,
                 hints.to_vec(),
@@ -925,20 +1029,30 @@ async fn relay_send_one_chunk(
                 buf.len() as u64,
                 transit::Abilities::ALL,
                 |_| {},       // relay 路径连接类型不展示
-                |_, _| {},    // 块粒度进度由 relay_send_chunks 聚合（与 quic_send_chunks 一致）
+                move |_, _| {
+                    if let Ok(mut last) = progress_heartbeat.lock() {
+                        *last = std::time::Instant::now();
+                    }
+                },
                 cancel,
             )
             .await
             .map_err(|e| e.to_string())
         },
         async {
-            async_io::Timer::after(Duration::from_secs(60)).await;
-            Err(format!("块 {index} 发送 60s 超时（对端未收/已死），放弃该码"))
+            wait_for_relay_idle(outer_heartbeat, idle_timeout, outer_flag).await;
+            Err(format!(
+                "块 {index} 连续 {}s 无进度（对端未收/已断开），放弃该码",
+                idle_timeout.as_secs()
+            ))
         },
     )
     .await;
     if timed_out.load(std::sync::atomic::Ordering::Acquire) {
-        return Err(format!("块 {index} 发送 60s 超时（对端未收/已死），放弃该码"));
+        return Err(format!(
+            "块 {index} 连续 {}s 无进度（对端未收/已断开），放弃该码",
+            idle_timeout.as_secs()
+        ));
     }
     res
 }
@@ -946,8 +1060,8 @@ async fn relay_send_one_chunk(
 /// relay 分块发送：每个缺失块一个独立 wormhole 会话（配对码经主通道 RelayChunk
 /// 告知接收方），`concurrency` 个 worker 并行。worker 取队列块 → 读块数据 →
 /// 建会话 → 交主任务转发配对码 → send_file 传块；失败重试 ≤3 次（新会话 + 新码）。
-/// 每块会话有 60s 整体超时（relay_send_one_chunk 的 cancel 定时器），主通道转发
-/// 与收尾等待有 600s 整体 deadline——接收方崩溃时发送方保证退出（不永久挂起）。
+/// 每块会话使用进度感知空闲超时，主通道 deadline 按剩余数据量动态计算——
+/// 接收方崩溃时仍保证退出，大文件正常传输则不再被固定 600s 误杀。
 /// 主通道消息流：N × RelayChunk（发送方顺序，与接收方 get 一一对应）。
 /// 返回已传字节总数（= 缺失块字节和）。
 async fn relay_send_chunks(
@@ -969,7 +1083,7 @@ async fn relay_send_chunks(
     }
     let pending: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
         std::sync::Arc::new(std::sync::Mutex::new(missing.to_vec()));
-    let failed: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
+    let failed: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let total_sent: std::sync::Arc<std::sync::atomic::AtomicU64> =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1014,7 +1128,7 @@ async fn relay_send_chunks(
                     Err(e) => {
                         // 本地文件读失败重试无意义，直接判死
                         eprintln!("  ⚠ 打开文件失败: {e}");
-                        failed.lock().unwrap().push(idx);
+                        failed.lock().unwrap().push(format!("块 {idx}: 打开文件失败: {e}"));
                         continue;
                     }
                 };
@@ -1023,12 +1137,13 @@ async fn relay_send_chunks(
                     || std::io::Read::read_exact(&mut f, &mut buf).is_err()
                 {
                     eprintln!("  ⚠ 读块 {idx} 失败");
-                    failed.lock().unwrap().push(idx);
+                    failed.lock().unwrap().push(format!("块 {idx}: 读取失败"));
                     continue;
                 }
                 // 重试总次数 ≤3（规格 §四：每块最多 3 次，不重排；每次 = 新会话
                 // + 新配对码，接收方经主通道拿新码重 get）
                 let mut ok = false;
+                let mut last_error = String::new();
                 for attempt in 0..3 {
                     // 会话在独立线程内 + catch_unwind：库层 transit panic 按失败
                     // 重试（debug 构建 unwind；release 为 panic=abort，见模块注释）
@@ -1043,9 +1158,11 @@ async fn relay_send_chunks(
                             break;
                         }
                         Ok(Err(e)) => {
+                            last_error = e.clone();
                             eprintln!("  ⚠ 块 {idx} relay 会话失败（第 {} 次）: {e}", attempt + 1);
                         }
                         Err(_) => {
+                            last_error = "会话线程 panic（库层 transit 复位）".into();
                             eprintln!("  ⚠ 块 {idx} 会话线程 panic（库层 transit 复位），按失败重试");
                         }
                     }
@@ -1055,7 +1172,7 @@ async fn relay_send_chunks(
                     progress(total_sent.load(std::sync::atomic::Ordering::Relaxed), total_bytes);
                 } else {
                     // 3 次尝试全部失败 → 判死（已成功块保留在接收方清单，可续传）
-                    failed.lock().unwrap().push(idx);
+                    failed.lock().unwrap().push(format!("块 {idx}: {last_error}"));
                 }
             }
             let _ = code_tx.send(RelayCodeMsg::Done);
@@ -1063,14 +1180,18 @@ async fn relay_send_chunks(
     }
     // 主任务：边转发 RelayChunk 码边等 worker 收尾（std mpsc try_recv 轮询，
     // 不阻塞 executor）。转发失败 = 主通道断裂 → 整体报错（worker 线程随进程退出）。
-    // 整体 deadline 600s（与接收方 relay_recv_chunks 对称）：worker 已由每块 60s
-    // 超时界定，但主通道转发本身也可能停滞（对端死/断网）——deadline 到点即放弃
-    // 所有 worker（detach，线程随进程退出），返回 Err 不无限等待（清单保留可续传）。
-    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    // Dynamic overall deadline (symmetric with relay_recv_chunks). Workers
+    // are bounded by per-chunk idle timeout; if the main channel stalls until
+    // this deadline, workers are detached and resumable state is preserved.
+    let overall_timeout = relay_overall_timeout(total_bytes, n);
+    let deadline = std::time::Instant::now() + overall_timeout;
     let mut remaining = n;
     while remaining > 0 {
         if std::time::Instant::now() >= deadline {
-            return Err("relay 块传输整体超时（600s 上限），worker 已放弃，清单保留可续传".into());
+            return Err(format!(
+                "relay 块传输整体超时（{}s 上限），worker 已放弃，清单保留可续传",
+                overall_timeout.as_secs()
+            ));
         }
         match code_rx.try_recv() {
             Ok(RelayCodeMsg::Relay { index, code }) => {
@@ -1085,7 +1206,10 @@ async fn relay_send_chunks(
                     },
                     async {
                         async_io::Timer::after(remain).await;
-                        Err("relay 块传输整体超时（600s 上限），worker 已放弃，清单保留可续传".to_string())
+                        Err(format!(
+                            "relay 块传输整体超时（{}s 上限），worker 已放弃，清单保留可续传",
+                            overall_timeout.as_secs()
+                        ))
                     },
                 )
                 .await?;
@@ -1101,7 +1225,10 @@ async fn relay_send_chunks(
     // 无需再 join 线程
     let failed = failed.lock().unwrap();
     if !failed.is_empty() {
-        return Err(format!("以下块 relay 传输失败（重试耗尽）: {:?}", failed));
+        return Err(format!(
+            "relay 分块重试耗尽: {}",
+            failed.join("; ")
+        ));
     }
     Ok(total_sent.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -1240,7 +1367,7 @@ async fn settle_workers(
 /// EINVAL → expect）被 catch_unwind 捕获不炸进程，panic 按块失败处理（发送方
 /// 换新码重试）；每码 30s 无 offer 超时防弃置码永久挂起。
 /// 结束条件：done 满（全部块）→ settle_workers 等收尾后校验返回；收到 Abort
-/// （发送方放弃）→ 报错（清单保留可续传）；主通道 600s 超时 → 报错。
+/// （发送方放弃）→ 报错（清单保留可续传）；主通道按数据量动态超时。
 /// 返回 (总完成块数, 本次收到字节数)。
 async fn relay_recv_chunks(
     main_wormhole: &mut Wormhole,
@@ -1290,8 +1417,10 @@ async fn relay_recv_chunks(
         std::sync::Arc::new(std::sync::Mutex::new(progress));
 
     let n = concurrency.max(1);
-    // 主通道整体超时：发送方放弃（未发 Abort）/ 崩溃时兜底，清单保留可续传
-    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    // Main-channel deadline scales with the remaining payload. The old fixed
+    // 600 second limit guaranteed failure for multi-gigabyte relay transfers.
+    let overall_timeout = relay_overall_timeout(expected_bytes, n);
+    let deadline = std::time::Instant::now() + overall_timeout;
     loop {
         // 收满 → 退出主循环（最后一块可能在 accept 阻塞期间完成，轮询保证及时退出）
         if done.lock().unwrap().len() >= plan.len() {
@@ -1299,7 +1428,10 @@ async fn relay_recv_chunks(
         }
         if std::time::Instant::now() >= deadline {
             settle_workers(&active, Duration::from_secs(120)).await;
-            return Err("等待 relay 块超时（清单已保留，可续传）".into());
+            return Err(format!(
+                "等待 relay 块超时（{}s 上限，清单已保留，可续传）",
+                overall_timeout.as_secs()
+            ));
         }
         // 收 RelayChunk（20ms 轮询，与 quic_recv_chunks 的 accept 轮询同模式）
         let res = futures_lite::future::or(
@@ -1429,34 +1561,21 @@ async fn relay_recv_chunks(
 /// missing）。返回已传字节总数。
 async fn relay_send_resume(
     wormhole: &mut Wormhole,
-    send_target: &str,
-    display_name: &str,
+    prepared: &PreparedTransfer,
     chunk_size: u64,
     concurrency: usize,
     progress: impl FnMut(u64, u64) + Clone + Send + 'static,
 ) -> Result<u64, String> {
     json_emit_conn("relay");
-    let filesize = std::fs::metadata(send_target)
-        .map_err(|e| format!("文件元数据: {e}"))?
-        .len();
+    let filesize = prepared.size;
     let plan = chunked::chunk_plan(filesize, chunk_size);
     let chunk_size = plan.first().map(|c| c.size).unwrap_or(0);
-    // 文件级 SHA-256：后台线程计算（relay 相位无时间窗口，仅避免阻塞主协程太久）。
-    // 接收方等 FileMeta 的超时窗口为 300s（> 大文件哈希时间），不会误判降级。
-    eprintln!("  🔎 计算文件级 SHA-256…");
-    let (hash_tx, hash_rx) = std::sync::mpsc::channel::<Result<String, String>>();
-    let hash_path = send_target.to_string();
-    std::thread::spawn(move || {
-        let _ = hash_tx.send(sha256_file(std::path::Path::new(&hash_path)));
-    });
-    let sha256 = match hash_rx.recv() {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("文件级 SHA-256 计算失败: {e}")),
-        Err(_) => return Err("哈希线程异常退出".into()),
-    };
+    // UDP and relay share the hash started before pairing.
+    let sha256 = prepared.wait_sha256().await
+        .map_err(|e| format!("文件级 SHA-256 计算失败: {e}"))?;
     wormhole
         .send_json(&UdpMsg::FileMeta {
-            name: display_name.to_string(),
+            name: prepared.display_name.clone(),
             size: filesize,
             sha256,
             chunk_size,
@@ -1478,7 +1597,7 @@ async fn relay_send_resume(
     eprintln!("  📡 relay 分块：{} 块经独立 wormhole 会话并发传输…", missing.len());
     relay_send_chunks(
         wormhole,
-        send_target,
+        &prepared.path,
         &plan,
         &missing,
         concurrency,
@@ -1512,7 +1631,7 @@ async fn relay_recv_resume(
             // 对方（未禁用 UDP）仍会先发 udp-hello 并等 ack；回 Abort 令其立即
             // 降级 relay（不等 15s 超时），消息相位保持对称，然后继续等 FileMeta。
             loop {
-                match recv_udp_msg(wormhole, Duration::from_secs(300), "file-meta").await? {
+                match recv_udp_msg(wormhole, FILE_META_TIMEOUT, "file-meta").await? {
                     Some(UdpMsg::FileMeta { name, size, sha256, chunk_size, chunk_count }) => {
                         break (name, size, sha256, chunk_size, chunk_count);
                     }
@@ -1606,27 +1725,18 @@ async fn udp_send_path(
     fp: String,
     nonce: u64,
     who: &str,
-    send_target: &str,
-    display_name: &str,
+    prepared: &PreparedTransfer,
     chunk_size: u64,
     concurrency: usize,
+    observed_sent: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<u64, String> {
     // 预备：文件大小 + 分块计划（纯内存计算，快）
-    let filesize = std::fs::metadata(send_target)
-        .map_err(|e| format!("文件元数据: {e}"))?
-        .len();
+    let filesize = prepared.size;
     let plan = chunked::chunk_plan(filesize, chunk_size);
     let chunk_size = plan.first().map(|c| c.size).unwrap_or(0);
-    // 文件级 SHA-256 放入后台线程（64KB 增量读）——与候选收集/hello/打洞/accept
-    // 并行。大文件（>20-30GB）哈希可能超过 13s，不能阻塞在 hello 之前：否则接收方
-    // 15s 等 udp-hello 超时降级 v1，迟到的 hello 污染 v1 消息流 → 硬失败。
-    // 哈希失败（文件读错）→ 通道收 Err → 本端发 Abort 降级 relay。
-    eprintln!("  🔎 后台计算文件级 SHA-256（与打洞并行，不阻塞 hello）…");
-    let (hash_tx, hash_rx) = std::sync::mpsc::channel::<Result<String, String>>();
-    let hash_path = send_target.to_string();
-    std::thread::spawn(move || {
-        let _ = hash_tx.send(sha256_file(std::path::Path::new(&hash_path)));
-    });
+    // SHA-256 was started before rendezvous/pairing. Direct and relay both
+    // await and reuse that result; no transport fallback rereads the archive.
+    eprintln!("  🔎 等待后台文件级 SHA-256（配对前已开始计算）…");
 
     // ① 收集候选：
     //    - host：每个本地 IPv4 接口绑一个 socket（ip:0 随机端口），同网段对端免打洞直连
@@ -1724,8 +1834,6 @@ async fn udp_send_path(
     //    await 驱动握手（带 5s 超时，防恶意连接挂死循环）；握手失败继续轮询。
     //    同时非阻塞监听 wormhole：对方发 Abort（候选全失败）→ 立即降级，不等超时。
     //    20s > 接收方全候选预算（host ≤2s×N + 打洞 3s + 握手 10s），保证 Abort 必达。
-    //    哈希等待预算：13s（< 接收方 15s file-meta 窗口，见下方哈希等待注释）。
-    let hash_deadline = std::time::Instant::now() + Duration::from_secs(13);
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         // 先收打洞线程送来的 srflx endpoint（非阻塞）
@@ -1775,36 +1883,13 @@ async fn udp_send_path(
                 // 顺序固定：QUIC 建连 → 发 FileMeta → 收 ChunkStatus（清单回执）→
                 // 多流只传缺失块。FileMeta 必须建连后才发——接收方 accept 到连接
                 // 才需要文件信息（wormhole 通道双方一直连着，可随时发）。
-                // Task 4：FileMeta 前先等后台哈希线程结果（哈希与打洞/accept 并行，
-                // 此时通常早已完成；非阻塞轮询防卡 executor）。超时 13s < 接收方 15s
-                // file-meta 窗口——哈希超时则本端先降级 relay，FileMeta 绝不迟到
-                // 污染对方已降级的 v1 消息流。
-                let sha256 = loop {
-                    match hash_rx.try_recv() {
-                        Ok(Ok(s)) => break s,
-                        Ok(Err(e)) => {
-                            // 文件读错：哈希失败即发 Abort 通知接收方立即降级（此时
-                            // 对方大概率仍在等 file-meta，Abort 被当作非 FileMeta 消息
-                            // → 报错 → 降级 relay，消息相位对齐）
-                            eprintln!("  ⚠ 文件级 SHA-256 计算失败: {e}");
-                            let _ = wormhole.send_json(&UdpMsg::Abort).await;
-                            return Err(format!("文件级 SHA-256 计算失败: {e}"));
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            return Err("哈希线程异常退出".into());
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            if std::time::Instant::now() >= hash_deadline {
-                                eprintln!("  ⚠ 等待文件哈希超时（>13s），降级 relay");
-                                return Err("hash-timeout".into());
-                            }
-                            async_io::Timer::after(Duration::from_millis(50)).await;
-                        }
-                    }
-                };
+                // The hash started before the pairing code was claimed. Keep
+                // the established QUIC connection alive while it finishes.
+                let sha256 = prepared.wait_sha256().await
+                    .map_err(|e| format!("文件级 SHA-256 计算失败: {e}"))?;
                 wormhole
                     .send_json(&UdpMsg::FileMeta {
-                        name: display_name.to_string(),
+                        name: prepared.display_name.clone(),
                         size: filesize,
                         sha256,
                         chunk_size,
@@ -1825,7 +1910,9 @@ async fn udp_send_path(
                 }
                 // UDP 直连已建立 → 事件通知（GUI 显示 direct 模式）
                 json_emit_conn("direct");
-                let sent = quic_send_chunks(&conn, send_target, &plan, &missing, concurrency, |done, total| {
+                let sent_progress = observed_sent.clone();
+                let sent = quic_send_chunks(&conn, &prepared.path, &plan, &missing, concurrency, move |done, total| {
+                    sent_progress.fetch_max(done, std::sync::atomic::Ordering::Relaxed);
                     if total > 0 {
                         eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
                     }
@@ -2032,7 +2119,10 @@ CREATE TABLE IF NOT EXISTS transfer_log (
     started_at INTEGER NOT NULL,
     finished_at INTEGER,
     code_used_at INTEGER,
-    completed_at INTEGER
+    completed_at INTEGER,
+    error_code TEXT,
+    error_message TEXT,
+    connection_mode TEXT
 );
 ";
 
@@ -2085,10 +2175,16 @@ fn audit_columns(conn: &rusqlite::Connection) -> Vec<String> {
 fn ensure_audit_schema(conn: &rusqlite::Connection) {
     let _ = conn.execute_batch(AUDIT_DDL);
     let cols = audit_columns(conn);
-    for col in ["code_used_at", "completed_at"] {
+    for (col, ty) in [
+        ("code_used_at", "INTEGER"),
+        ("completed_at", "INTEGER"),
+        ("error_code", "TEXT"),
+        ("error_message", "TEXT"),
+        ("connection_mode", "TEXT"),
+    ] {
         if !cols.iter().any(|c| c == col) {
             let _ = conn.execute(
-                &format!("ALTER TABLE transfer_log ADD COLUMN {col} INTEGER"),
+                &format!("ALTER TABLE transfer_log ADD COLUMN {col} {ty}"),
                 [],
             );
         }
@@ -2167,7 +2263,15 @@ fn audit_mark_completed(store: &SqliteStore, id: i64) {
 }
 
 /// 发送方审计：终态回写（ok / failed + peer_key + 字节 + finished_at）
-fn audit_finish(store: &SqliteStore, id: i64, peer_key: Option<&str>, bytes_sent: u64, status: &str) {
+fn audit_finish(
+    store: &SqliteStore,
+    id: i64,
+    peer_key: Option<&str>,
+    bytes_sent: u64,
+    status: &str,
+    connection_mode: Option<&str>,
+    error_message: Option<&str>,
+) {
     let conn = match store.conn.lock() {
         Ok(c) => c,
         Err(e) => {
@@ -2176,9 +2280,40 @@ fn audit_finish(store: &SqliteStore, id: i64, peer_key: Option<&str>, bytes_sent
         }
     };
     let _ = conn.execute(
-        "UPDATE transfer_log SET peer_key=?1, bytes_sent=?2, status=?3, finished_at=?4 WHERE id=?5",
-        rusqlite::params![peer_key, bytes_sent as i64, status, now_secs(), id],
+        "UPDATE transfer_log
+         SET peer_key=?1, bytes_sent=?2, status=?3, finished_at=?4,
+             connection_mode=?5, error_code=?6, error_message=?7
+         WHERE id=?8",
+        rusqlite::params![
+            peer_key,
+            bytes_sent as i64,
+            status,
+            now_secs(),
+            connection_mode,
+            error_message.map(transfer_error_code),
+            error_message,
+            id
+        ],
     );
+}
+
+fn transfer_error_code(message: &str) -> &'static str {
+    let lower = message.to_lowercase();
+    if lower.contains("sha-256") || lower.contains("hash") || lower.contains("哈希") {
+        "hash_error"
+    } else if lower.contains("file-meta") {
+        "file_meta_timeout"
+    } else if lower.contains("relay") && (lower.contains("超时") || lower.contains("timeout")) {
+        "relay_timeout"
+    } else if lower.contains("wormhole") || lower.contains("rendezvous") {
+        "rendezvous_error"
+    } else if lower.contains("取消") || lower.contains("中止") || lower.contains("abort") {
+        "peer_cancelled"
+    } else if lower.contains("fingerprint") || lower.contains("指纹") {
+        "security_error"
+    } else {
+        "transfer_error"
+    }
 }
 
 fn audit(
@@ -2255,6 +2390,20 @@ fn send(
     } else {
         PathBuf::from(&path).file_name().unwrap_or_default().to_string_lossy().to_string()
     };
+    // Start hashing before rendezvous/pairing. For large files most or all of
+    // the hash pass completes while the user communicates and enters the code.
+    let prepared = match PreparedTransfer::start(send_target.clone(), display_name.clone()) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            if let Some(tmp) = &temp_tar {
+                let _ = std::fs::remove_file(tmp);
+            }
+            eprintln!("准备传输文件失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    let observed_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let connection_mode = std::sync::Arc::new(std::sync::Mutex::new(String::from("rendezvous")));
 
     // 配对码状态机（Task 3）：配对码生成即入审计（waiting）→ 配对完成
     // （code_used_at）→ 数据发完（completed_at）→ 终态（ok/failed）。
@@ -2282,6 +2431,9 @@ fn send(
 
         // UDP 打洞优先（双方都支持才尝试；失败/禁用自动降级 relay）
         if udp_allowed && !udp_disabled() && peer_supports_udp(&wormhole) {
+            if let Ok(mut mode) = connection_mode.lock() {
+                *mode = "punching".into();
+            }
             json_emit_conn("punching");
             eprintln!("  🔎 对端支持 UDP 打洞，尝试直连…");
             let (cert, key, fp) = crate::commands::quic_link::gen_cert_with_fingerprint();
@@ -2296,14 +2448,17 @@ fn send(
                 fp,
                 nonce,
                 "sender",
-                send_target.as_str(),
-                &display_name,
+                &prepared,
                 chunk_size,
                 concurrency,
+                observed_sent.clone(),
             )
             .await
             {
                 Ok(sent) => {
+                    if let Ok(mut mode) = connection_mode.lock() {
+                        *mode = "direct".into();
+                    }
                     human!("\n  ✅ UDP 直连传输完成，校验通过（{} 字节）", sent);
                     // Task 3：数据发完 = 收满全部 0x6b ack（接收方逐块校验回执）
                     audit_mark_completed(&audit_store, audit_id);
@@ -2323,13 +2478,17 @@ fn send(
         // relay 兜底：v3 对端 → 多线程分块（partial + 清单跨路径复用，只传 missing）；
         // 旧端（无 v3 能力）→ v1 单流整文件传输（旧行为，协商层已隔离）
         if peer_supports_udp(&wormhole) {
+            if let Ok(mut mode) = connection_mode.lock() {
+                *mode = "relay".into();
+            }
+            let relay_progress = observed_sent.clone();
             let sent = match relay_send_resume(
                 &mut wormhole,
-                send_target.as_str(),
-                &display_name,
+                &prepared,
                 chunk_size,
                 concurrency,
-                |done, total| {
+                move |done, total| {
+                    relay_progress.fetch_max(done, std::sync::atomic::Ordering::Relaxed);
                     if total > 0 {
                         eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
                     }
@@ -2350,10 +2509,14 @@ fn send(
             audit_mark_completed(&audit_store, audit_id);
             Ok((audit_id, peer_key, sent))
         } else {
+            if let Ok(mut mode) = connection_mode.lock() {
+                *mode = "relay-v1".into();
+            }
             json_emit_conn("relay");
             let relay_hints = relay_hints();
             let total_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let tb = total_bytes.clone();
+            let observed = observed_sent.clone();
             let res = transfer::send_file_or_folder(
                 wormhole,
                 relay_hints,
@@ -2363,6 +2526,7 @@ fn send(
                 |info| eprintln!("  连接: {}", fmt_conn(&info.conn_type)),
                 move |done, total| {
                     tb.store(total, std::sync::atomic::Ordering::Relaxed);
+                    observed.fetch_max(done, std::sync::atomic::Ordering::Relaxed);
                     if total > 0 {
                         eprintln!("\r  进度: {}/{} ({:.0}%)", done, total, done as f64 / total as f64 * 100.0);
                     }
@@ -2388,19 +2552,33 @@ fn send(
 
     // 清理临时 tar
     if let Some(tmp) = &temp_tar {
-        let _ = std::fs::remove_file(tmp);
+        if std::fs::remove_file(tmp).is_err() {
+            // On Windows an early rendezvous failure can race the background
+            // hash reader. Wait for it to release the archive, then retry.
+            let _ = async_io::block_on(prepared.wait_sha256());
+            let _ = std::fs::remove_file(tmp);
+        }
     }
 
     let elapsed = now_secs() as f64 - started_at as f64;
+    let mode = connection_mode.lock().map(|m| m.clone()).unwrap_or_default();
     match result {
         Ok((audit_id, peer_key, sent)) => {
             // 终态回写：ok + peer_key + 字节 + finished_at
             // （code_used_at/completed_at 已在配对完成/数据发完时写入）
-            audit_finish(&store, audit_id, Some(&peer_key), sent, "ok");
+            audit_finish(&store, audit_id, Some(&peer_key), sent, "ok", Some(&mode), None);
             json_emit_done(true, sent, elapsed);
         }
         Err((audit_id, e)) => {
-            audit_finish(&store, audit_id, None, 0, "failed");
+            audit_finish(
+                &store,
+                audit_id,
+                None,
+                observed_sent.load(std::sync::atomic::Ordering::Relaxed),
+                "failed",
+                Some(&mode),
+                Some(&e),
+            );
             json_emit_error(&e);
             eprintln!("{}", e);
             std::process::exit(1);
@@ -2645,7 +2823,7 @@ fn log(config: &Config, layer: &DataLayer, json: bool) {
     ensure_audit_schema(&conn);
     let mut stmt = match conn.prepare(
         "SELECT direction, dataset, code, status, bytes_sent, bytes_received, started_at,
-                code_used_at, completed_at
+                code_used_at, completed_at, error_code, error_message, connection_mode
          FROM transfer_log ORDER BY id DESC LIMIT 50"
     ) {
         Ok(s) => s,
@@ -2656,6 +2834,8 @@ fn log(config: &Config, layer: &DataLayer, json: bool) {
             r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
             r.get::<_, String>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
             r.get::<_, i64>(6)?, r.get::<_, Option<i64>>(7)?, r.get::<_, Option<i64>>(8)?,
+            r.get::<_, Option<String>>(9)?, r.get::<_, Option<String>>(10)?,
+            r.get::<_, Option<String>>(11)?,
         ))
     });
     if json {
@@ -2666,6 +2846,8 @@ fn log(config: &Config, layer: &DataLayer, json: bool) {
                     "direction": row.0, "dataset": row.1, "code": row.2,
                     "status": row.3, "bytes_sent": row.4, "bytes_received": row.5,
                     "time": row.6, "code_used_at": row.7, "completed_at": row.8,
+                    "error_code": row.9, "error_message": row.10,
+                    "connection_mode": row.11,
                 }));
             }
         }
@@ -3418,6 +3600,9 @@ mod tests {
         let cols = audit_columns(&conn);
         assert!(cols.iter().any(|c| c == "code_used_at"), "新库应含 code_used_at 列: {cols:?}");
         assert!(cols.iter().any(|c| c == "completed_at"), "新库应含 completed_at 列: {cols:?}");
+        assert!(cols.iter().any(|c| c == "error_code"), "新库应含 error_code 列: {cols:?}");
+        assert!(cols.iter().any(|c| c == "error_message"), "新库应含 error_message 列: {cols:?}");
+        assert!(cols.iter().any(|c| c == "connection_mode"), "新库应含 connection_mode 列: {cols:?}");
         // 旧库：模拟 CREATE TABLE IF NOT EXISTS 之前就存在的旧表（无两列）
         // → ensure_audit_schema 迁移后补齐（AUDIT_DDL 的 CREATE IF NOT EXISTS
         // 不会给已有表加列，必须 ALTER TABLE ADD COLUMN）
@@ -3442,6 +3627,9 @@ mod tests {
         let cols2 = audit_columns(&conn2);
         assert!(cols2.iter().any(|c| c == "code_used_at"), "旧库迁移后应补 code_used_at 列: {cols2:?}");
         assert!(cols2.iter().any(|c| c == "completed_at"), "旧库迁移后应补 completed_at 列: {cols2:?}");
+        assert!(cols2.iter().any(|c| c == "error_code"), "旧库迁移后应补 error_code 列: {cols2:?}");
+        assert!(cols2.iter().any(|c| c == "error_message"), "旧库迁移后应补 error_message 列: {cols2:?}");
+        assert!(cols2.iter().any(|c| c == "connection_mode"), "旧库迁移后应补 connection_mode 列: {cols2:?}");
         // 幂等：重复迁移不报错、列不重复
         ensure_audit_schema(&conn2);
         let cols3 = audit_columns(&conn2);
@@ -3450,6 +3638,45 @@ mod tests {
             1,
             "重复迁移不应产生重复列: {cols3:?}"
         );
+    }
+
+    #[test]
+    fn large_relay_timeouts_scale_with_payload() {
+        assert_eq!(relay_chunk_idle_timeout(4 * 1024 * 1024).as_secs(), 120);
+        assert_eq!(relay_chunk_idle_timeout(64 * 1024 * 1024).as_secs(), 286);
+        let large = relay_overall_timeout(31_574_721_024, 4);
+        assert!(large.as_secs() > 600, "31GB relay must not retain the old 600s deadline");
+        assert!(large <= RELAY_MAX_OVERALL_TIMEOUT);
+    }
+
+    #[test]
+    fn prepared_transfer_reuses_one_hash_result() {
+        let dir = std::env::temp_dir().join(format!(
+            "fan-prepared-transfer-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload.bin");
+        std::fs::write(&path, b"large-transfer-fixture").unwrap();
+        let prepared = PreparedTransfer::start(
+            path.to_string_lossy().into_owned(),
+            "payload.bin".into(),
+        )
+        .unwrap();
+        let first = async_io::block_on(prepared.wait_sha256()).unwrap();
+        let second = async_io::block_on(prepared.wait_sha256()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transfer_errors_are_classified_for_audit() {
+        assert_eq!(transfer_error_code("file-meta 超时"), "file_meta_timeout");
+        assert_eq!(transfer_error_code("relay 块传输整体超时"), "relay_timeout");
+        assert_eq!(transfer_error_code("Wormhole 连接失败"), "rendezvous_error");
+        assert_eq!(transfer_error_code("文件级 SHA-256 计算失败"), "hash_error");
     }
 
     /// 过期/无效配对码错误 → 友好中文提示（含有效期说明）；其他错误原样保留。
