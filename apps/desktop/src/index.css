@@ -1086,3 +1086,167 @@ html, body {
   display: block;
   margin-top: 4px;
 }
+
+/* ===== cc-switch-style design tokens (Task 1) ===== */
+
+/* Glass effects */
+.glass {
+  background: hsl(var(--bg) / .7);
+  backdrop-filter: blur(8px) saturate(180%);
+  -webkit-backdrop-filter: blur(8px) saturate(180%);
+  border: 1px solid hsl(var(--border) / .5);
+}
+.glass-card {
+  background: hsl(var(--bg-elevated) / .8);
+  backdrop-filter: blur(12px) saturate(180%);
+  -webkit-backdrop-filter: blur(12px) saturate(180%);
+  border: 1px solid hsl(var(--border) / .4);
+  box-shadow: 0 4px 16px hsl(0 0% 0% / .06);
+}
+.glass-header {
+  background: hsl(var(--bg) / .75);
+  backdrop-filter: blur(10px) saturate(180%);
+  -webkit-backdrop-filter: blur(10px) saturate(180%);
+  border-bottom: 1px solid hsl(var(--border) / .3);
+  transition: box-shadow 200ms ease;
+}
+.glass-header.scrolled {
+  box-shadow: 0 1px 0 hsl(var(--border)), 0 4px 16px hsl(0 0% 0% / .04);
+}
+
+/* Animations */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+@keyframes slide-in-right {
+  from { opacity: 0; transform: translateX(24px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes pulse-bg {
+  0%, 100% { background: hsl(var(--destructive) / .08); }
+  50%      { background: hsl(var(--destructive) / .15); }
+}
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 hsl(var(--primary) / .45); }
+  100% { box-shadow: 0 0 0 8px hsl(var(--primary) / 0); }
+}
+@keyframes shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Animation utility classes */
+.anim-fade       { animation: fade-in 200ms ease both; }
+.anim-fade-up    { animation: fade-up 250ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.anim-scale-in   { animation: scale-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.anim-slide-in   { animation: slide-in-right 250ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.anim-pulse-bg   { animation: pulse-bg 2s ease-in-out infinite; }
+.anim-pulse-ring { animation: pulse-ring 1.5s ease-out infinite; }
+
+.transition-base {
+  transition: background 150ms ease, color 150ms ease,
+              border-color 150ms ease, transform 120ms ease,
+              box-shadow 200ms ease;
+}
+.hover-lift {
+  transition: transform 150ms ease, box-shadow 200ms ease;
+}
+.hover-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px hsl(0 0% 0% / .08);
+}
+
+/* Shimmer overlay (for progress bar) */
+.shimmer-overlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    hsl(var(--primary-fg) / .2) 50%,
+    transparent 100%);
+  animation: shimmer 1.5s infinite;
+  pointer-events: none;
+}
+
+/* App shell layout primitives */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: hsl(var(--bg));
+}
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  padding: 14px 28px;
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+}
+.app-header-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 16px;
+}
+.app-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: hsl(var(--fg));
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+.app-main {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 28px 28px;
+}
+
+/* Interactive card with hover feedback */
+.card-interactive {
+  background: hsl(var(--bg-elevated));
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 200ms ease, border-color 150ms ease, transform 150ms ease;
+}
+.card-interactive:hover {
+  border-color: hsl(var(--primary) / .35);
+  box-shadow: 0 6px 20px hsl(0 0% 0% / .08);
+}
+
+/* Primary ring on selection */
+.ring-primary {
+  box-shadow: 0 0 0 1px hsl(var(--primary) / .4);
+}
+
+/* Honor user motion preference (a11y) */
+@media (prefers-reduced-motion: reduce) {
+  .anim-fade,
+  .anim-fade-up,
+  .anim-scale-in,
+  .anim-slide-in,
+  .anim-pulse-bg,
+  .anim-pulse-ring,
+  .shimmer-overlay {
+    animation: none !important;
+  }
+  .transition-base,
+  .hover-lift,
+  .card-interactive {
+    transition: none !important;
+  }
+}
