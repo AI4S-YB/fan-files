@@ -25,11 +25,12 @@ export function Sidebar({
         width: SIDEBAR_WIDTH,
         display: "flex",
         flexDirection: "column",
-        padding: "12px 8px",
+        padding: "14px 10px",
         gap: 4,
         background: "hsl(var(--bg-elevated))",
         borderRight: "1px solid hsl(var(--border))",
         fontFamily: "var(--font-sans)",
+        flexShrink: 0,
       }}
     >
       <div
@@ -38,7 +39,7 @@ export function Sidebar({
           alignItems: "center",
           gap: 8,
           padding: "8px 10px 12px",
-          marginBottom: 4,
+          marginBottom: 8,
           borderBottom: "1px solid hsl(var(--border))",
           fontSize: 14,
           fontWeight: 700,
@@ -59,6 +60,7 @@ export function Sidebar({
               type="button"
               aria-current={active ? "page" : undefined}
               onClick={() => onSelect(it.key)}
+              className="transition-base"
               style={{
                 position: "relative",
                 display: "flex",
@@ -74,29 +76,23 @@ export function Sidebar({
                 borderRadius: "var(--radius)",
                 cursor: "pointer",
                 textAlign: "left",
-                transition: "background 120ms ease, color 120ms ease",
+                boxShadow: active ? "0 0 0 1px hsl(var(--primary) / .4)" : "none",
               }}
               onMouseEnter={(e) => {
-                if (!active) e.currentTarget.style.background = "hsl(var(--bg))";
+                if (!active) {
+                  e.currentTarget.style.background = "hsl(var(--bg))";
+                  e.currentTarget.style.color = "hsl(var(--fg))";
+                  e.currentTarget.style.transform = "translateX(2px)";
+                }
               }}
               onMouseLeave={(e) => {
-                if (!active) e.currentTarget.style.background = "transparent";
+                if (!active) {
+                  e.currentTarget.style.background = "transparent";
+                  e.currentTarget.style.color = "hsl(var(--fg-muted))";
+                  e.currentTarget.style.transform = "translateX(0)";
+                }
               }}
             >
-              {active && (
-                <span
-                  aria-hidden="true"
-                  style={{
-                    position: "absolute",
-                    left: 0,
-                    top: 6,
-                    bottom: 6,
-                    width: 3,
-                    borderRadius: 2,
-                    background: "hsl(var(--primary))",
-                  }}
-                />
-              )}
               <span aria-hidden="true" style={{ fontSize: 15, width: 18, textAlign: "center" }}>
                 {it.icon}
               </span>
