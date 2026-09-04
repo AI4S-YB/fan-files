@@ -1,74 +1,138 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 
-export type ToastType = "success" | "error" | "info";
+export type ToastKind = "success" | "error" | "info";
 
-export interface ToastContextValue {
-  showToast: (msg: string, type?: ToastType) => void;
-}
-
-// 默认 no-op：未包 Provider（如单组件测试）时调用不报错
-const ToastContext = createContext<ToastContextValue>({ showToast: () => {} });
-
-export function useToast() {
-  return useContext(ToastContext);
-}
-
-interface ToastItem {
+export interface Toast {
   id: number;
-  msg: string;
-  type: ToastType;
+  kind: ToastKind;
+  message: string;
+  ttl?: number;
 }
 
-// 轻量无依赖 toast：右上角堆叠，3s 自动消失 + 手动关闭按钮。
-// SF-T2：扫描完成/失败通知、预检提示等全局轻提示走这里。
-const AUTO_DISMISS_MS = 3000;
+let nextId = 1;
+const listeners = new Set<(t: Toast) => void>();
 
-export default function ToastProvider({ children }: { children: ReactNode }) {
-  const [toasts, setToasts] = useState<ToastItem[]>([]);
-  const nextId = useRef(1);
+export function pushToast(t: Omit<Toast, "id">) {
+  const toast: Toast = { id: nextId++, ...t };
+  listeners.forEach((cb) => cb(toast));
+}
 
-  const dismiss = useCallback((id: number) => {
-    setToasts((ts) => ts.filter((t) => t.id !== id));
-  }, []);
+const ICONS: Record<ToastKind, string> = {
+  success: "✓",
+  error:   "✕",
+  info:    "ℹ",
+};
 
-  const showToast = useCallback(
-    (msg: string, type: ToastType = "info") => {
-      const id = nextId.current++;
-      setToasts((ts) => [...ts, { id, msg, type }]);
-      setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
-    },
-    [dismiss]
-  );
+const KIND_VAR: Record<ToastKind, string> = {
+  success: "success",
+  error: "destructive",
+  info: "primary",
+};
 
-  // value 身份稳定：toasts 变化时只重渲染 Provider，不波及仅用 showToast 的消费者
-  const value = useMemo(() => ({ showToast }), [showToast]);
-
+function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
+  const ttl = toast.ttl ?? 4000;
+  useEffect(() => {
+    const id = setTimeout(onClose, ttl);
+    return () => clearTimeout(id);
+  }, [ttl, onClose]);
+  const kindVar = KIND_VAR[toast.kind];
   return (
-    <ToastContext.Provider value={value}>
+    <div
+      role="status"
+      data-kind={toast.kind}
+      className="anim-slide-in"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        background: "hsl(var(--bg-elevated))",
+        border: "1px solid hsl(var(--border))",
+        borderLeft: `4px solid hsl(var(--${kindVar}))`,
+        borderRadius: "var(--radius-lg)",
+        padding: "10px 14px",
+        minWidth: 220,
+        maxWidth: 380,
+        boxShadow: "var(--shadow)",
+        fontSize: 13,
+        color: "hsl(var(--fg))",
+      }}
+    >
+      <span
+        aria-hidden="true"
+        style={{
+          width: 22,
+          height: 22,
+          borderRadius: "50%",
+          background: `hsl(var(--${kindVar}) / .15)`,
+          color: `hsl(var(--${kindVar}-fg))`,
+          display: "grid",
+          placeItems: "center",
+          fontSize: 12,
+          fontWeight: 700,
+          flexShrink: 0,
+        }}
+      >
+        {ICONS[toast.kind]}
+      </span>
+      <span style={{ flex: 1 }}>{toast.message}</span>
+      <button
+        type="button"
+        aria-label="关闭"
+        onClick={onClose}
+        className="transition-base"
+        style={{
+          border: "none",
+          background: "transparent",
+          cursor: "pointer",
+          color: "hsl(var(--fg-muted))",
+          fontSize: 16,
+          lineHeight: 1,
+          padding: 0,
+        }}
+        onMouseEnter={(e) => { e.currentTarget.style.color = "hsl(var(--fg))"; }}
+        onMouseLeave={(e) => { e.currentTarget.style.color = "hsl(var(--fg-muted))"; }}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+export default function ToastProvider({ children }: { children: React.ReactNode }) {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  useEffect(() => {
+    const cb = (t: Toast) => {
+      setToasts((prev) => [...prev, t]);
+    };
+    listeners.add(cb);
+    return () => { listeners.delete(cb); };
+  }, []);
+  const close = (id: number) => setToasts((prev) => prev.filter((t) => t.id !== id));
+  return (
+    <>
       {children}
-      {/* role=status + aria-live：新增 toast 时读屏播报 */}
-      <div className="toast-container" role="status" aria-live="polite">
-        {toasts.map((t) => (
-          <div key={t.id} className={`toast-item toast-${t.type}`}>
-            <span className="toast-msg">{t.msg}</span>
-            <button
-              className="toast-close"
-              aria-label="关闭"
-              onClick={() => dismiss(t.id)}
-            >
-              ×
-            </button>
-          </div>
-        ))}
-      </div>
-    </ToastContext.Provider>
+      {createPortal(
+        <div
+          style={{
+            position: "fixed",
+            top: 16,
+            right: 16,
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+            zIndex: 1000,
+            pointerEvents: "none",
+          }}
+        >
+          {toasts.map((t) => (
+            <div key={t.id} style={{ pointerEvents: "auto" }}>
+              <ToastItem toast={t} onClose={() => close(t.id)} />
+            </div>
+          ))}
+        </div>,
+        document.body
+      )}
+    </>
   );
 }

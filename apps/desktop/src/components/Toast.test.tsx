@@ -1,71 +1,56 @@
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import ToastProvider, { useToast, type ToastType } from "./Toast";
-
-// 测试探针：在 Provider 内挂一个组件拿到 showToast 引用，向外部暴露。
-let showToast: (msg: string, type?: ToastType) => void = () => {};
-function Probe() {
-  showToast = useToast().showToast;
-  return null;
-}
+import ToastProvider, { pushToast } from "./Toast";
 
 function renderHarness() {
-  return render(
-    <ToastProvider>
-      <Probe />
-    </ToastProvider>
-  );
+  return render(<ToastProvider><div /></ToastProvider>);
 }
-
-beforeEach(() => {
-  showToast = () => {};
-});
 
 afterEach(() => {
   vi.useRealTimers();
 });
 
 describe("Toast", () => {
-  it("renders the message after showToast and auto-dismisses after 3s", () => {
+  beforeEach(() => {
     vi.useFakeTimers();
+  });
+
+  it("renders the message after pushToast and auto-dismisses after 4s", () => {
     renderHarness();
-    act(() => showToast("扫描完成"));
+    act(() => pushToast({ kind: "info", message: "扫描完成" }));
     expect(screen.getByText("扫描完成")).toBeInTheDocument();
-    act(() => vi.advanceTimersByTime(3000));
+    act(() => vi.advanceTimersByTime(4000));
     expect(screen.queryByText("扫描完成")).not.toBeInTheDocument();
   });
 
-  it("stacks multiple toasts and dismisses each after 3s", () => {
-    vi.useFakeTimers();
+  it("stacks multiple toasts and dismisses each after 4s", () => {
     renderHarness();
-    act(() => showToast("第一条"));
-    act(() => showToast("第二条"));
+    act(() => pushToast({ kind: "info", message: "第一条" }));
+    act(() => pushToast({ kind: "info", message: "第二条" }));
     expect(screen.getByText("第一条")).toBeInTheDocument();
     expect(screen.getByText("第二条")).toBeInTheDocument();
-    act(() => vi.advanceTimersByTime(3000));
+    act(() => vi.advanceTimersByTime(4000));
     expect(screen.queryByText("第一条")).not.toBeInTheDocument();
     expect(screen.queryByText("第二条")).not.toBeInTheDocument();
   });
 
   it("dismisses immediately when the close button is clicked", () => {
-    vi.useFakeTimers();
     renderHarness();
-    act(() => showToast("扫描失败，详见日志"));
+    act(() => pushToast({ kind: "error", message: "扫描失败，详见日志" }));
     fireEvent.click(screen.getByRole("button", { name: "关闭" }));
     expect(screen.queryByText("扫描失败，详见日志")).not.toBeInTheDocument();
   });
 
-  it("applies the type class for coloring (success/error/info)", () => {
-    vi.useFakeTimers();
+  it("applies the data-kind attribute for success/error/info", () => {
     renderHarness();
-    act(() => showToast("已完成", "success"));
-    const ok = screen.getByText("已完成").closest(".toast-item");
-    expect(ok!.className).toContain("toast-success");
-    act(() => showToast("出错了", "error"));
-    const err = screen.getByText("出错了").closest(".toast-item");
-    expect(err!.className).toContain("toast-error");
-    act(() => showToast("默认提示"));
-    const info = screen.getByText("默认提示").closest(".toast-item");
-    expect(info!.className).toContain("toast-info");
+    act(() => pushToast({ kind: "success", message: "已完成" }));
+    const ok = screen.getByText("已完成").closest("[data-kind]");
+    expect(ok).toHaveAttribute("data-kind", "success");
+    act(() => pushToast({ kind: "error", message: "出错了" }));
+    const err = screen.getByText("出错了").closest("[data-kind]");
+    expect(err).toHaveAttribute("data-kind", "error");
+    act(() => pushToast({ kind: "info", message: "默认提示" }));
+    const info = screen.getByText("默认提示").closest("[data-kind]");
+    expect(info).toHaveAttribute("data-kind", "info");
   });
 });
