@@ -371,7 +371,7 @@ describe("DatasetsPage", () => {
     );
     expect(invoke).not.toHaveBeenCalledWith("fan_home");
     eventMock.emit("receive://progress", JSON.stringify({ type: "conn", mode: "direct" }));
-    expect(await screen.findByText("P2P直连")).toBeInTheDocument();
+    expect(await screen.findByText("🚀 direct")).toBeInTheDocument();
     eventMock.emit(
       "receive://progress",
       JSON.stringify({ type: "progress", sent: 512, total: 1024, pct: 50, chunks: 1 })
