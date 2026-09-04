@@ -444,10 +444,7 @@ describe("DatasetsPage", () => {
     eventMock.emit("share://code", "8-purple-hammer");
     expect(await screen.findByText("8-purple-hammer")).toBeInTheDocument();
     // 关闭弹层（点击遮罩）
-    const modalTitle = screen
-      .getAllByText("Oryza_sativa_v1")
-      .find((el) => el.closest(".modal"));
-    fireEvent.click(modalTitle!.closest(".modal") as HTMLElement);
+    fireEvent.click(screen.getByRole("dialog"));
     // 页面级共享面板接管：配对码仍在，进度事件继续驱动面板
     expect(await screen.findByText("8-purple-hammer")).toBeInTheDocument();
     eventMock.emit(

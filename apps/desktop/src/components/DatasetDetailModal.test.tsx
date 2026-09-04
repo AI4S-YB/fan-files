@@ -80,7 +80,7 @@ describe("DatasetDetailModal", () => {
 
   it("calls onClose when the backdrop is clicked", () => {
     renderModal();
-    fireEvent.click(screen.getByText("Oryza_sativa_v1").closest(".modal") as HTMLElement);
+    fireEvent.click(screen.getByRole("dialog"));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
