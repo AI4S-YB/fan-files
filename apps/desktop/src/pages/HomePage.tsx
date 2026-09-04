@@ -54,10 +54,36 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
   return (
     <div className="page">
       {loading ? null : !configured ? (
-        <div className="empty-cta">
-          <p>先告诉 fan-files 你的数据在哪里</p>
-          <button className="primary" onClick={onGoSettings}>
-            📁 选择目录开始扫描
+        <div
+          className="empty-cta anim-fade-up"
+          style={{
+            padding: "60px 40px",
+            textAlign: "center",
+            background: "hsl(var(--bg-elevated))",
+            border: "1px dashed hsl(var(--border))",
+            borderRadius: "var(--radius-lg)",
+            maxWidth: 480,
+            margin: "40px auto",
+          }}
+        >
+          <div style={{ fontSize: 40, marginBottom: 12 }}>📁</div>
+          <p
+            style={{
+              color: "hsl(var(--fg))",
+              fontSize: 15,
+              fontWeight: 500,
+              margin: "0 0 16px",
+            }}
+          >
+            先告诉 fan-files 你的数据在哪里
+          </p>
+          <button
+            type="button"
+            onClick={onGoSettings}
+            className="btn btn-primary transition-base"
+            style={{ height: 38, padding: "0 20px", fontSize: 14 }}
+          >
+            选择目录开始扫描
           </button>
         </div>
       ) : (
@@ -78,13 +104,10 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
             ].map((c) => (
               <div
                 key={c.label}
+                className="card-interactive"
                 style={{
                   position: "relative",
                   padding: 16,
-                  background: "hsl(var(--bg-elevated))",
-                  border: "1px solid hsl(var(--border))",
-                  borderRadius: "var(--radius-lg)",
-                  boxShadow: "var(--shadow-sm)",
                   overflow: "hidden",
                 }}
               >
@@ -102,22 +125,36 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
                   style={{
                     display: "flex",
                     alignItems: "center",
-                    gap: 6,
+                    gap: 8,
                     fontSize: 12,
                     color: "hsl(var(--fg-muted))",
-                    marginBottom: 6,
+                    marginBottom: 8,
                   }}
                 >
-                  <span aria-hidden="true">{c.icon}</span>
+                  <span
+                    aria-hidden="true"
+                    style={{
+                      width: 22,
+                      height: 22,
+                      borderRadius: 6,
+                      background: "hsl(var(--bg))",
+                      border: "1px solid hsl(var(--border))",
+                      display: "grid",
+                      placeItems: "center",
+                      fontSize: 12,
+                    }}
+                  >
+                    {c.icon}
+                  </span>
                   <span>{c.label}</span>
                 </div>
                 <div
                   style={{
-                    fontSize: 22,
+                    fontSize: 24,
                     fontWeight: 700,
                     color: "hsl(var(--fg))",
                     fontVariantNumeric: "tabular-nums",
-                    letterSpacing: "-0.01em",
+                    letterSpacing: "-0.02em",
                   }}
                   title={countTitle}
                 >
