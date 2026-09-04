@@ -3,15 +3,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar, Page } from "./components/Sidebar";
 import EngineBanner from "./components/EngineBanner";
+import ThemeToggle from "./components/ThemeToggle";
 import HomePage from "./pages/HomePage";
 import DatasetsPage from "./pages/DatasetsPage";
 import SearchPage from "./pages/SearchPage";
 import SettingsPage from "./pages/SettingsPage";
 import ToastProvider from "./components/Toast";
 import { setApiBase } from "./api";
+import { useTheme } from "./hooks/useTheme";
 import "./App.css";
 
 export default function App() {
+  useTheme();
   const [page, setPage] = useState<Page>("home");
   const [engineError, setEngineError] = useState<string | null>(null);
 
@@ -66,9 +69,43 @@ export default function App() {
 
   return (
     <ToastProvider>
-      <div className="app">
+      <div className="app" style={{ display: "flex", height: "100vh", background: "hsl(var(--bg))" }}>
         <Sidebar page={page} onSelect={setPage} />
-        <main className="content">
+        <main
+          style={{
+            flex: 1,
+            padding: "20px 24px",
+            overflow: "auto",
+            background: "hsl(var(--bg))",
+          }}
+        >
+          <header
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: "20px",
+              paddingBottom: "12px",
+              borderBottom: "1px solid hsl(var(--border))",
+            }}
+          >
+            <div>
+              <h1
+                style={{
+                  fontSize: "1.25rem",
+                  fontWeight: 700,
+                  margin: 0,
+                  color: "hsl(var(--fg))",
+                  letterSpacing: "-0.01em",
+                }}
+              >
+                {page === "home" ? "首页" :
+                 page === "datasets" ? "数据集" :
+                 page === "search" ? "搜索" : "设置"}
+              </h1>
+            </div>
+            <ThemeToggle compact />
+          </header>
           <EngineBanner error={engineError} onRetry={retryEngine} />
           {page === "home" && <HomePage onGoSettings={() => setPage("settings")} />}
           {page === "datasets" && <DatasetsPage />}

@@ -53,7 +53,6 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
 
   return (
     <div className="page">
-      <h2>首页</h2>
       {loading ? null : !configured ? (
         <div className="empty-cta">
           <p>先告诉 fan-files 你的数据在哪里</p>
@@ -63,24 +62,73 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
         </div>
       ) : (
         <>
-          <div className="stat-cards">
-            <div className="stat-card" title={countTitle}>
-              <b>{stats ? `${approx}${stats.datasets_upper_bound.toLocaleString()}` : "—"}</b>
-              <span>数据集</span>
-            </div>
-            {/* GUI-T4: 统计卡补全资产数（Stats.assets_upper_bound 由后端聚合） */}
-            <div className="stat-card" title={countTitle}>
-              <b>{stats ? `${approx}${stats.assets_upper_bound.toLocaleString()}` : "—"}</b>
-              <span>资产</span>
-            </div>
-            <div className="stat-card" title={countTitle}>
-              <b>{stats ? `${approx}${stats.files_upper_bound.toLocaleString()}` : "—"}</b>
-              <span>文件</span>
-            </div>
-            <div className="stat-card">
-              <b>{lastScan}</b>
-              <span>最近扫描</span>
-            </div>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+              gap: 12,
+              marginBottom: 20,
+            }}
+          >
+            {[
+              { label: "数据集", value: stats?.datasets_upper_bound, icon: "🗂️" },
+              { label: "资产", value: stats?.assets_upper_bound, icon: "📦" },
+              { label: "文件", value: stats?.files_upper_bound, icon: "📄" },
+              { label: "最近扫描", value: null, icon: "🕐", text: lastScan },
+            ].map((c) => (
+              <div
+                key={c.label}
+                style={{
+                  position: "relative",
+                  padding: 16,
+                  background: "hsl(var(--bg-elevated))",
+                  border: "1px solid hsl(var(--border))",
+                  borderRadius: "var(--radius-lg)",
+                  boxShadow: "var(--shadow-sm)",
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  aria-hidden="true"
+                  style={{
+                    position: "absolute",
+                    top: 0, left: 0, right: 0,
+                    height: 3,
+                    background:
+                      "linear-gradient(90deg, hsl(var(--primary)), hsl(199 89% 60%))",
+                  }}
+                />
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    fontSize: 12,
+                    color: "hsl(var(--fg-muted))",
+                    marginBottom: 6,
+                  }}
+                >
+                  <span aria-hidden="true">{c.icon}</span>
+                  <span>{c.label}</span>
+                </div>
+                <div
+                  style={{
+                    fontSize: 22,
+                    fontWeight: 700,
+                    color: "hsl(var(--fg))",
+                    fontVariantNumeric: "tabular-nums",
+                    letterSpacing: "-0.01em",
+                  }}
+                  title={countTitle}
+                >
+                  {c.text !== undefined
+                    ? c.text
+                    : c.value != null
+                      ? `${approx}${c.value.toLocaleString()}`
+                      : "—"}
+                </div>
+              </div>
+            ))}
           </div>
           <ScanPanel onDone={refreshStats} />
         </>

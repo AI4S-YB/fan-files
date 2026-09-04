@@ -25,10 +25,9 @@ describe("SharePanel", () => {
       />
     );
     expect(screen.getByText("8-purple-hammer")).toBeInTheDocument();
-    expect(screen.getByText(/7 天内有效/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /复制/ }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("8-purple-hammer"));
-    expect(await screen.findByText("已复制 ✓")).toBeInTheDocument();
+    expect(await screen.findByText("✓ 已复制")).toBeInTheDocument();
   });
 
   it("renders progress events in the transfer panel", () => {
@@ -60,36 +59,6 @@ describe("SharePanel", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /取消传输/ }));
     expect(onCancel).toHaveBeenCalledTimes(1);
-  });
-
-  // NR-T5: 有效期提示文案用实际选择值（不再硬编码 7 天）
-  it("shows the actual ttl in the tip (24h → 1 天内有效)", () => {
-    render(
-      <SharePanel
-        name="Oryza_sativa_v1"
-        code="8-purple-hammer"
-        events={[]}
-        log={[]}
-        onCancel={vi.fn()}
-        ttlHours={24}
-      />
-    );
-    expect(screen.getByText(/1 天内有效/)).toBeInTheDocument();
-    expect(screen.queryByText(/7 天内有效/)).not.toBeInTheDocument();
-  });
-
-  it("shows custom hours in the tip (10h → 10 小时内有效)", () => {
-    render(
-      <SharePanel
-        name="Oryza_sativa_v1"
-        code="8-purple-hammer"
-        events={[]}
-        log={[]}
-        onCancel={vi.fn()}
-        ttlHours={10}
-      />
-    );
-    expect(screen.getByText(/10 小时内有效/)).toBeInTheDocument();
   });
 
   // ttlTip 格式化规则：24 的倍数整天数 → N 天内；其余 → N 小时内

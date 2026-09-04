@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 
 // 传输事件（引擎 FAN_JSON_PROGRESS=1 的 JSONL 事件行 JSON.parse 后分发）。
 // 字段与 crates/fan-files/src/commands/transfer.rs 的 json_event_value 一致。
@@ -17,7 +17,7 @@ interface Props {
 }
 
 // 字节 → 人类可读（B/KB/MB/GB，保留 1 位小数）
-function formatBytes(n: number): string {
+function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB", "TB"];
   let v = n;
@@ -29,11 +29,11 @@ function formatBytes(n: number): string {
   return `${v.toFixed(1)} ${units[u]}`;
 }
 
-// 剩余秒数 → 人类可读
-function formatEta(secs: number): string {
-  if (secs < 60) return `剩余 ${Math.ceil(secs)} 秒`;
-  if (secs < 3600) return `剩余 ${Math.ceil(secs / 60)} 分钟`;
-  return `剩余 ${(secs / 3600).toFixed(1)} 小时`;
+// 秒 → 人类可读（秒/分钟/小时）
+function fmtSec(secs: number): string {
+  if (secs < 60) return `${Math.ceil(secs)}s`;
+  if (secs < 3600) return `${Math.ceil(secs / 60)}m`;
+  return `${(secs / 3600).toFixed(1)}h`;
 }
 
 // 连接模式徽标文案与样式（direct→绿 / relay→橙 / punching→蓝）
@@ -76,7 +76,7 @@ export default function TransferPanel({ name, events, log, onCancel }: Props) {
   }, [events]);
 
   // 剩余时间估计（无足够样本 / 未开始时不显示）
-  let eta: string | null = null;
+  let etaSec: number | null = null;
   if (progress && !terminal && progress.total > 0) {
     const pts = speedRef.current;
     if (pts.length >= 2) {
@@ -85,7 +85,22 @@ export default function TransferPanel({ name, events, log, onCancel }: Props) {
       const dt = (lastP.t - first.t) / 1000;
       const ds = lastP.sent - first.sent;
       if (dt >= 0.5 && ds > 0) {
-        eta = formatEta((progress.total - progress.sent) / (ds / dt));
+        etaSec = (progress.total - progress.sent) / (ds / dt);
+      }
+    }
+  }
+
+  // 派生速度（B/s），与 ETA 共享同一份样本
+  let speedBps: number | null = null;
+  if (progress && !terminal) {
+    const pts = speedRef.current;
+    if (pts.length >= 2) {
+      const first = pts[0];
+      const lastP = pts[pts.length - 1];
+      const dt = (lastP.t - first.t) / 1000;
+      const ds = lastP.sent - first.sent;
+      if (dt >= 0.5 && ds > 0) {
+        speedBps = ds / dt;
       }
     }
   }
@@ -95,7 +110,7 @@ export default function TransferPanel({ name, events, log, onCancel }: Props) {
   if (terminal) {
     if (terminal.type === "done") {
       statusText = terminal.ok
-        ? `✅ 传输完成（共 ${formatBytes(terminal.bytes)}，用时 ${Math.round(terminal.elapsed_secs)} 秒）`
+        ? `✅ 传输完成（共 ${fmtBytes(terminal.bytes)}，用时 ${Math.round(terminal.elapsed_secs)} 秒）`
         : "❌ 传输失败或已取消";
     } else {
       statusText = `⚠️ ${terminal.msg}`;
@@ -112,38 +127,130 @@ export default function TransferPanel({ name, events, log, onCancel }: Props) {
   }
 
   // 进度条：最新 progress 的 pct（无事件时为 0）
-  const pct = progress ? Math.max(0, Math.min(100, Math.round(progress.pct))) : 0;
+  const pct = progress ? Math.max(0, Math.min(100, progress.pct)) : 0;
+  const done = progress?.sent ?? 0;
+  const total = progress?.total ?? 0;
+
+  // 模式徽标（direct/relay/punching → 不同色调 token）
+  let modeBadge: React.ReactNode = null;
+  if (conn) {
+    const meta = CONN_META[conn.mode];
+    const label = meta?.label ?? conn.mode;
+    const cls = meta?.cls ?? "badge-other";
+    let bg = "hsl(var(--primary))";
+    let fg = "hsl(var(--primary-fg, var(--bg)))";
+    if (conn.mode === "relay") {
+      bg = "hsl(var(--warning, 35 90% 55%))";
+      fg = "hsl(var(--warning-fg, 35 90% 15%))";
+    } else if (conn.mode === "punching") {
+      bg = "hsl(var(--accent, 210 90% 55%))";
+      fg = "hsl(var(--accent-fg, 210 90% 15%))";
+    }
+    modeBadge = (
+      <span
+        className={`badge ${cls}`}
+        style={{
+          background: bg,
+          color: fg,
+          fontSize: 11,
+          fontWeight: 600,
+          padding: "2px 8px",
+          borderRadius: 999,
+        }}
+      >
+        {label}
+      </span>
+    );
+  }
+
+  // 续传徽标
+  let resumeBadge: React.ReactNode = null;
+  if (resume) {
+    const pct = Math.round((resume.done / resume.total) * 100);
+    resumeBadge = (
+      <span
+        className="badge badge-resume"
+        style={{
+          background: "hsl(var(--muted, var(--border)))",
+          color: "hsl(var(--fg-muted))",
+          fontSize: 11,
+          fontWeight: 600,
+          padding: "2px 8px",
+          borderRadius: 999,
+        }}
+      >
+        已恢复 {pct}%
+      </span>
+    );
+  }
 
   return (
     <div className="transfer-panel">
-      <div className="transfer-file">
-        <span className="transfer-name">📦 {name}</span>
-      </div>
-      <div className="transfer-badges">
-        {conn && (
-          <span className={`badge ${CONN_META[conn.mode]?.cls ?? "badge-other"}`}>
-            {CONN_META[conn.mode]?.label ?? conn.mode}
-          </span>
-        )}
-        {resume && (
-          <span className="badge badge-resume">
-            已恢复 {Math.round((resume.done / resume.total) * 100)}%
-          </span>
-        )}
-        {eta && <span className="transfer-eta">{eta}</span>}
-      </div>
-      <div className="progress-track">
+      <div className="card" style={{ marginTop: 10 }}>
         <div
-          className="progress-fill"
-          role="progressbar"
-          aria-valuenow={pct}
-          aria-valuemin={0}
-          aria-valuemax={100}
-          style={{ width: `${pct}%` }}
-        />
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            marginBottom: 8,
+          }}
+        >
+          <span style={{ fontSize: 14, fontWeight: 600, color: "hsl(var(--fg))" }}>
+            {name}
+          </span>
+          {modeBadge}
+          {resumeBadge}
+        </div>
+
+        {progress != null && (
+          <>
+            <div
+              role="progressbar"
+              aria-valuenow={Math.round(pct)}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              style={{
+                position: "relative",
+                height: 8,
+                background: "hsl(var(--border))",
+                borderRadius: 999,
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  width: `${pct}%`,
+                  height: "100%",
+                  background: "hsl(var(--primary))",
+                  transition: "width 200ms ease",
+                }}
+              />
+            </div>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                marginTop: 4,
+                fontSize: 12,
+                color: "hsl(var(--fg-muted))",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              <span>
+                {fmtBytes(done)} / {fmtBytes(total)} · {pct.toFixed(1)}%
+              </span>
+              {speedBps != null && (
+                <span>
+                  {fmtBytes(speedBps)}/s
+                  {etaSec != null && ` · ETA ${fmtSec(etaSec)}`}
+                </span>
+              )}
+            </div>
+          </>
+        )}
       </div>
       <div className="transfer-meta">
-        {progress ? `${formatBytes(progress.sent)} / ${formatBytes(progress.total)}（${pct}%） · ` : ""}
+        {progress ? `${fmtBytes(progress.sent)} / ${fmtBytes(progress.total)}（${pct}%） · ` : ""}
         {statusText}
       </div>
       <div className="transfer-actions">

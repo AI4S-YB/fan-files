@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ProfilePicker from "../components/ProfilePicker";
+import ThemeToggle from "../components/ThemeToggle";
 import type { CcProfile } from "../components/ProfilePicker";
 
 // 与后端 T5 read_config 命令返回的形状一致（见 src-tauri FanConfig）。
@@ -247,7 +248,29 @@ export default function SettingsPage() {
 
   return (
     <div className="page settings">
-      <h2>设置</h2>
+
+      <div className="card" style={{ marginBottom: 12 }}>
+        <h3
+          style={{
+            margin: "0 0 10px",
+            fontSize: 15,
+            fontWeight: 600,
+            color: "hsl(var(--fg))",
+          }}
+        >
+          外观
+        </h3>
+        <div
+          style={{
+            fontSize: 13,
+            color: "hsl(var(--fg-muted))",
+            marginBottom: 8,
+          }}
+        >
+          切换浅色 / 暗色 / 跟随系统（重启保留选择）
+        </div>
+        <ThemeToggle />
+      </div>
 
       <section className="settings-section">
         <h3>数据目录</h3>

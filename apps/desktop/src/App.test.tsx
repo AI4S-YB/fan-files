@@ -72,8 +72,8 @@ describe("App shell", () => {
     const { container } = render(<App />);
     // HomePage 挂载后有异步状态更新，等 ScanPanel 出现以 flush 掉它们
     await screen.findByText("🔄 重新扫描");
-    // 页面正文里也有"首页"等文案（如 h2），断言范围限定在侧边栏内
-    const sidebar = within(container.querySelector(".sidebar") as HTMLElement);
+    // 页面正文里也有"首页"等文案（如 h2），断言范围限定在侧边栏内（aria-label="主导航"）
+    const sidebar = within(container.querySelector('nav[aria-label="主导航"]') as HTMLElement);
     for (const label of ["首页", "数据集", "搜索", "设置"]) {
       expect(sidebar.getByText(label)).toBeInTheDocument();
     }
@@ -81,10 +81,10 @@ describe("App shell", () => {
   it("switches page on sidebar click", async () => {
     const { container } = render(<App />);
     await screen.findByText("🔄 重新扫描");
-    const sidebar = within(container.querySelector(".sidebar") as HTMLElement);
+    const sidebar = within(container.querySelector('nav[aria-label="主导航"]') as HTMLElement);
     const btn = sidebar.getByText("数据集").closest("button")!;
     fireEvent.click(btn);
-    expect(btn).toHaveClass("side-item", "active");
+    expect(btn).toHaveAttribute("aria-current", "page");
   });
   it("sets api base from get_share_port", async () => {
     render(<App />);

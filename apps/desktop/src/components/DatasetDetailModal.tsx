@@ -36,9 +36,72 @@ export default function DatasetDetailModal({
   // 下拉值：24 / 168 直选；其他值视为自定义（渲染小时输入框）
   const customTtl = ttlHours !== 24 && ttlHours !== 168;
   return (
-    <div className="modal" onClick={onClose}>
-      <div className="modal-body" onClick={(e) => e.stopPropagation()}>
-        <h3>{detail.name}</h3>
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="数据集详情"
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "hsl(var(--fg) / .45)",
+        backdropFilter: "blur(6px)",
+        WebkitBackdropFilter: "blur(6px)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 50,
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "hsl(var(--bg))",
+          borderRadius: "var(--radius-xl)",
+          padding: 24,
+          width: "min(640px, 90vw)",
+          maxHeight: "80vh",
+          overflow: "auto",
+          boxShadow: "var(--shadow-lg)",
+          border: "1px solid hsl(var(--border))",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            marginBottom: 12,
+          }}
+        >
+          <h3
+            style={{
+              margin: 0,
+              fontSize: 17,
+              fontWeight: 600,
+              color: "hsl(var(--fg))",
+            }}
+          >
+            {detail.name}
+          </h3>
+          <button
+            type="button"
+            aria-label="关闭"
+            onClick={onClose}
+            style={{
+              width: 32,
+              height: 32,
+              borderRadius: "50%",
+              border: "none",
+              background: "transparent",
+              color: "hsl(var(--fg-muted))",
+              fontSize: 18,
+              cursor: "pointer",
+            }}
+          >
+            ✕
+          </button>
+        </div>
         <p>
           物种: {detail.species ?? "—"} · 路径: {detail.path ?? "—"}
         </p>
