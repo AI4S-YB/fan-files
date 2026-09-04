@@ -3,15 +3,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar, Page } from "./components/Sidebar";
 import EngineBanner from "./components/EngineBanner";
+import ThemeToggle from "./components/ThemeToggle";
 import HomePage from "./pages/HomePage";
 import DatasetsPage from "./pages/DatasetsPage";
 import SearchPage from "./pages/SearchPage";
 import SettingsPage from "./pages/SettingsPage";
 import ToastProvider from "./components/Toast";
 import { setApiBase } from "./api";
+import { useTheme } from "./hooks/useTheme";
 import "./App.css";
 
 export default function App() {
+  useTheme();
   const [page, setPage] = useState<Page>("home");
   const [engineError, setEngineError] = useState<string | null>(null);
 
@@ -69,6 +72,16 @@ export default function App() {
       <div className="app">
         <Sidebar page={page} onSelect={setPage} />
         <main className="content">
+          <header
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "flex-end",
+              marginBottom: 12,
+            }}
+          >
+            <ThemeToggle compact />
+          </header>
           <EngineBanner error={engineError} onRetry={retryEngine} />
           {page === "home" && <HomePage onGoSettings={() => setPage("settings")} />}
           {page === "datasets" && <DatasetsPage />}
