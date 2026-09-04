@@ -15,15 +15,19 @@ describe("TransferPanel", () => {
   it("shows file name and formatted total size", () => {
     renderPanel([{ type: "progress", sent: 512, total: 2 * 1024 * 1024, pct: 0.02, chunks: 1 }]);
     expect(screen.getByText(/rice\.tar\.gz/)).toBeInTheDocument();
-    expect(screen.getByText(/2\.0 MB/)).toBeInTheDocument();
+    // 2.0 MB appears in both the new card and the legacy transfer-meta line.
+    expect(screen.getAllByText(/2\.0 MB/).length).toBeGreaterThan(0);
   });
 
   it("renders progress bar from progress event (pct + sent/total)", () => {
     renderPanel([{ type: "progress", sent: 512, total: 1024, pct: 50, chunks: 1 }]);
     const bar = screen.getByRole("progressbar");
     expect(bar).toHaveAttribute("aria-valuenow", "50");
-    expect(bar).toHaveStyle({ width: "50%" });
-    expect(screen.getByText(/512 B \/ 1\.0 KB/)).toBeInTheDocument();
+    // 8px slim bar; width set on inner fill div
+    expect(bar).toHaveStyle({ height: "8px" });
+    const fill = bar.querySelector("div");
+    expect(fill).toHaveStyle({ width: "50%" });
+    expect(screen.getAllByText(/512 B \/ 1\.0 KB/).length).toBeGreaterThan(0);
   });
 
   it("renders conn badge: direct → P2P直连", () => {
@@ -108,7 +112,7 @@ describe("TransferPanel", () => {
           onCancel={vi.fn()}
         />
       );
-      expect(screen.getByText("剩余 8 秒")).toBeInTheDocument();
+      expect(screen.getByText((t) => typeof t === "string" && t.includes("ETA 8s"))).toBeInTheDocument();
       act(() => vi.advanceTimersByTime(1000));
       // 新传输：事件流清空 → 速度样本重置
       rerender(
@@ -141,8 +145,8 @@ describe("TransferPanel", () => {
         />
       );
       // 重置后样本为 0@3s/1000@4s → 1s；混入旧样本则 (2000-1500)/(1000/4s)=2s
-      expect(screen.getByText("剩余 1 秒")).toBeInTheDocument();
-      expect(screen.queryByText("剩余 2 秒")).not.toBeInTheDocument();
+      expect(screen.getByText((t) => typeof t === "string" && t.includes("ETA 1s"))).toBeInTheDocument();
+      expect(screen.queryByText((t) => typeof t === "string" && t.includes("ETA 2s"))).not.toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
