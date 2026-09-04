@@ -247,7 +247,6 @@ export default function SettingsPage() {
 
   return (
     <div className="page settings">
-      <h2>设置</h2>
 
       <section className="settings-section">
         <h3>数据目录</h3>

@@ -53,7 +53,6 @@ export default function HomePage({ onGoSettings }: { onGoSettings: () => void })
 
   return (
     <div className="page">
-      <h2>首页</h2>
       {loading ? null : !configured ? (
         <div className="empty-cta">
           <p>先告诉 fan-files 你的数据在哪里</p>

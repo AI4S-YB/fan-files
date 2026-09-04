@@ -69,17 +69,41 @@ export default function App() {
 
   return (
     <ToastProvider>
-      <div className="app">
+      <div className="app" style={{ display: "flex", height: "100vh", background: "hsl(var(--bg))" }}>
         <Sidebar page={page} onSelect={setPage} />
-        <main className="content">
+        <main
+          style={{
+            flex: 1,
+            padding: "20px 24px",
+            overflow: "auto",
+            background: "hsl(var(--bg))",
+          }}
+        >
           <header
             style={{
               display: "flex",
               alignItems: "center",
-              justifyContent: "flex-end",
-              marginBottom: 12,
+              justifyContent: "space-between",
+              marginBottom: "20px",
+              paddingBottom: "12px",
+              borderBottom: "1px solid hsl(var(--border))",
             }}
           >
+            <div>
+              <h1
+                style={{
+                  fontSize: "1.25rem",
+                  fontWeight: 700,
+                  margin: 0,
+                  color: "hsl(var(--fg))",
+                  letterSpacing: "-0.01em",
+                }}
+              >
+                {page === "home" ? "首页" :
+                 page === "datasets" ? "数据集" :
+                 page === "search" ? "搜索" : "设置"}
+              </h1>
+            </div>
             <ThemeToggle compact />
           </header>
           <EngineBanner error={engineError} onRetry={retryEngine} />

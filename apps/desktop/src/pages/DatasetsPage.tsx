@@ -323,7 +323,6 @@ export default function DatasetsPage() {
 
   return (
     <div className="page">
-      <h2>数据集</h2>
       {/* P2P 接收入口：输入对方发来的配对码接收数据 */}
       <div className="receive-bar">
         <input

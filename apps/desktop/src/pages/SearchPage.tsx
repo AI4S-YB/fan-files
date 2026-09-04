@@ -179,7 +179,6 @@ export default function SearchPage() {
 
   return (
     <div className="page">
-      <h2>搜索</h2>
       {llmConfigured ? (
         /* NR-T5: 对话模式（有模型）：消息气泡列表 + 输入框，可多轮追问 */
         <>
