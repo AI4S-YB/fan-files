@@ -27,15 +27,15 @@ export default function SharePanel({ name, code, events, log, onCancel, ttlHours
     <div className="share-panel">
       {code && (
         <div
-          className="share-code"
+          className="anim-fade-up"
           style={{
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
-            gap: 8,
-            padding: 16,
+            gap: 12,
+            padding: 20,
             background: "hsl(var(--primary) / .06)",
-            border: "1px solid hsl(var(--primary) / .25)",
+            border: "1px solid hsl(var(--primary) / .2)",
             borderRadius: "var(--radius-lg)",
           }}
         >
@@ -44,25 +44,31 @@ export default function SharePanel({ name, code, events, log, onCancel, ttlHours
               fontSize: 11,
               color: "hsl(var(--fg-muted))",
               textTransform: "uppercase",
-              letterSpacing: "0.05em",
+              letterSpacing: "0.1em",
+              fontWeight: 600,
             }}
           >
             配对码
           </div>
           <div
+            className="anim-pulse-ring"
             style={{
-              fontSize: 26,
+              fontSize: 28,
               fontFamily: "var(--font-mono)",
               fontWeight: 700,
               color: "hsl(var(--primary))",
               letterSpacing: "0.05em",
+              padding: "8px 16px",
+              borderRadius: "var(--radius)",
+              background: "hsl(var(--bg))",
+              border: "1px solid hsl(var(--primary) / .3)",
             }}
           >
             {code}
           </div>
           <button
             type="button"
-            className="btn btn-secondary btn-sm"
+            className="btn btn-secondary transition-base"
             onClick={() => {
               navigator.clipboard.writeText(code);
               setCopied(true);
