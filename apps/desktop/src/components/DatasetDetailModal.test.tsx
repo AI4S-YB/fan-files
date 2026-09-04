@@ -124,7 +124,7 @@ describe("DatasetDetailModal", () => {
   it("renders the share panel with pairing code from page-level state", () => {
     renderModal({ share: { status: "code", code: "8-purple-hammer" } });
     expect(screen.getByText("8-purple-hammer")).toBeInTheDocument();
-    expect(screen.getByText(/7 天内有效/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /复制/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /取消传输/ })).toBeInTheDocument();
   });
 

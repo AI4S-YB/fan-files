@@ -19,38 +19,59 @@ interface Props {
 
 // GUI-T5: 从 DatasetDetailModal 提取的共享面板（配对码 + 传输面板），
 // 弹层内与页面级共用——页面级实例保证弹层关闭后传输仍可跟踪/取消。
-export default function SharePanel({ name, code, events, log, onCancel, ttlHours = 168 }: Props) {
+export default function SharePanel({ name, code, events, log, onCancel, ttlHours: _ttlHours = 168 }: Props) {
   // 配对码复制反馈
   const [copied, setCopied] = useState(false);
-
-  // 复制配对码到剪贴板（navigator.clipboard；非安全上下文等失败静默）
-  async function copyCode() {
-    if (!code) return;
-    try {
-      await navigator.clipboard.writeText(code);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* 剪贴板不可用时静默 */
-    }
-  }
 
   return (
     <div className="share-panel">
       {code && (
-        <div className="share-code">
-          <div className="share-code-label">把下面的配对码发给对方，对方执行：</div>
-          <div className="share-code-row">
-            <code className="share-code-value">{code}</code>
-            <button className="secondary copy-btn" onClick={copyCode}>
-              {copied ? "已复制 ✓" : "📋 复制"}
-            </button>
+        <div
+          className="share-code"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 8,
+            padding: 16,
+            background: "hsl(var(--primary) / .06)",
+            border: "1px solid hsl(var(--primary) / .25)",
+            borderRadius: "var(--radius-lg)",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 11,
+              color: "hsl(var(--fg-muted))",
+              textTransform: "uppercase",
+              letterSpacing: "0.05em",
+            }}
+          >
+            配对码
           </div>
-          <div className="share-code-cmd">
-            fan-files transfer get {code}
+          <div
+            style={{
+              fontSize: 26,
+              fontFamily: "var(--font-mono)",
+              fontWeight: 700,
+              color: "hsl(var(--primary))",
+              letterSpacing: "0.05em",
+            }}
+          >
+            {code}
           </div>
-          {/* NR-T4/T5 文案同步：配对码有效期提示用实际选择值（引擎默认 7 天） */}
-          <div className="share-code-tip">⏳ 配对码 {ttlTip(ttlHours)}</div>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            onClick={() => {
+              navigator.clipboard.writeText(code);
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1200);
+            }}
+            aria-label="复制配对码"
+          >
+            {copied ? "✓ 已复制" : "📋 复制"}
+          </button>
         </div>
       )}
       {/* 共享传输面板（进度/徽标/续传/取消 + 折叠原始日志） */}
