@@ -153,7 +153,7 @@ pub fn stun_query(sock: &UdpSocket, timeout: Duration) -> Option<SocketAddr> {
                 .wrapping_add(a);
             let mut t = [0u8; 12];
             t[..8].copy_from_slice(&mix.to_be_bytes());
-            t[8..].copy_from_slice(&c.to_be_bytes());
+            t[8..].copy_from_slice(&c.to_be_bytes()[..4]);
             t
         };
         let mut req = [0u8; 20];
