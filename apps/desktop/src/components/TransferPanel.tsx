@@ -37,12 +37,6 @@ function fmtSec(secs: number): string {
 }
 
 // 连接模式徽标文案与样式（direct→绿 / relay→橙 / punching→蓝）
-const CONN_META: Record<string, { label: string; cls: string }> = {
-  direct: { label: "P2P直连", cls: "badge-direct" },
-  relay: { label: "中继relay", cls: "badge-relay" },
-  punching: { label: "打洞中", cls: "badge-punching" },
-};
-
 export default function TransferPanel({ name, events, log, onCancel }: Props) {
   // 取各类事件的"最新一条"驱动面板（conn/progress/resume 各保留最新；done/error 即终态）
   const { conn, progress, resume, terminal } = useMemo(() => {
@@ -132,54 +126,23 @@ export default function TransferPanel({ name, events, log, onCancel }: Props) {
   const total = progress?.total ?? 0;
 
   // 模式徽标（direct/relay/punching → 不同色调 token）
-  let modeBadge: React.ReactNode = null;
-  if (conn) {
-    const meta = CONN_META[conn.mode];
-    const label = meta?.label ?? conn.mode;
-    const cls = meta?.cls ?? "badge-other";
-    let bg = "hsl(var(--primary))";
-    let fg = "hsl(var(--primary-fg, var(--bg)))";
-    if (conn.mode === "relay") {
-      bg = "hsl(var(--warning, 35 90% 55%))";
-      fg = "hsl(var(--warning-fg, 35 90% 15%))";
-    } else if (conn.mode === "punching") {
-      bg = "hsl(var(--accent, 210 90% 55%))";
-      fg = "hsl(var(--accent-fg, 210 90% 15%))";
-    }
-    modeBadge = (
-      <span
-        className={`badge ${cls}`}
-        style={{
-          background: bg,
-          color: fg,
-          fontSize: 11,
-          fontWeight: 600,
-          padding: "2px 8px",
-          borderRadius: 999,
-        }}
-      >
-        {label}
-      </span>
-    );
-  }
+  const modeBadge = conn ? (
+    conn.mode === "direct" ? (
+      <span className="badge badge-success">🚀 direct</span>
+    ) : conn.mode === "punching" ? (
+      <span className="badge badge-info">⚡ punching</span>
+    ) : (
+      <span className="badge badge-warning">📡 relay</span>
+    )
+  ) : null;
 
   // 续传徽标
   let resumeBadge: React.ReactNode = null;
   if (resume) {
-    const pct = Math.round((resume.done / resume.total) * 100);
+    const pct2 = Math.round((resume.done / resume.total) * 100);
     resumeBadge = (
-      <span
-        className="badge badge-resume"
-        style={{
-          background: "hsl(var(--muted, var(--border)))",
-          color: "hsl(var(--fg-muted))",
-          fontSize: 11,
-          fontWeight: 600,
-          padding: "2px 8px",
-          borderRadius: 999,
-        }}
-      >
-        已恢复 {pct}%
+      <span className="badge badge-resume">
+        ↻ resume {pct2}%
       </span>
     );
   }
@@ -223,8 +186,13 @@ export default function TransferPanel({ name, events, log, onCancel }: Props) {
                   height: "100%",
                   background: "hsl(var(--primary))",
                   transition: "width 200ms ease",
+                  position: "relative",
                 }}
-              />
+              >
+                {pct > 5 && pct < 95 && (
+                  <div className="shimmer-overlay" />
+                )}
+              </div>
             </div>
             <div
               style={{

@@ -40,6 +40,7 @@ export default function DatasetDetailModal({
       role="dialog"
       aria-modal="true"
       aria-label="数据集详情"
+      className="anim-scale-in"
       style={{
         position: "fixed",
         inset: 0,

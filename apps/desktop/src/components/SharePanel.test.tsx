@@ -43,7 +43,7 @@ describe("SharePanel", () => {
         onCancel={vi.fn()}
       />
     );
-    expect(screen.getByText("P2P直连")).toBeInTheDocument();
+    expect(screen.getByText("🚀 direct")).toBeInTheDocument();
     expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
   });
 

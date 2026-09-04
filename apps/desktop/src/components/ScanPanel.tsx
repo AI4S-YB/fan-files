@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { fetchStats } from "../api";
-import { useToast } from "./Toast";
+import { pushToast } from "./Toast";
 
 // read_config 返回形状（与 SettingsPage 的 FanConfig 同构）；预检只看 api_key
 interface FanConfig {
@@ -18,8 +18,7 @@ interface FanConfig {
 export default function ScanPanel({ onDone }: { onDone?: () => void }) {
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
-  const { showToast } = useToast();
-
+  
   useEffect(() => {
     let cancelled = false;
     invoke<boolean>("scan_state").then((s) => {
@@ -35,15 +34,15 @@ export default function ScanPanel({ onDone }: { onDone?: () => void }) {
         // 成功后拉一次统计拼"发现 N 个数据集"；失败（引擎未起等）退化为不带数的基础文案
         fetchStats()
           .then((stats) =>
-            showToast(
-              `扫描完成：发现 ${stats.datasets_upper_bound.toLocaleString()} 个数据集`,
-              "success"
-            )
+            pushToast({
+              kind: "success",
+              message: `扫描完成：发现 ${stats.datasets_upper_bound.toLocaleString()} 个数据集`,
+            })
           )
-          .catch(() => showToast("扫描完成", "success"));
+          .catch(() => pushToast({ kind: "success", message: "扫描完成" }));
       } else {
         // 非 0 退出码：扫描未完成，日志里有阶段明细
-        showToast("扫描失败，详见日志", "error");
+        pushToast({ kind: "error", message: "扫描失败，详见日志" });
       }
     });
     const un3 = listen<string>("scan://error", (e) => {
@@ -51,7 +50,7 @@ export default function ScanPanel({ onDone }: { onDone?: () => void }) {
       // 否则按钮永远停在"扫描中…"禁用态
       setRunning(false);
       setLines((ls) => [...ls, `扫描失败: ${e.payload}`]);
-      showToast("扫描失败，详见日志", "error");
+      pushToast({ kind: "error", message: "扫描失败，详见日志" });
     });
     return () => {
       cancelled = true;
@@ -59,7 +58,7 @@ export default function ScanPanel({ onDone }: { onDone?: () => void }) {
       un2.then((u) => u());
       un3.then((u) => u());
     };
-  }, [onDone, showToast]);
+  }, [onDone]);
 
   // LLM 预检：read_config 失败按未配置处理（询问一次，确认后仍可继续基础索引）。
   // 取消 → 不发扫描；用户可去设置页配置模型。
@@ -83,7 +82,7 @@ export default function ScanPanel({ onDone }: { onDone?: () => void }) {
     } catch (e) {
       setLines([`扫描失败: ${String(e)}`]);
       setRunning(false);
-      showToast("扫描失败，详见日志", "error");
+      pushToast({ kind: "error", message: "扫描失败，详见日志" });
     }
   }
 

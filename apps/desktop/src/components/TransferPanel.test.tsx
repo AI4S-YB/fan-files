@@ -30,22 +30,22 @@ describe("TransferPanel", () => {
     expect(screen.getAllByText(/512 B \/ 1\.0 KB/).length).toBeGreaterThan(0);
   });
 
-  it("renders conn badge: direct → P2P直连", () => {
+  it("renders conn badge: direct → 🚀 direct", () => {
     renderPanel([{ type: "conn", mode: "direct" }]);
-    expect(screen.getByText("P2P直连")).toBeInTheDocument();
+    expect(screen.getByText("🚀 direct")).toBeInTheDocument();
   });
-  it("renders conn badge: relay → 中继relay", () => {
+  it("renders conn badge: relay → 📡 relay", () => {
     renderPanel([{ type: "conn", mode: "relay" }]);
-    expect(screen.getByText("中继relay")).toBeInTheDocument();
+    expect(screen.getByText("📡 relay")).toBeInTheDocument();
   });
-  it("renders conn badge: punching → 打洞中", () => {
+  it("renders conn badge: punching → ⚡ punching", () => {
     renderPanel([{ type: "conn", mode: "punching" }]);
-    expect(screen.getByText("打洞中")).toBeInTheDocument();
+    expect(screen.getByText("⚡ punching")).toBeInTheDocument();
   });
 
   it("renders resume badge with percentage", () => {
     renderPanel([{ type: "resume", done: 34, total: 120 }]);
-    expect(screen.getByText(/已恢复 28%/)).toBeInTheDocument();
+    expect(screen.getByText(/↻ resume 28%/)).toBeInTheDocument();
   });
 
   it("shows done state and disables cancel on success", () => {

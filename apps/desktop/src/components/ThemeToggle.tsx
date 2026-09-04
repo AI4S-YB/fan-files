@@ -37,7 +37,9 @@ export default function ThemeToggle({ compact = false }: { compact?: boolean }) 
               borderRadius: "var(--radius-sm)",
               background: active ? "hsl(var(--bg))" : "transparent",
               color: active ? "hsl(var(--fg))" : "hsl(var(--fg-muted))",
-              boxShadow: active ? "var(--shadow-sm)" : "none",
+              boxShadow: active
+                ? "var(--shadow-sm), 0 0 0 1px hsl(var(--primary) / .5)"
+                : "none",
               cursor: "pointer",
               transition: "all 150ms ease",
             }}

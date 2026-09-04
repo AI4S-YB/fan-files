@@ -9,9 +9,17 @@ import DatasetsPage from "./pages/DatasetsPage";
 import SearchPage from "./pages/SearchPage";
 import SettingsPage from "./pages/SettingsPage";
 import ToastProvider from "./components/Toast";
+import { AppShell } from "./components/AppShell";
 import { setApiBase } from "./api";
 import { useTheme } from "./hooks/useTheme";
 import "./App.css";
+
+const TITLE: Record<Page, string> = {
+  home: "首页",
+  datasets: "数据集",
+  search: "搜索",
+  settings: "设置",
+};
 
 export default function App() {
   useTheme();
@@ -69,49 +77,34 @@ export default function App() {
 
   return (
     <ToastProvider>
-      <div className="app" style={{ display: "flex", height: "100vh", background: "hsl(var(--bg))" }}>
+      <div className="app" style={{ display: "flex", height: "100vh" }}>
         <Sidebar page={page} onSelect={setPage} />
-        <main
-          style={{
-            flex: 1,
-            padding: "20px 24px",
-            overflow: "auto",
-            background: "hsl(var(--bg))",
-          }}
+        <AppShell
+          title={TITLE[page]}
+          actions={<ThemeToggle compact />}
         >
-          <header
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              marginBottom: "20px",
-              paddingBottom: "12px",
-              borderBottom: "1px solid hsl(var(--border))",
-            }}
-          >
-            <div>
-              <h1
-                style={{
-                  fontSize: "1.25rem",
-                  fontWeight: 700,
-                  margin: 0,
-                  color: "hsl(var(--fg))",
-                  letterSpacing: "-0.01em",
-                }}
-              >
-                {page === "home" ? "首页" :
-                 page === "datasets" ? "数据集" :
-                 page === "search" ? "搜索" : "设置"}
-              </h1>
-            </div>
-            <ThemeToggle compact />
-          </header>
           <EngineBanner error={engineError} onRetry={retryEngine} />
-          {page === "home" && <HomePage onGoSettings={() => setPage("settings")} />}
-          {page === "datasets" && <DatasetsPage />}
-          {page === "search" && <SearchPage />}
-          {page === "settings" && <SettingsPage />}
-        </main>
+          {page === "home" && (
+            <div key="home" className="anim-fade-up">
+              <HomePage onGoSettings={() => setPage("settings")} />
+            </div>
+          )}
+          {page === "datasets" && (
+            <div key="datasets" className="anim-fade-up">
+              <DatasetsPage />
+            </div>
+          )}
+          {page === "search" && (
+            <div key="search" className="anim-fade-up">
+              <SearchPage />
+            </div>
+          )}
+          {page === "settings" && (
+            <div key="settings" className="anim-fade-up">
+              <SettingsPage />
+            </div>
+          )}
+        </AppShell>
       </div>
     </ToastProvider>
   );
