@@ -95,7 +95,7 @@ jobs:
           path: apps/desktop/fan-files-desktop-macOS-arm64.zip
 
   build-windows-desktop:
-    name: Windows Desktop (.msi)
+    name: Windows Desktop
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -114,6 +114,7 @@ jobs:
         run: choco install protoc -y
 
       - name: Build sidecars (Windows x86_64)
+        shell: bash
         run: cargo build --release -p fan-files -p fan-files-share
 
       - name: npm install
@@ -124,16 +125,34 @@ jobs:
         working-directory: apps/desktop
         run: npm test -- --run
 
-      # Windows: build .exe app + .msi installer (no DMG)
-      - name: Build Windows desktop
+      # Build portable .exe bundle first (reliable — always succeeds).
+      - name: Build Windows app bundle
         working-directory: apps/desktop
-        run: npm run tauri build -- --bundles app,msi
+        shell: bash
+        run: npm run tauri build -- --bundles app
+
+      - name: Zip the Windows app bundle
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          cd src-tauri/target/release/bundle/app
+          zip -r fan-files-windows-x86_64.zip fan-files-desktop/
+          ls -la *.zip
+
+      # Best-effort MSI installer: don't block the release if WiX fails in CI.
+      - name: Build Windows MSI installer (optional)
+        working-directory: apps/desktop
+        shell: bash
+        continue-on-error: true
+        run: npm run tauri build -- --bundles msi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: desktop-windows
-          path: apps/desktop/src-tauri/target/release/bundle/msi/*.msi
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/msi/*.msi
+            apps/desktop/fan-files-windows-x86_64.zip
 
   release:
     name: Create GitHub Release v0.2.7
