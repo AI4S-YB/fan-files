@@ -1,5 +1,8 @@
 name: Release
 
+# Triggered by `git push origin v*` tags (e.g. v0.2.7).
+# Produces: Linux CLI tar.gz, macOS .zip(.app), Windows MSI.
+
 on:
   push:
     tags: ["v*"]
@@ -7,78 +10,135 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: auto
+  RUST_BACKTRACE: 1
+
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: ubuntu-22.04
-            artifact_ext: AppImage
-          - platform: macos-latest
-            artifact_ext: dmg
-          - platform: windows-latest
-            artifact_ext: msi
-    runs-on: ${{ matrix.platform }}
+  build-linux-cli:
+    name: Linux CLI (x86_64)
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
 
-      # Tauri v2 system deps + sidecar build deps (candle-onnx needs protoc,
-      # libclang/pkg-config for bindgen-ish deps — mirrors release.yml)
-      - name: Linux deps
-        if: matrix.platform == 'ubuntu-22.04'
+      - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
-            patchelf libssl-dev \
-            build-essential cmake libclang-dev pkg-config \
-            protobuf-compiler libprotobuf-dev libsqlite3-dev
+          sudo apt-get install -y build-essential cmake pkg-config protobuf-compiler libsqlite3-dev
 
-      - name: macOS deps
-        if: matrix.platform == 'macos-latest'
-        run: brew install protobuf cmake
-
-      - name: Windows deps
-        if: matrix.platform == 'windows-latest'
-        run: choco install protoc -y
-
-      - name: Build release binary
+      - name: Build CLI binary
         run: cargo build --release --bin fan-files
 
-      - name: Build desktop (Tauri bundle includes sidecars)
+      - name: Package
+        run: |
+          cd target/release
+          strip fan-files
+          tar czf fan-files-linux-x86_64.tar.gz fan-files
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-linux
+          path: target/release/fan-files-linux-x86_64.tar.gz
+
+  build-macos-desktop:
+    name: macOS Desktop (.app)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install system deps
+        run: brew install protobuf cmake
+
+      - name: Build sidecars (macOS arm64)
+        run: cargo build --release -p fan-files -p fan-files-share
+
+      - name: npm install
         working-directory: apps/desktop
-        run: npm install && npm run tauri build -- --bundles app
-        timeout-minutes: 30
+        run: npm install
 
-      # Desktop bundle 输出到 src-tauri/target/release/bundle/
-      # macOS .dmg / linux .AppImage / windows .msi
+      - name: Frontend tests
+        working-directory: apps/desktop
+        run: npm test -- --run
 
-      - name: Upload CLI binary
+      # .app only — skip DMG (create-dmg's hdiutil fails in CI sandbox)
+      - name: Build macOS desktop app
+        working-directory: apps/desktop
+        run: npm run tauri build -- --bundles app
+
+      - name: Zip the .app
+        working-directory: apps/desktop
+        run: |
+          cd src-tauri/target/release/bundle/macos
+          zip -r fan-files-desktop-macOS-arm64.zip fan-files-desktop.app
+          mv fan-files-desktop-macOS-arm64.zip ../../../../../fan-files-desktop-macOS-arm64.zip
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: "cli-${{ matrix.platform }}"
-          path: target/release/fan-files
+          name: desktop-macos
+          path: apps/desktop/fan-files-desktop-macOS-arm64.zip
 
-      - name: Upload desktop bundle
+  build-windows-desktop:
+    name: Windows Desktop (.msi)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install system deps
+        run: choco install protoc -y
+
+      - name: Build sidecars (Windows x86_64)
+        run: cargo build --release -p fan-files -p fan-files-share
+
+      - name: npm install
+        working-directory: apps/desktop
+        run: npm install
+
+      - name: Frontend tests
+        working-directory: apps/desktop
+        run: npm test -- --run
+
+      # Windows: build .exe app + .msi installer (no DMG)
+      - name: Build Windows desktop
+        working-directory: apps/desktop
+        run: npm run tauri build -- --bundles app,msi
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: "desktop-${{ matrix.platform }}"
-          path: apps/desktop/src-tauri/target/release/bundle/**
+          name: desktop-windows
+          path: apps/desktop/src-tauri/target/release/bundle/msi/*.msi
 
   release:
-    name: Create GitHub Release
-    needs: build
+    name: Create GitHub Release v0.2.7
+    needs: [build-linux-cli, build-macos-desktop, build-windows-desktop]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -86,9 +146,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: release-artifacts
-          merge-multiple: true
 
-      - name: Release
+      - name: List all artifacts
+        run: find release-artifacts -type f -name "*.*"
+
+      - name: Create / update release
         uses: softprops/action-gh-release@v2
         with:
           files: release-artifacts/**
@@ -96,6 +158,3 @@ jobs:
           body_path: RELEASE.md
           draft: false
           prerelease: false
-          generate_release_notes: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
