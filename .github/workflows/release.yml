@@ -1,7 +1,7 @@
 name: Release
 
 # Triggered by `git push origin v*` tags (e.g. v0.2.7).
-# Produces: Linux CLI tar.gz, macOS .dmg/.app, Windows .msi/.exe.
+# Produces: Linux CLI tar.gz, macOS .zip(.app), Windows .msi/.exe.
 
 on:
   push:
@@ -76,19 +76,26 @@ jobs:
         working-directory: apps/desktop
         run: npm test -- --run
 
-      # Proven-working path (matches build-desktop.yml green runs): tauri-action
-      # builds .app + .dmg on GitHub macOS runners (hdiutil works there).
-      - uses: tauri-apps/tauri-action@v0
-        with:
-          projectPath: apps/desktop
+      # --bundles app skips DMG (hdiutil HFS+ creation fails on ARM64 GH runners).
+      # tauri-action tries full bundling incl. DMG, so build directly instead.
+      - name: Build macOS desktop (.app, no DMG)
+        working-directory: apps/desktop
+        shell: bash
+        run: npm run tauri build -- --bundles app
+
+      - name: Zip the .app
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          cd src-tauri/target/release/bundle/macos
+          zip -r fan-files-desktop-macOS-arm64.zip fan-files-desktop.app
+          mv fan-files-desktop-macOS-arm64.zip ../../../../../fan-files-desktop-macOS-arm64.zip
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: desktop-macos
-          path: |
-            apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
-            apps/desktop/src-tauri/target/release/bundle/macos/*.app
+          path: apps/desktop/fan-files-desktop-macOS-arm64.zip
 
   build-windows-desktop:
     name: Windows Desktop
@@ -121,8 +128,8 @@ jobs:
         working-directory: apps/desktop
         run: npm test -- --run
 
-      # Proven-working path (matches build-desktop.yml green runs): tauri-action
-      # builds .exe + .msi on GitHub Windows runners (WiX auto-installed).
+      # Proven-working path (matches build-desktop.yml Aug-20 green runs):
+      # tauri-action sets up WiX/NSIS and builds .exe + .msi on Windows runners.
       - uses: tauri-apps/tauri-action@v0
         with:
           projectPath: apps/desktop
