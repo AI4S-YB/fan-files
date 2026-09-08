@@ -18,8 +18,8 @@ pub enum AppError {
     /// LLM 未配置或调用失败（chat-search；前端据此降级基础搜索）
     #[error("模型未配置或调用失败")]
     LlmUnavailable,
-    #[error("internal error")]
-    Internal,
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 #[derive(Serialize)]
@@ -40,7 +40,7 @@ impl IntoResponse for AppError {
             Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "database_busy"),
             Self::NotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, "not_ready"),
             Self::LlmUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "llm_unavailable"),
-            Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+            Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         let message = self.to_string();
         (
@@ -66,7 +66,7 @@ impl From<rusqlite::Error> for AppError {
             }
             _ => {
                 tracing::error!(error = %value, "database query failed");
-                Self::Internal
+                Self::Internal(value.to_string())
             }
         }
     }

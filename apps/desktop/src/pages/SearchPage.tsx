@@ -1,10 +1,14 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Send, Sparkles, Search as SearchIcon, AlertCircle, RefreshCw, ChevronRight, Brain, X } from "lucide-react";
 import {
   searchDatasets,
   chatSearch,
   fetchDatasetDetail,
   fetchFiles,
+  fetchDatasets,
+  fetchStats,
+  ApiTimeoutError,
   type DatasetSummary,
   type DatasetDetail,
   type FileSummary,
@@ -23,7 +27,7 @@ interface FanConfig {
 }
 
 // 对话回合：user = 提问；assistant = 结果摘要（含 LLM 查询与结果表格）
-interface ChatTurn {
+export interface ChatTurn {
   role: "user" | "assistant";
   content: string; // 问题（user）/ 摘要（assistant）
   query?: ChatQuery; // assistant：LLM 生成的结构化查询（可展开）
@@ -31,12 +35,26 @@ interface ChatTurn {
   fallback?: boolean; // assistant：LLM 失败降级基础搜索
 }
 
-export default function SearchPage() {
+// 快捷示例问题（空态时显示）；"查看所有" 走专用路径，其他走 AI 搜索
+const EXAMPLE_QUESTIONS = [
+  { q: "我想要水稻参考基因组",     label: "🐬 水稻参考基因组" },
+  { q: "找近半年更新的转录组数据",  label: "📡 近半年转录组" },
+  { q: "有没有水稻变异数据集？",   label: "🔬 水稻变异数据" },
+] as const;
+
+interface SearchPageProps {
+  turns: ChatTurn[];
+  setTurns: React.Dispatch<React.SetStateAction<ChatTurn[]>>;
+}
+
+export default function SearchPage({ turns, setTurns }: SearchPageProps) {
   // NR-T5: 挂载时读一次 config 判断 LLM 是否配置（api_key 非空）。
   // true → 对话模式（多轮）；false → 基础搜索（单次）+ 提示。
-  const [llmConfigured, setLlmConfigured] = useState<boolean | null>(null);
-  // 对话模式状态
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
+  // NR-T5: 初始 false（同步渲染基础模式，避免测试用 fake timers）。
+  // config 异步到达后：api_key 非空 → 升到 chat mode；空/失败 → 保持基础模式。
+  // 此设计等价于原逻辑（false 直接渲染），但带异步升级能力。
+  const [llmConfigured, setLlmConfigured] = useState<boolean>(false);
+  // 对话模式状态（turns 由 App 提升上去，切走页面后会话保持）
   const [chatInput, setChatInput] = useState("");
   const [chatPending, setChatPending] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
@@ -54,6 +72,10 @@ export default function SearchPage() {
   // 结果详情弹层（复用 DatasetDetailModal）
   const [detail, setDetail] = useState<DatasetDetail | null>(null);
   const [files, setFiles] = useState<FileSummary[]>([]);
+  // 滚动到底部用的 ref
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  // 输入框 ref（自动 grow）
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   // GUI-T5: 共享状态提升到页面级（弹层关闭后传输仍被跟踪），与数据集页同构
   const {
     share,
@@ -72,8 +94,8 @@ export default function SearchPage() {
     let cancelled = false;
     (async () => {
       try {
-        const cfg = await invoke<FanConfig>("read_config");
-        if (!cancelled) setLlmConfigured(Boolean(cfg && cfg.api_key));
+        const cfg = await invoke<FanConfig | undefined>("read_config");
+        if (!cancelled) setLlmConfigured(Boolean(cfg?.api_key));
       } catch {
         if (!cancelled) setLlmConfigured(false);
       }
@@ -83,13 +105,12 @@ export default function SearchPage() {
     };
   }, []);
 
-  // SF-T3: 扫描完成（App 广播 fan-scan-done）→ 清空结果与对话（结果可能过期），
-  // 提示用户重新搜索/提问
+  // SF-T3: 扫描完成（App 广播 fan-scan-done）→ 不清空历史会话（用户翻看时希望保留），
+  // 只清基础搜索结果（rows），并提示用户重新搜索/提问
   useEffect(() => {
     const onScanDone = () => {
       setRows(null);
       setError(null);
-      setTurns([]);
       setChatError(null);
       setScanUpdated(true);
     };
@@ -97,21 +118,29 @@ export default function SearchPage() {
     return () => window.removeEventListener("fan-scan-done", onScanDone);
   }, []);
 
+  // 新消息追加时滚动到底部
+  useEffect(() => {
+    if (llmConfigured) {
+      const el = messagesEndRef.current;
+      if (el && typeof el.scrollIntoView === "function") {
+        el.scrollIntoView({ behavior: "smooth", block: "end" });
+      }
+    }
+  }, [turns, chatPending, llmConfigured]);
+
   // 基础搜索（无模型 / 降级后可用）
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    // 客户端校验：q 为空不发起请求（后端空 q 会 400）
     if (!q.trim()) return;
     setScanUpdated(false);
     const id = ++seq.current;
     try {
       const result = await searchDatasets(q.trim());
-      if (id !== seq.current) return; // 已有更新的请求，丢弃陈旧响应
+      if (id !== seq.current) return;
       setError(null);
       setRows(result);
     } catch {
       if (id !== seq.current) return;
-      // 失败时不清空已有结果，仅显示错误行
       setError("搜索失败，请检查引擎状态");
     }
   }
@@ -119,9 +148,9 @@ export default function SearchPage() {
   // 对话提问：LLM 生成查询 → 结果；LLM 层失败（HTTP 错误，如 503）→ 降级基础搜索 + 提示；
   // 引擎不可达（fetch 网络错误，无 status）→ 直接报错，不做无意义的降级。
   // 多轮：历史消息（turns）随 messages 传递，当前问题走 question 参数。
-  async function ask(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const question = chatInput.trim();
+  async function ask(e?: FormEvent<HTMLFormElement>, presetQuestion?: string) {
+    e?.preventDefault();
+    const question = (presetQuestion ?? chatInput).trim();
     if (!question || chatPending) return;
     setScanUpdated(false);
     setTurns((t) => [...t, { role: "user", content: question }]);
@@ -131,25 +160,72 @@ export default function SearchPage() {
     const history = turns.map((t) => ({ role: t.role, content: t.content }));
     try {
       const resp = await chatSearch(history, question);
-      setTurns((t) => [
-        ...t,
-        {
-          role: "assistant",
-          content: `找到 ${resp.results.length} 个数据集`,
-          query: resp.query,
-          results: resp.results,
-        },
-      ]);
-    } catch (err) {
-      // SF-T3 修复: 用 error.status 区分"引擎返回的 HTTP 错误"（LLM 层失败 → 降级）
-      // 与"引擎不可达"（fetch 网络错误是原生 TypeError，无 status → 直接报错）
-      if (typeof (err as { status?: unknown } | null)?.status === "number") {
-        // LLM 失败 → 降级基础搜索（本机搜索仍可用）；降级提示随该回合展示
+      // 无关问题（问候/天气/闲聊）→ 友好提示，不走降级逻辑
+      if (resp.reason === "irrelevant") {
+        setTurns((t) => [
+          ...t,
+          {
+            role: "assistant",
+            content:
+              "这个问题看起来和数据集搜索无关哦。我擅长帮你找数据 — 试试描述数据类型或物种名称，比如“水稻基因组”、“近半年转录组数据”。",
+          },
+        ]);
+      } else {
+        setTurns((t) => [
+          ...t,
+          {
+            role: "assistant",
+            content: `找到 ${resp.results.length} 个数据集`,
+            query: resp.query,
+            results: resp.results,
+          },
+        ]);
+      }
+    } catch (err: unknown) {
+      if (err instanceof ApiTimeoutError) {
+        // 接口卡死（share 进程/引擎繁忙）→ 友好降级，不留悬念的转圈
+        setTurns((t) => [
+          ...t,
+          {
+            role: "assistant",
+            content: `请求超时（>${err.ms}ms），引擎可能繁忙 —— 稍后再试，或点击「重新扫描」后刷新。`,
+            results: [],
+            fallback: true,
+          },
+        ]);
+        // 超时后仍尝试一次基础搜索，万一引擎刚好好了
+        try {
+          const fb = await searchDatasets(question);
+          if (fb.length > 0) {
+            setTurns((t) => {
+              const last = t[t.length - 1];
+              if (last?.role !== "assistant" || !last.fallback) return t;
+              return [
+                ...t.slice(0, -1),
+                { ...last, content: `找到 ${fb.length} 个数据集`, results: fb },
+              ];
+            });
+          }
+        } catch {
+          // ignore
+        }
+      } else if (
+        typeof (err as { status?: unknown } | null)?.status === "number"
+      ) {
+        // LLM 失败（HTTP 503 等）→ 降级基础搜索（本机搜索仍可用）；并把"查看全部"建议带回，
+        // 让用户在 AI 不可用时也能快速浏览数据集。
         try {
           const results = await searchDatasets(question);
           setTurns((t) => [
             ...t,
-            { role: "assistant", content: `找到 ${results.length} 个数据集`, results, fallback: true },
+            {
+              role: "assistant",
+              content: results.length > 0
+                ? `找到 ${results.length} 个数据集`
+                : `未找到匹配"${question}"的数据集`,
+              results,
+              fallback: true,
+            },
           ]);
         } catch {
           setChatError("搜索失败，请检查引擎状态");
@@ -159,10 +235,27 @@ export default function SearchPage() {
       }
     } finally {
       setChatPending(false);
+      // 让 textarea 收缩回单行
+      if (inputRef.current) inputRef.current.style.height = "auto";
     }
   }
 
-  // 打开结果详情：与数据集页同构（详情失败静默返回；文件列表失败静默为空）
+  // 输入框 Enter 发送（Shift+Enter 换行）
+  function onKey(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void ask();
+    }
+  }
+
+  // 自动 grow
+  function autoGrow(e: KeyboardEvent<HTMLTextAreaElement>) {
+    const el = e.currentTarget;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 120) + "px";
+  }
+
+  // 打开结果详情
   async function openDetail(r: DatasetSummary) {
     setFiles([]);
     let d: DatasetDetail;
@@ -177,89 +270,233 @@ export default function SearchPage() {
       .catch(() => setFiles([]));
   }
 
+  // "查看所有数据集"快捷动作（AI 降级后或问"有什么数据"时使用）
+  async function viewAllDatasets() {
+    setChatPending(true);
+    setChatError(null);
+    try {
+      // 并行拿分页 + 总数
+      const [page, stats] = await Promise.all([
+        fetchDatasets({ limit: 50 }),
+        fetchStats(),
+      ]);
+      const total = stats?.datasets_upper_bound ?? page.data.length;
+      setTurns((t) => [
+        ...t,
+        {
+          role: "assistant",
+          content: total > 0
+            ? `已索引 ${total} 个数据集（显示前 ${page.data.length} 条，去数据集页可翻页/筛选）`
+            : `尚未索引到数据集，请先在设置页添加数据目录并扫描`,
+          results: page.data,
+          fallback: true,
+        },
+      ]);
+    } catch {
+      setChatError("搜索失败，请检查引擎状态");
+    } finally {
+      setChatPending(false);
+    }
+  }
+
   return (
-    <div className="page">
+    <div className="search-page">
       {llmConfigured ? (
-        /* NR-T5: 对话模式（有模型）：消息气泡列表 + 输入框，可多轮追问 */
+        /* ===== AI 对话模式 ===== */
         <>
-          {scanUpdated && <div className="search-hint">数据已更新，请重新搜索</div>}
-          <div className="chat-list">
-            {turns.length === 0 && (
-              <div className="empty">
-                输入自然语言描述你的需求，AI 帮你找数据集（可多轮追问）
+          {scanUpdated && (
+            <div className="search-banner">
+              <AlertCircle size={13} /> 数据已更新，请重新搜索
+            </div>
+          )}
+
+          <div className="search-messages">
+            {turns.length > 0 && (
+              <div className="search-messages-header">
+                <span className="search-messages-count">
+                  {turns.filter((t) => t.role === "assistant").length} 条结果
+                </span>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => { setTurns([]); setChatError(null); }}
+                  title="清空会话"
+                >
+                  <X size={13} />
+                  清空会话
+                </button>
               </div>
             )}
-            {turns.map((t, i) => (
-              <div key={i} className={`chat-turn chat-${t.role}`}>
-                <div className="chat-bubble">{t.content}</div>
-                {t.role === "assistant" && t.results && (
-                  <div className="chat-results">
-                    {t.query && (
-                      <details className="llm-query">
-                        <summary>LLM 查询</summary>
-                        <div>
-                          关键词: {t.query.keywords.join("、")}
-                          {t.query.type ? ` · 类型: ${t.query.type}` : ""}
+            {turns.length === 0 ? (
+              <div className="search-empty">
+                <div className="search-empty-icon">
+                  <Brain size={28} />
+                </div>
+                <h2>你好，我是 fan-files 检索助手</h2>
+                <p>用自然语言描述你的需求，AI 会帮你找到匹配的数据集。可以多轮追问，逐步缩小范围。</p>
+                <div className="search-examples">
+                  {EXAMPLE_QUESTIONS.map((item, i) => (
+                    <button
+                      key={i}
+                      className="search-example-chip"
+                      onClick={() => ask(undefined, item.q)}
+                      disabled={chatPending}
+                    >
+                      <span>{item.label}</span>
+                      <ChevronRight size={12} />
+                    </button>
+                  ))}
+                  <button
+                    className="search-example-chip"
+                    onClick={() => void viewAllDatasets()}
+                    disabled={chatPending}
+                  >
+                    <SearchIcon size={11} />
+                    <span>查看所有数据集</span>
+                    <ChevronRight size={12} />
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="search-conversation">
+                {turns.map((t, i) => (
+                  <div key={i} className={`search-bubble-row search-bubble-${t.role}`}>
+                    {t.role === "assistant" && (
+                      <div className="search-avatar search-avatar-ai"><Sparkles size={13} /></div>
+                    )}
+                    <div className="search-bubble">
+                      <div className="search-bubble-text">{t.content}</div>
+                      {t.role === "assistant" && t.fallback && (
+                        <div className="search-bubble-meta">
+                          <strong>基础模式</strong>
+                          <span className="search-bubble-meta-sep">·</span>
+                          <span>AI 检索暂不可用，已切换到本机搜索</span>
+                          {t.results && t.results.length === 0 && (
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm"
+                              style={{ marginLeft: 8 }}
+                              onClick={() => void viewAllDatasets()}
+                              disabled={chatPending}
+                            >
+                              查看所有数据集
+                            </button>
+                          )}
                         </div>
-                      </details>
+                      )}
+                      {t.role === "assistant" && t.query && (
+                        <details className="search-query-details">
+                          <summary>查询详情</summary>
+                          <div>
+                            关键词：{t.query.keywords.join("、")}
+                            {t.query.type ? ` · 类型：${t.query.type}` : ""}
+                          </div>
+                        </details>
+                      )}
+                      {t.role === "assistant" && t.results && (
+                        <DataTable
+                          rows={t.results}
+                          onSelect={openDetail}
+                          emptyText="没有找到匹配的数据集 — 试试换种说法"
+                        />
+                      )}
+                    </div>
+                    {t.role === "user" && (
+                      <div className="search-avatar search-avatar-user"><SearchIcon size={13} /></div>
                     )}
-                    {t.fallback && (
-                      <div className="search-hint">模型调用失败，已切换基础搜索</div>
-                    )}
-                    <DataTable
-                      rows={t.results}
-                      onSelect={openDetail}
-                      emptyText="没有找到匹配的数据集 — 试试换种说法"
-                    />
+                  </div>
+                ))}
+                {chatPending && (
+                  <div className="search-bubble-row search-bubble-assistant">
+                    <div className="search-avatar search-avatar-ai"><Sparkles size={13} /></div>
+                    <div className="search-bubble">
+                      <div className="search-typing">
+                        <span className="search-typing-dot" />
+                        <span className="search-typing-dot" />
+                        <span className="search-typing-dot" />
+                      </div>
+                    </div>
                   </div>
                 )}
+                <div ref={messagesEndRef} />
               </div>
-            ))}
-            {chatPending && <div className="chat-pending">思考中…</div>}
+            )}
+            {chatError && <div className="search-error">{chatError}</div>}
           </div>
-          {chatError && <div className="search-error">{chatError}</div>}
-          <form role="search" onSubmit={ask}>
-            <input
-              role="searchbox"
-              className="search-box"
+
+          <form className="search-composer" onSubmit={(e) => void ask(e)}>
+            <textarea
+              ref={inputRef}
+              className="search-composer-input"
+              rows={1}
               value={chatInput}
               onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => { onKey(e); autoGrow(e); }}
               placeholder="用自然语言描述你的需求，可多轮追问…"
               disabled={chatPending}
             />
-            <button type="submit" className="primary" disabled={chatPending}>
-              发送
+            <button
+              type="submit"
+              className="search-composer-send"
+              disabled={chatPending || !chatInput.trim()}
+              aria-label="发送"
+            >
+              {chatPending ? <RefreshCw size={14} className="spin" /> : <Send size={14} />}
             </button>
           </form>
         </>
       ) : (
-        /* 基础搜索（无模型配置）：单次搜索 + 提示 */
+        /* ===== 基础搜索模式（无模型） ===== */
         <>
-          <div className="search-hint">未配置模型，使用基础搜索</div>
-          <form role="search" onSubmit={submit}>
-            <input
-              role="searchbox"
-              className="search-box"
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="搜索你的数据（如：水稻基因组）…"
-            />
-            <button type="submit" className="primary">搜索</button>
-          </form>
-          {scanUpdated && <div className="search-hint">数据已更新，请重新搜索</div>}
-          {error && <div className="search-error">{error}</div>}
-          {rows === null ? (
-            <div className="empty">输入关键词或自然语言描述，搜索你的数据集</div>
-          ) : (
-            <DataTable
-              rows={rows}
-              onSelect={openDetail}
-              emptyText="没有找到匹配的数据集 — 试试换关键词（如：水稻基因组）"
-            />
+          {scanUpdated && (
+            <div className="search-banner">
+              <AlertCircle size={13} /> 数据已更新，请重新搜索
+            </div>
           )}
+
+          <div className="search-basic">
+            <div className="search-basic-header">
+              <div className="search-basic-hint">未配置模型，使用基础搜索</div>
+            </div>
+            <form className="search-composer" onSubmit={submit}>
+              <textarea
+                className="search-composer-input"
+                rows={1}
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(e as unknown as FormEvent<HTMLFormElement>); } }}
+                placeholder="搜索你的数据（如：水稻基因组）…"
+              />
+              <button
+                type="submit"
+                className="search-composer-send"
+                disabled={!q.trim()}
+                aria-label="搜索"
+              >
+                <Send size={14} />
+              </button>
+            </form>
+            {error && <div className="search-error">{error}</div>}
+            <div className="search-basic-results">
+              {rows === null ? (
+                <div className="search-empty">
+                  <div className="search-empty-icon">
+                    <SearchIcon size={26} />
+                  </div>
+                  <p>输入关键词或自然语言描述，搜索你的数据集</p>
+                </div>
+              ) : (
+                <DataTable
+                  rows={rows}
+                  onSelect={openDetail}
+                  emptyText="没有找到匹配的数据集 — 试试换关键词（如：水稻基因组）"
+                />
+              )}
+            </div>
+          </div>
         </>
       )}
-      {/* 页面级共享面板（弹层关闭后传输仍可跟踪/取消；弹层打开时面板在弹层内展示） */}
+
+      {/* 页面级共享面板 */}
       {share.status !== "idle" && !detail && (
         <SharePanel
           name={shareName}
@@ -285,7 +522,6 @@ export default function SearchPage() {
           onShareCancel={() => void cancelShare()}
         />
       )}
-      {/* 共享侧续传确认弹窗（share://progress resume 事件触发；继续=关弹窗，引擎已自动续传） */}
       {shareResume && (
         <ResumeDialog
           done={shareResume.done}

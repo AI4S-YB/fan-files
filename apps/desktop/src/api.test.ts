@@ -33,7 +33,7 @@ describe("api client", () => {
     const m = vi.fn().mockResolvedValue({ ok: true, json: async () => statsBody });
     vi.stubGlobal("fetch", m);
     const stats = await fetchStats();
-    expect(m).toHaveBeenCalledWith(expect.stringContaining("/api/v1/stats"));
+    expect(m.mock.calls[0][0]).toEqual(expect.stringContaining("/api/v1/stats"));
     expect(stats.datasets_upper_bound).toBe(3);
   });
 
@@ -41,7 +41,7 @@ describe("api client", () => {
     const m = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ data: [] }) });
     vi.stubGlobal("fetch", m);
     await searchDatasets("水稻 基因组");
-    expect(m).toHaveBeenCalledWith(expect.stringContaining(encodeURIComponent("水稻 基因组")));
+    expect(m.mock.calls[0][0]).toEqual(expect.stringContaining(encodeURIComponent("水稻 基因组")));
   });
 
   it("fetchDatasets builds cursor/limit params and keeps meta", async () => {
@@ -93,7 +93,7 @@ describe("api client", () => {
     });
     vi.stubGlobal("fetch", m);
     const detail = await fetchDatasetDetail(1);
-    expect(m).toHaveBeenCalledWith(expect.stringContaining("/api/v1/datasets/1"));
+    expect(m.mock.calls[0][0]).toEqual(expect.stringContaining("/api/v1/datasets/1"));
     expect(detail.assets[0].file_count).toBe(3);
   });
 

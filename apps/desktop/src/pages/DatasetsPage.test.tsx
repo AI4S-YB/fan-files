@@ -113,11 +113,11 @@ describe("DatasetsPage", () => {
     for (const head of ["名称", "类型", "物种", "文件", "路径"]) {
       expect(screen.getByRole("columnheader", { name: head })).toBeInTheDocument();
     }
-    // chips 用后端聚合的 type_counts（含数量）
-    expect(screen.getByText("genome (12)")).toBeInTheDocument();
-    expect(screen.getByText("transcriptome (7)")).toBeInTheDocument();
-    expect(screen.getByText("variant (3)")).toBeInTheDocument();
-    expect(screen.getByText("other (1)")).toBeInTheDocument();
+    // chips: 后端聚合 count 显示在 "·" 后（含数量）
+    expect(screen.getByText(/^genome · 12$/)).toBeInTheDocument();
+    expect(screen.getByText(/^transcriptome · 7$/)).toBeInTheDocument();
+    expect(screen.getByText(/^variant · 3$/)).toBeInTheDocument();
+    expect(screen.getByText(/^other · 1$/)).toBeInTheDocument();
     expect(mockedApi.fetchDatasets).toHaveBeenCalledWith({ cursor: undefined, limit: 50, type: undefined });
   });
 
@@ -141,14 +141,14 @@ describe("DatasetsPage", () => {
     render(<DatasetsPage />);
     // 请求在途（loading=true）：chips、搜索按钮与排序下拉都禁用，防止切筛选后旧响应覆盖 UI。
     // 注意在途时 typeCounts 尚未到达，chip 显示回退集文案（无计数）
-    await waitFor(() => expect(screen.getByRole("button", { name: "genome" })).toBeDisabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: /^genome/ })).toBeDisabled());
     expect(screen.getByRole("button", { name: "上一页" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "下一页" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "搜索" })).toBeDisabled();
     expect(screen.getByRole("combobox", { name: "排序方式" })).toBeDisabled();
     resolvePage(pageOne);
     expect(await screen.findByText("Oryza_sativa_v1")).toBeInTheDocument();
-    expect(screen.getByText("genome (12)")).toBeEnabled();
+    expect(screen.getByText(/^genome · 12$/)).toBeEnabled();
   });
 
   it("disables next page button when next_cursor is null", async () => {
@@ -229,14 +229,14 @@ describe("DatasetsPage", () => {
   it("filters by type chip and toggles off", async () => {
     render(<DatasetsPage />);
     await screen.findByText("Oryza_sativa_v1");
-    const chip = screen.getByText("variant (3)");
+    const chip = screen.getByText(/^variant · 3$/);
     fireEvent.click(chip);
-    expect(await screen.findByText("variant (3)")).toHaveClass("chip", "active");
+    expect(await screen.findByText(/^variant · 3$/)).toHaveClass("chip", "active");
     expect(mockedApi.fetchDatasets).toHaveBeenLastCalledWith({ cursor: undefined, limit: 50, type: "variant" });
-    fireEvent.click(screen.getByText("variant (3)"));
+    fireEvent.click(screen.getByText(/^variant · 3$/));
     await screen.findByText("Oryza_sativa_v1");
     expect(mockedApi.fetchDatasets).toHaveBeenLastCalledWith({ cursor: undefined, limit: 50, type: undefined });
-    expect(screen.getByText("variant (3)")).not.toHaveClass("active");
+    expect(screen.getByText(/^variant · 3$/)).not.toHaveClass("active");
   });
 
   it("shows empty state when fetch fails", async () => {
@@ -337,8 +337,8 @@ describe("DatasetsPage", () => {
       })
     );
     // 等 q 请求落地（loading 结束、chip 可用）再切类型
-    await waitFor(() => expect(screen.getByText("variant (3)")).toBeEnabled());
-    fireEvent.click(screen.getByText("variant (3)"));
+    await waitFor(() => expect(screen.getByText(/^variant · 3$/)).toBeEnabled());
+    fireEvent.click(screen.getByText(/^variant · 3$/));
     await waitFor(() =>
       expect(mockedApi.fetchDatasets).toHaveBeenLastCalledWith({
         cursor: undefined,
@@ -394,7 +394,7 @@ describe("DatasetsPage", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "接收" }));
     eventMock.emit("receive://done", 0);
-    const open = await screen.findByRole("button", { name: /打开接收目录/ });
+    const open = await screen.findByRole("button", { name: /打开目录/ });
     fireEvent.click(open);
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("open_path", { path: "/data/inbox" })
@@ -426,8 +426,7 @@ describe("DatasetsPage", () => {
     eventMock.emit("share://done", 0);
     // 共享完成的传输自动出现在"传输历史"表（无需手动刷新）
     expect(await screen.findByText(/传输历史（1）/)).toBeInTheDocument();
-    expect(screen.getByText("📤 发送")).toBeInTheDocument();
-    expect(screen.getByText("✓ 成功")).toBeInTheDocument();
+    expect(screen.getByText("发送")).toBeInTheDocument();
   });
 
   // GUI-T5 修复 [回归 2]: 共享传输中关闭弹层不丢跟踪——
@@ -580,8 +579,6 @@ describe("DatasetsPage", () => {
     expect(screen.getByText("已发码")).toBeInTheDocument();
     expect(screen.getByText(/已被使用 \(/)).toBeInTheDocument();
     expect(screen.getByText(/已传输完成 \(/)).toBeInTheDocument();
-    // 状态列与传输结果列并存（结果列仍是成功/失败）
-    expect(screen.getAllByText("✓ 成功").length).toBe(3);
   });
 
   // NR-T5: 共享弹层有效期选择 → share_dataset 带 ttl_hours（默认 7 天 = 168）

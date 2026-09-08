@@ -115,6 +115,10 @@ pub struct ChatQuery {
 pub struct ChatSearchResponse {
     pub query: ChatQuery,
     pub results: Vec<DatasetSummary>,
+    /// 当 LLM 输出明显与数据搜索无关（如问候语、天气）时为 Some("irrelevant")；
+    /// 前端据此显示友好提示而非"基础模式·AI 不可用"。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]

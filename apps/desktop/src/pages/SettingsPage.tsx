@@ -1,8 +1,5 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import ProfilePicker from "../components/ProfilePicker";
-import ThemeToggle from "../components/ThemeToggle";
-import type { CcProfile } from "../components/ProfilePicker";
 
 // 与后端 T5 read_config 命令返回的形状一致（见 src-tauri FanConfig）。
 // threads 不进 UI，但必须保留在接口以透传保存（否则 GUI 保存会把文件的 threads 键删掉）。
@@ -14,14 +11,6 @@ interface FanConfig {
   api_key: string;
   model: string;
   api_type: string; // "openai"（OpenAI 兼容）| "anthropic"，与引擎 [llm].api_type 同键
-}
-
-// CC Switch 端点（fan-core LlmEndpoint 形状，`fan-files config cc-switch` 输出）
-interface CcEndpoint {
-  api_type: string;
-  base_url: string;
-  api_key: string;
-  model: string;
 }
 
 const EMPTY: FanConfig = {
@@ -59,13 +48,7 @@ export default function SettingsPage() {
   const [testError, setTestError] = useState<string | null>(null);
   const [testRunning, setTestRunning] = useState(false);
   const [updateText, setUpdateText] = useState<string | null>(null);
-  // CC Switch 接管（list_cc_switch_profiles → 0 个提示 / 1 个直接填充 / 多个弹窗选择）
-  const [ccRunning, setCcRunning] = useState(false);
-  const [ccSource, setCcSource] = useState<string | null>(null);
-  const [ccError, setCcError] = useState<string | null>(null);
-  // SF-T4: 多 profile 选择弹窗（列表来自 list_cc_switch_profiles，选中后 read_cc_switch_profile）
-  const [pickerProfiles, setPickerProfiles] = useState<CcProfile[]>([]);
-  const [pickerOpen, setPickerOpen] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   // 传输参数（[transfer] 段，独立加载/保存）
   const [transfer, setTransfer] = useState<TransferCfg>(DEFAULT_TRANSFER);
   const [transferSaved, setTransferSaved] = useState(false);
@@ -149,61 +132,15 @@ export default function SettingsPage() {
 
   // T13: 后端 check_update 返回 CLI 输出文本，直接展示（T16 sidecar 定位前为 PATH 临时实现）
   const checkUpdate = async () => {
+    setCheckingUpdate(true);
     setUpdateText(null);
     try {
       const out = await invoke<string>("check_update");
       setUpdateText(out);
     } catch (e) {
       setUpdateText(`检查更新失败：${String(e)}`);
-    }
-  };
-
-  // SF-T4: 从 CC Switch 接管——先列 profile 再分流：
-  // 0 个 → 提示"未找到 CC Switch 配置"；1 个 → 直接读取填充；
-  // 多个 → 弹窗（ProfilePicker）列出名称+协议徽标+模型，选中后读取填充。
-  const takeoverCcSwitch = async () => {
-    setCcRunning(true);
-    setCcError(null);
-    setCcSource(null);
-    try {
-      const profiles = await invoke<CcProfile[]>("list_cc_switch_profiles");
-      if (profiles.length === 0) {
-        setCcError("未找到 CC Switch 配置");
-      } else if (profiles.length === 1) {
-        await applyCcProfile(profiles[0].name);
-      } else {
-        setPickerProfiles(profiles);
-        setPickerOpen(true);
-      }
-    } catch (e) {
-      setCcError(String(e));
     } finally {
-      setCcRunning(false);
-    }
-  };
-
-  // 读取指定 profile 的 LLM 端点并填充表单（1 个直接走 / 弹窗选中后共用），
-  // api_type/endpoint/api_key/model 一并带入；来源提示显示 profile 名。
-  const applyCcProfile = async (name: string) => {
-    setPickerOpen(false);
-    setCcRunning(true);
-    setCcError(null);
-    try {
-      const ep = await invoke<CcEndpoint>("read_cc_switch_profile", { name });
-      setCfg((c) => ({
-        ...c,
-        endpoint: ep.base_url,
-        api_key: ep.api_key,
-        model: ep.model,
-        api_type: ep.api_type === "anthropic" ? "anthropic" : "openai",
-      }));
-      setSaved(false);
-      setError(null);
-      setCcSource(name);
-    } catch (e) {
-      setCcError(String(e));
-    } finally {
-      setCcRunning(false);
+      setCheckingUpdate(false);
     }
   };
 
@@ -247,217 +184,173 @@ export default function SettingsPage() {
   };
 
   return (
-    <div className="page settings">
+    <div className="settings-page">
 
-      <div className="card" style={{ marginBottom: 12 }}>
-        <h3
-          style={{
-            margin: "0 0 10px",
-            fontSize: 15,
-            fontWeight: 600,
-            color: "hsl(var(--fg))",
-          }}
-        >
-          外观
-        </h3>
-        <div
-          style={{
-            fontSize: 13,
-            color: "hsl(var(--fg-muted))",
-            marginBottom: 8,
-          }}
-        >
-          切换浅色 / 暗色 / 跟随系统（重启保留选择）
+      {/* 数据目录 */}
+      <section className="card" style={{ marginBottom: 20 }}>
+        <div className="card-header">
+          <h2>数据目录</h2>
         </div>
-        <ThemeToggle />
-      </div>
-
-      <section className="settings-section">
-        <h3>数据目录</h3>
-        {cfg.include.length === 0 ? (
-          <p className="settings-hint">还没有添加数据目录。扫描会遍历这些目录下的数据集。</p>
-        ) : (
-          <ul className="dir-list">
-            {cfg.include.map((dir, i) => (
-              <li key={i} className="dir-row">
-                <input
-                  aria-label={`目录 ${i + 1}`}
-                  className="dir-input"
-                  value={dir}
-                  onChange={(e) => patchInclude(i, e.target.value)}
-                />
-                <button className="secondary" onClick={() => removeInclude(i)}>
-                  移除
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-        <button className="secondary" onClick={addDirectory}>
-          📁 添加目录
-        </button>
-      </section>
-
-      {/* GUI-T3: 传输参数（config [transfer] 段，独立保存） */}
-      <section className="settings-section">
-        <h3>传输设置</h3>
-        <label className="field" htmlFor="chunk-size">
-          <span>块大小（MB）</span>
-          <select
-            id="chunk-size"
-            value={transfer.chunk_size_mb}
-            onChange={(e) => patchTransfer("chunk_size_mb", Number(e.target.value))}
-          >
-            {[2, 4, 8, 16].map((v) => (
-              <option key={v} value={v}>
-                {v} MB
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="field" htmlFor="concurrency">
-          <span>并发数（同时传输的块数）</span>
-          <select
-            id="concurrency"
-            value={transfer.concurrency}
-            onChange={(e) => patchTransfer("concurrency", Number(e.target.value))}
-          >
-            {[1, 2, 4, 8].map((v) => (
-              <option key={v} value={v}>
-                {v}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="field">
-          <span>默认接收目录</span>
-          <div className="dir-row">
-            <input
-              aria-label="默认接收目录"
-              readOnly
-              className="dir-input dir-readonly"
-              value={
-                transfer.receive_dir ?? "未设置（默认 ~/Downloads/fan-received）"
-              }
-            />
-            <button className="secondary" onClick={pickReceiveDir}>
-              📁 选择目录
+        <div className="card-body">
+          {cfg.include.length === 0 ? (
+            <p className="muted">还没有添加数据目录。扫描会遍历这些目录下的数据集。</p>
+          ) : (
+            <ul className="dir-list">
+              {cfg.include.map((dir, i) => (
+                <li key={i} className="dir-row">
+                  <input
+                    aria-label={`目录 ${i + 1}`}
+                    className="input"
+                    value={dir}
+                    onChange={(e) => patchInclude(i, e.target.value)}
+                  />
+                  <button className="btn btn-ghost btn-sm" onClick={() => removeInclude(i)}>
+                    移除
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <button className="btn btn-ghost btn-sm" onClick={addDirectory}>
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 1v11M1 6.5h11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+            添加目录
+          </button>
+          <div className="settings-actions">
+            <button className="btn btn-primary" onClick={save}>
+              保存配置
             </button>
-            {transfer.receive_dir && (
-              <button
-                className="secondary"
-                onClick={() => patchTransfer("receive_dir", null)}
-              >
-                清除
-              </button>
-            )}
+            {saved && <span className="feedback-ok">✓ 已保存</span>}
+            {error && <span className="feedback-err">{errorLabel}：{error}</span>}
           </div>
         </div>
-        <label className="field toggle-row" htmlFor="udp-enabled">
-          <span>启用 UDP 直连（P2P 打洞，失败自动降级中继）</span>
-          <input
-            id="udp-enabled"
-            type="checkbox"
-            checked={transfer.udp_enabled}
-            onChange={(e) => patchTransfer("udp_enabled", e.target.checked)}
-          />
-        </label>
-        <div className="settings-actions">
-          <button className="secondary" onClick={saveTransfer}>
-            保存传输设置
+      </section>
+
+      {/* 传输设置 */}
+      <section className="card" style={{ marginBottom: 20 }}>
+        <div className="card-header">
+          <h2>传输设置</h2>
+        </div>
+        <div className="card-body">
+          <div className="input-row" style={{ marginBottom: 12 }}>
+            <div style={{ flex: 1 }}>
+              <label className="input-label" htmlFor="chunk-size">块大小（MB）</label>
+              <select
+                id="chunk-size"
+                className="input"
+                value={transfer.chunk_size_mb}
+                onChange={(e) => patchTransfer("chunk_size_mb", Number(e.target.value))}
+              >
+                {[2, 4, 8, 16].map((v) => (
+                  <option key={v} value={v}>{v} MB</option>
+                ))}
+              </select>
+            </div>
+            <div style={{ flex: 1 }}>
+              <label className="input-label" htmlFor="concurrency">并发数（同时传输的块数）</label>
+              <select
+                id="concurrency"
+                className="input"
+                value={transfer.concurrency}
+                onChange={(e) => patchTransfer("concurrency", Number(e.target.value))}
+              >
+                {[1, 2, 4, 8].map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div style={{ marginBottom: 12 }}>
+            <label className="input-label" htmlFor="receive-dir">默认接收目录</label>
+            <div className="dir-row">
+              <input
+                id="receive-dir"
+                readOnly
+                className="input"
+                value={transfer.receive_dir ?? "未设置（默认 ~/Downloads/fan-received）"}
+              />
+              <button className="btn btn-ghost btn-sm" style={{ whiteSpace: "nowrap" }} onClick={pickReceiveDir}>
+                选择目录
+              </button>
+              {transfer.receive_dir && (
+                <button className="btn btn-ghost btn-sm" onClick={() => patchTransfer("receive_dir", null)}>
+                  清除
+                </button>
+              )}
+            </div>
+          </div>
+          <label className="toggle-row" style={{ marginBottom: 14 }}>
+            <span className="muted">启用 UDP 直连（P2P 打洞，失败自动降级中继）</span>
+            <input
+              type="checkbox"
+              checked={transfer.udp_enabled}
+              onChange={(e) => patchTransfer("udp_enabled", e.target.checked)}
+            />
+          </label>
+          <div className="settings-actions">
+            <button className="btn btn-primary" onClick={saveTransfer}>
+              保存传输设置
+            </button>
+            {transferSaved && <span className="feedback-ok">✓ 已保存</span>}
+            {transferError && <span className="feedback-err">保存失败：{transferError}</span>}
+          </div>
+        </div>
+      </section>
+
+      {/* 模型配置 */}
+      <section className="card" style={{ marginBottom: 20 }}>
+        <div className="card-header">
+          <h2>模型配置</h2>
+        </div>
+        <div className="card-body">
+          <div style={{ marginBottom: 12 }}>
+            <label className="input-label" htmlFor="api-type">API 类型</label>
+            <select
+              id="api-type"
+              className="input"
+              value={cfg.api_type}
+              onChange={(e) => patch("api_type", e.target.value)}
+            >
+              <option value="openai">OpenAI 兼容</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+          </div>
+          <div style={{ marginBottom: 12 }}>
+            <label className="input-label" htmlFor="endpoint">Endpoint</label>
+            <input id="endpoint" className="input" value={cfg.endpoint} onChange={(e) => patch("endpoint", e.target.value)} />
+          </div>
+          <div style={{ marginBottom: 12 }}>
+            <label className="input-label" htmlFor="api-key">API Key</label>
+            <input id="api-key" type="password" className="input" value={cfg.api_key} onChange={(e) => patch("api_key", e.target.value)} />
+          </div>
+          <div style={{ marginBottom: 14 }}>
+            <label className="input-label" htmlFor="model">模型名称</label>
+            <input id="model" className="input" value={cfg.model} onChange={(e) => patch("model", e.target.value)} />
+          </div>
+          <button className="btn btn-primary" onClick={testConnection} disabled={testRunning}>
+            {testRunning ? <><span className="spinner" /> 测试中…</> : "测试连接"}
           </button>
-          {transferSaved && <span className="feedback-ok">已保存 ✓</span>}
-          {transferError && (
-            <span className="feedback-err">保存失败：{transferError}</span>
+          {testResult && (
+            testResult.ok
+              ? <span className="feedback-ok">✓ 连接成功（{testResult.ms}ms）</span>
+              : <span className="feedback-err">连接失败（{testResult.ms}ms）{testError ? `：${testError}` : ""}</span>
           )}
         </div>
       </section>
 
-      <section className="settings-section">
-        <h3>模型配置</h3>
-        {/* NR-T4: 从 CC Switch 接管——读取当前激活 profile 并填充下方表单 */}
-        <div className="field cc-switch-row">
-          <span>CC Switch 配置</span>
-          <button
-            className="secondary"
-            onClick={takeoverCcSwitch}
-            disabled={ccRunning}
-          >
-            {ccRunning ? "读取中…" : "从 CC Switch 接管"}
-          </button>
-          {ccSource && (
-            <span className="feedback-ok">已从 CC Switch 接管：{ccSource}</span>
-          )}
-          {ccError && <span className="feedback-err">{ccError}</span>}
+      {/* 关于 */}
+      <section className="card">
+        <div className="card-header">
+          <h2>关于</h2>
         </div>
-        {/* SF-T4: 多个 profile 时的选择弹窗（取消不填充） */}
-        {pickerOpen && (
-          <ProfilePicker
-            profiles={pickerProfiles}
-            onSelect={(name) => {
-              void applyCcProfile(name);
-            }}
-            onClose={() => setPickerOpen(false)}
-          />
-        )}
-        <label className="field" htmlFor="api-type">
-          <span>API 类型</span>
-          <select
-            id="api-type"
-            value={cfg.api_type}
-            onChange={(e) => patch("api_type", e.target.value)}
-          >
-            <option value="openai">OpenAI 兼容</option>
-            <option value="anthropic">Anthropic</option>
-          </select>
-        </label>
-        <label className="field" htmlFor="endpoint">
-          <span>Endpoint</span>
-          <input id="endpoint" value={cfg.endpoint} onChange={(e) => patch("endpoint", e.target.value)} />
-        </label>
-        <label className="field" htmlFor="api-key">
-          <span>API Key</span>
-          <input
-            id="api-key"
-            type="password"
-            value={cfg.api_key}
-            onChange={(e) => patch("api_key", e.target.value)}
-          />
-        </label>
-        <label className="field" htmlFor="model">
-          <span>模型名称</span>
-          <input id="model" value={cfg.model} onChange={(e) => patch("model", e.target.value)} />
-        </label>
-        <button className="secondary" onClick={testConnection} disabled={testRunning}>
-          {testRunning ? "测试中…" : "测试连接"}
-        </button>
-        {testResult &&
-          (testResult.ok ? (
-            <span className="feedback-ok">连接成功 ✓（{testResult.ms}ms）</span>
-          ) : (
-            <span className="feedback-err">
-              连接失败（{testResult.ms}ms）{testError ? `：${testError}` : ""}
-            </span>
-          ))}
+        <div className="card-body">
+          <p className="muted" style={{ marginBottom: 12 }}>fan-files desktop v0.2.6</p>
+          <button className="btn btn-primary" onClick={checkUpdate} disabled={checkingUpdate}>
+            {checkingUpdate ? <><span className="spinner" /> 检查中…</> : "检查更新"}
+          </button>
+          {updateText && <span className="muted" style={{ marginLeft: 10 }}>{updateText}</span>}
+        </div>
       </section>
 
-      <section className="settings-section">
-        <h3>关于</h3>
-        {/* 版本与 package.json / src-tauri/tauri.conf.json 同步 */}
-        <p className="settings-hint">fan-files desktop v0.1.0</p>
-        <button className="secondary" onClick={checkUpdate}>
-          检查更新
-        </button>
-        {updateText && <span className="settings-hint update-feedback">{updateText}</span>}
-      </section>
-
-      <div className="settings-actions">
-        <button className="primary" onClick={save}>
-          保存配置
-        </button>
-        {saved && <span className="feedback-ok">已保存 ✓</span>}
-        {error && <span className="feedback-err">{errorLabel}：{error}</span>}
-      </div>
     </div>
   );
 }

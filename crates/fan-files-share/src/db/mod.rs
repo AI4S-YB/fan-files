@@ -342,6 +342,102 @@ impl Database {
         Ok(rows)
     }
 
+    /// Type-only search: no Tantivy index needed. Returns all datasets of the
+    /// given type, sorted by most recently updated. Optionally limited to the
+    /// last `days` days. Used as a fallback when LLM extracted a dataset_type
+    /// but the keyword-based Tantivy search returned 0 results.
+    /// 用子串匹配（LIKE %type%）容忍 dataset_type 的拼写变体，
+    /// 如 genomic_variation / genomic_variants 都能被 "variant" 命中。
+    pub fn search_datasets_by_type(
+        &self,
+        dataset_type: &str,
+        days: Option<i64>,
+        expose_path: bool,
+    ) -> Result<Vec<DatasetSummary>, AppError> {
+        let conn = self.pool.get()?;
+        // std::time::SystemTime now → Unix timestamp 秒（share 不依赖 chrono）
+        let cutoff = days.map(|d| {
+            std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(d as u64 * 86_400))
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
+        let sql = if cutoff.is_some() {
+            "SELECT d.id,d.name,d.dataset_type,d.species,d.summary,d.path,d.updated_at,
+                    (SELECT COUNT(*) FROM asset WHERE dataset_id=d.id),
+                    (SELECT COUNT(*) FROM asset_file af JOIN asset a ON af.asset_id=a.id WHERE a.dataset_id=d.id)
+             FROM dataset d
+             WHERE lower(d.dataset_type) LIKE '%' || lower(?1) || '%'
+               AND d.updated_at>=?2
+             ORDER BY d.updated_at DESC"
+                .to_string()
+        } else {
+            "SELECT d.id,d.name,d.dataset_type,d.species,d.summary,d.path,d.updated_at,
+                    (SELECT COUNT(*) FROM asset WHERE dataset_id=d.id),
+                    (SELECT COUNT(*) FROM asset_file af JOIN asset a ON af.asset_id=a.id WHERE a.dataset_id=d.id)
+             FROM dataset d
+             WHERE lower(d.dataset_type) LIKE '%' || lower(?1) || '%'
+             ORDER BY d.updated_at DESC"
+                .to_string()
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<DatasetSummary> = if cutoff.is_some() {
+            let c = cutoff.unwrap_or(0);
+            stmt.query_map(rusqlite::params![dataset_type, c], |row| {
+                dataset_summary(row, expose_path)
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        } else {
+            stmt.query_map(rusqlite::params![dataset_type], |row| {
+                dataset_summary(row, expose_path)
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        Ok(rows)
+    }
+
+    /// Return stored embedding vectors for the given file ids. Used by the
+    /// hybrid search path to compute cosine similarity against the query
+    /// embedding. Empty result (including when the `embeddings` table does not
+    /// exist or the last scan ran without an embedding model) tells the caller
+    /// to fall back to Tantivy-only ordering.
+    pub fn load_embeddings_for_ids(
+        &self,
+        file_ids: &[i64],
+    ) -> Result<Vec<(i64, Vec<f32>)>, AppError> {
+        if file_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.pool.get()?;
+        let placeholders = vec!["?"; file_ids.len()].join(",");
+        let sql = format!(
+            "SELECT file_id, vector FROM embeddings WHERE file_id IN ({})",
+            placeholders
+        );
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            // Table missing (index built before embeddings were added) → empty
+            Err(ref e) if e.to_string().contains("no such table") => return Ok(Vec::new()),
+            Err(e) => return Err(AppError::Internal(e.to_string())),
+        };
+        let rows = match stmt.query_map(rusqlite::params_from_iter(file_ids.iter()), |row| {
+            let id: i64 = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            let floats: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            Ok((id, floats))
+        }) {
+            Ok(r) => r,
+            Err(ref e) if e.to_string().contains("no such table") => return Ok(Vec::new()),
+            Err(e) => return Err(AppError::Internal(e.to_string())),
+        };
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Internal(e.to_string()))
+    }
+
     pub fn facets(&self) -> Result<Facets, AppError> {
         let conn = self.pool.get()?;
         fn values(

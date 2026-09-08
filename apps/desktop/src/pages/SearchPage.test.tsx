@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { useState } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import SearchPage from "./SearchPage";
+import SearchPage, { type ChatTurn } from "./SearchPage";
 import * as api from "../api";
 
 vi.mock("../api");
@@ -8,6 +9,14 @@ vi.mock("../api");
 // 自持，测试通过 eventMock.emit 注入 share:// 事件驱动共享面板。
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 import { invoke } from "@tauri-apps/api/core";
+
+// 容器组件：与 App.tsx 同构，将 turns 状态本地化，使 SearchPage 在测试中
+// 也能正常更新（直接传 vi.fn() 作为 setter 会让所有 setTurns 调用变成 no-op，
+// 气泡里就不会渲染出 chat 消息）
+function SearchPageHarness() {
+  const [turns, setTurns] = useState<ChatTurn[]>([]);
+  return <SearchPage turns={turns} setTurns={setTurns} />;
+}
 
 const eventMock = vi.hoisted(() => {
   const listeners = new Map<string, ((e: { payload: unknown }) => void)[]>();
@@ -35,25 +44,25 @@ beforeEach(() => {
 
 describe("SearchPage", () => {
   it("shows hint before any search", () => {
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     expect(screen.getByText(/输入关键词或自然语言描述/)).toBeInTheDocument();
   });
   it("does not call api on empty query", async () => {
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "   " } });
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     expect(mockedApi.searchDatasets).not.toHaveBeenCalled();
   });
   it("renders results and empty text after search", async () => {
     mockedApi.searchDatasets.mockResolvedValue([{ id: 1, name: "Oryza_sativa_v1", type: "genome", species: "Oryza sativa", path: "/a/v1", file_count: 3, asset_count: 2, summary: null, updated_at: 1787000000 }]);
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "水稻" } });
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     await waitFor(() => expect(screen.getByText("Oryza_sativa_v1")).toBeInTheDocument());
   });
   it("shows no-result text when api returns empty", async () => {
     mockedApi.searchDatasets.mockResolvedValue([]);
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "xyz" } });
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     await waitFor(() => expect(screen.getByText(/没有找到匹配的数据集/)).toBeInTheDocument());
@@ -61,7 +70,7 @@ describe("SearchPage", () => {
   it("shows error line on api failure and keeps old results", async () => {
     mockedApi.searchDatasets.mockResolvedValueOnce([{ id: 1, name: "A", type: "genome", species: null, path: "/a", file_count: 1, asset_count: 1, summary: null, updated_at: 0 }]);
     mockedApi.searchDatasets.mockRejectedValueOnce(new Error("HTTP 500"));
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "a" } });
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     await waitFor(() => expect(screen.getByText("A")).toBeInTheDocument());
@@ -74,7 +83,7 @@ describe("SearchPage", () => {
     mockedApi.searchDatasets
       .mockRejectedValueOnce(new Error("HTTP 500"))
       .mockResolvedValueOnce([{ id: 1, name: "Oryza_sativa_v1", type: "genome", species: "Oryza sativa", path: "/a/v1", file_count: 3, asset_count: 2, summary: null, updated_at: 1787000000 }]);
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "水稻" } });
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     await waitFor(() => expect(screen.getByText(/搜索失败/)).toBeInTheDocument());
@@ -89,7 +98,7 @@ describe("SearchPage", () => {
     mockedApi.searchDatasets
       .mockReturnValueOnce(new Promise((r) => (resolveFirst = r)) as never)
       .mockReturnValueOnce(new Promise((r) => (resolveSecond = r)) as never);
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "a" } });
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "b" } });
@@ -126,7 +135,7 @@ describe("SearchPage", () => {
       ],
       meta: { limit: 50, next_cursor: null, has_more: false },
     });
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "水稻" } });
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
@@ -161,7 +170,7 @@ describe("SearchPage", () => {
       meta: { limit: 50, next_cursor: null, has_more: false },
     });
     vi.mocked(invoke).mockResolvedValue(null);
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "水稻" } });
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     fireEvent.click(await screen.findByText("Oryza_sativa_v1"));
@@ -200,7 +209,7 @@ describe("SearchPage", () => {
 
   it("renders the conversation UI when llm is configured", async () => {
     vi.mocked(invoke).mockResolvedValue(llmCfg);
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     expect(await screen.findByPlaceholderText(/用自然语言描述/)).toBeInTheDocument();
     // 对话模式无基础搜索框、无"未配置模型"提示
     expect(screen.queryByPlaceholderText(/搜索你的数据/)).not.toBeInTheDocument();
@@ -213,7 +222,7 @@ describe("SearchPage", () => {
       query: { keywords: ["水稻", "基因组"], type: "genome" },
       results: [result1],
     });
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     const input = await screen.findByPlaceholderText(/用自然语言描述/);
     fireEvent.change(input, { target: { value: "帮我找水稻基因组" } });
     fireEvent.click(screen.getByRole("button", { name: /发送/ }));
@@ -240,7 +249,7 @@ describe("SearchPage", () => {
 
   it("renders basic search with hint when llm is not configured", async () => {
     vi.mocked(invoke).mockResolvedValue({ ...llmCfg, api_key: "" });
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     expect(await screen.findByPlaceholderText(/搜索你的数据/)).toBeInTheDocument();
     expect(screen.getByText(/未配置模型，使用基础搜索/)).toBeInTheDocument();
     // 基础搜索仍可用
@@ -257,11 +266,12 @@ describe("SearchPage", () => {
     // SF-T3 契约：HTTP 错误经 api.ts 抛出时带 status（ApiError）——503 = LLM 层失败 → 降级
     mockedApi.chatSearch.mockRejectedValue(Object.assign(new Error("HTTP 503"), { status: 503 }));
     mockedApi.searchDatasets.mockResolvedValue([result1]);
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     const input = await screen.findByPlaceholderText(/用自然语言描述/);
     fireEvent.change(input, { target: { value: "水稻" } });
     fireEvent.click(screen.getByRole("button", { name: /发送/ }));
-    expect(await screen.findByText(/模型调用失败，已切换基础搜索/)).toBeInTheDocument();
+    expect(await screen.findByText(/基础模式/)).toBeInTheDocument();
+    expect(await screen.findByText(/AI 检索暂不可用/)).toBeInTheDocument();
     expect(mockedApi.searchDatasets).toHaveBeenCalledWith("水稻");
     expect(screen.getByText("Oryza_sativa_v1")).toBeInTheDocument();
   });
@@ -271,20 +281,20 @@ describe("SearchPage", () => {
   it("shows engine error without falling back when chatSearch fails with a network error", async () => {
     vi.mocked(invoke).mockResolvedValue(llmCfg);
     mockedApi.chatSearch.mockRejectedValue(new TypeError("Failed to fetch"));
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     const input = await screen.findByPlaceholderText(/用自然语言描述/);
     fireEvent.change(input, { target: { value: "水稻" } });
     fireEvent.click(screen.getByRole("button", { name: /发送/ }));
     expect(await screen.findByText(/搜索失败，请检查引擎状态/)).toBeInTheDocument();
     expect(mockedApi.searchDatasets).not.toHaveBeenCalled();
-    expect(screen.queryByText(/模型调用失败/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/基础模式/)).not.toBeInTheDocument();
   });
 
   // SF-T3: 扫描完成（App 广播 fan-scan-done）→ 旧结果可能过期：清空结果 + 提示重新搜索；
   // 重新搜索后提示消失
   it("clears results and shows a refresh hint when a scan completes", async () => {
     mockedApi.searchDatasets.mockResolvedValue([result1]);
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     fireEvent.change(screen.getByPlaceholderText(/搜索你的数据/), { target: { value: "水稻" } });
     fireEvent.click(screen.getByRole("button", { name: /搜索/ }));
     await screen.findByText("Oryza_sativa_v1");
@@ -300,28 +310,23 @@ describe("SearchPage", () => {
     expect(screen.queryByText(/数据已更新，请重新搜索/)).not.toBeInTheDocument();
   });
 
-  // SF-T3: 对话模式同样响应扫描完成——清空对话（结果可能过期），提示重新提问
-  it("clears the conversation when a scan completes in chat mode", async () => {
+  // SF-T3（修订）：对话模式同样响应扫描完成——但只清基础搜索结果，
+  // 历史会话保留（用户希望"翻看旧对话"不被无脑清掉），并提示结果可能过期
+  it("keeps the conversation and shows a refresh hint when a scan completes in chat mode", async () => {
     vi.mocked(invoke).mockResolvedValue(llmCfg);
     mockedApi.chatSearch.mockResolvedValue({
       query: { keywords: ["水稻", "基因组"], type: "genome" },
       results: [result1],
     });
-    render(<SearchPage />);
+    render(<SearchPageHarness />);
     const input = await screen.findByPlaceholderText(/用自然语言描述/);
     fireEvent.change(input, { target: { value: "帮我找水稻基因组" } });
     fireEvent.click(screen.getByRole("button", { name: /发送/ }));
     await screen.findByText("Oryza_sativa_v1");
     fireEvent(window, new CustomEvent("fan-scan-done"));
     expect(await screen.findByText(/数据已更新，请重新搜索/)).toBeInTheDocument();
-    expect(screen.queryByText("Oryza_sativa_v1")).not.toBeInTheDocument();
-    expect(screen.queryByText("帮我找水稻基因组")).not.toBeInTheDocument();
-    // 重新提问后提示消失（历史已清空，首轮不带上下文）
-    fireEvent.change(input, { target: { value: "再找转录组" } });
-    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
-    await waitFor(() =>
-      expect(mockedApi.chatSearch).toHaveBeenLastCalledWith([], "再找转录组")
-    );
-    await waitFor(() => expect(screen.queryByText(/数据已更新/)).not.toBeInTheDocument());
+    // 历史对话保留：用户能继续翻看旧结果
+    expect(screen.getByText("Oryza_sativa_v1")).toBeInTheDocument();
+    expect(screen.getByText("帮我找水稻基因组")).toBeInTheDocument();
   });
 });

@@ -322,114 +322,82 @@ export default function DatasetsPage() {
   const countOf = (t: string) => typeCounts.find((f) => f.value === t)?.count;
 
   return (
-    <div className="page">
-      {/* P2P 接收入口：输入对方发来的配对码接收数据 */}
-      <div className="receive-bar">
-        <input
-          className="receive-input"
-          placeholder="📥 输入配对码接收数据（如 8-purple-hammer）"
-          value={receiveCode}
-          onChange={(e) => setReceiveCode(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && startReceive()}
-        />
-        <button
-          className="primary"
-          disabled={receiveStatus === "running" || !receiveCode.trim()}
-          onClick={startReceive}
-        >
-          {receiveStatus === "running" ? "接收中…" : "接收"}
-        </button>
-        {receiveStatus === "done-ok" && (
-          <span className="feedback-ok">✅ 已接收</span>
-        )}
-        {receiveStatus === "done-ok" && (
-          <button className="secondary" onClick={() => openReceiveDir()}>
-            📂 打开接收目录
-          </button>
-        )}
-        {receiveStatus === "done-err" && (
-          <span className="feedback-err">❌ 接收失败</span>
-        )}
-        {receiveStatus === "cancelled" && (
-          <span className="feedback-err">已取消</span>
-        )}
-        {/* 接收传输面板（进度/徽标/续传/取消 + 折叠原始日志） */}
+    <div className="datasets-page">
+      {/* P2P 接收入口 */}
+      <div className="card ds-receive-card">
+        <div className="ds-receive-row">
+            <input
+              className="input"
+              placeholder="输入配对码接收数据（如 8-purple-hammer）"
+              value={receiveCode}
+              onChange={(e) => setReceiveCode(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && startReceive()}
+            />
+            <button
+              className="btn btn-primary"
+              disabled={receiveStatus === "running" || !receiveCode.trim()}
+              onClick={startReceive}
+            >
+              {receiveStatus === "running" ? <><span className="spinner" /> 接收中</> : "接收"}
+            </button>
+            {receiveStatus === "done-ok" && (
+              <>
+                <span className="feedback-ok">✓ 已接收</span>
+                <button className="btn btn-ghost" onClick={() => openReceiveDir()}>
+                  打开目录
+                </button>
+              </>
+            )}
+            {receiveStatus === "done-err" && <span className="feedback-err">接收失败</span>}
+            {receiveStatus === "cancelled" && <span className="feedback-err">已取消</span>}
+        </div>
         {receiveStatus !== "idle" && (
-          <div className="receive-panel-wrap">
+          <div className="ds-receive-panel">
             <TransferPanel
-              name={receiveCode.trim() || "接收"}
-              events={receiveEvents}
-              log={receiveRaw}
-              onCancel={() => void cancelReceive()}
+                name={receiveCode.trim() || "接收"}
+                events={receiveEvents}
+                log={receiveRaw}
+                onCancel={() => void cancelReceive()}
             />
           </div>
         )}
       </div>
-      {/* GUI-T5 修复: 页面级共享面板（与接收侧对称）——弹层关闭后传输仍可跟踪/取消；
-          弹层打开时面板在弹层内展示（此处用 !detail 隐藏避免双份） */}
+
+      {/* 共享进度面板 */}
       {share.status !== "idle" && !detail && (
-        <SharePanel
-          name={shareName}
-          code={share.status === "code" ? share.code : undefined}
-          events={shareEvents}
-          log={shareRaw}
-          onCancel={() => void cancelShare()}
-          ttlHours={shareTtl}
-        />
+        <div className="card ds-receive-card">
+          <SharePanel
+              name={shareName}
+              code={share.status === "code" ? share.code : undefined}
+              events={shareEvents}
+              log={shareRaw}
+              onCancel={() => void cancelShare()}
+              ttlHours={shareTtl}
+          />
+        </div>
       )}
-      {/* P2P 传输历史 */}
-      {transferHistory.length > 0 && (
-        <details className="history-panel">
-          <summary>🕘 传输历史（{transferHistory.length}）</summary>
-          <table className="history-table">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>方向</th>
-                <th>数据集/码</th>
-                <th>状态</th>
-                <th>结果</th>
-                <th>字节</th>
-              </tr>
-            </thead>
-            <tbody>
-              {transferHistory.map((h, i) => (
-                <tr key={i}>
-                  <td className="mono">{fmtTs(h.time)}</td>
-                  <td>{h.direction === "send" ? "📤 发送" : "📥 接收"}</td>
-                  <td className="mono">{h.dataset}</td>
-                  {/* NR-T3: 配对码状态列（已发码 → 已被使用 → 已传输完成） */}
-                  <td>{codeStatus(h)}</td>
-                  <td>
-                    <span className={h.status === "ok" ? "badge badge-other" : "feedback-err"}>
-                      {h.status === "ok" ? "✓ 成功" : "✗ 失败"}
-                    </span>
-                  </td>
-                  <td className="mono">{(h.bytes_sent + h.bytes_received).toLocaleString()}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </details>
-      )}
-      {/* GUI-T4: 搜索框（q 参数，名称/关键词过滤）+ 排序下拉（name/file_count） */}
-      <div className="dataset-toolbar">
-        <div className="dataset-search">
+
+      {/* 工具栏：搜索 + 排序 */}
+      <div className="ds-toolbar">
+        <div className="ds-search-wrap">
           <input
-            className="search-box"
-            placeholder="搜索名称/关键词…"
+            className="input"
+            placeholder="搜索名称 / 关键词…"
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            // GUI-T5 修复 [回归 3]: Enter 键盘路径补 loading 防护（按钮 disabled 拦不住 Enter）
             onKeyDown={(e) => e.key === "Enter" && !loading && submitSearch()}
             aria-label="搜索数据集"
           />
-          <button className="primary" disabled={loading} onClick={submitSearch}>
+          <button
+            className="btn btn-primary btn-sm"
+            disabled={loading}
+            onClick={submitSearch}
+          >
             搜索
           </button>
         </div>
         <select
-          className="sort-select"
+          className="input ds-sort-select"
           aria-label="排序方式"
           value={sort}
           disabled={loading}
@@ -440,29 +408,69 @@ export default function DatasetsPage() {
           <option value="file_count">按文件数</option>
         </select>
       </div>
-      <div className="filters">
+
+      {/* 类型筛选 chips */}
+      <div className="ds-chips">
         {chips.map((t) => (
           <button
             key={t}
-            className={type === t ? "chip active" : "chip"}
-            // 翻页请求在途时禁用筛选，防止"切筛选 → 旧响应后到覆盖 UI"的竞态
+            type="button"
             disabled={loading}
             onClick={() => setType(type === t ? undefined : t)}
+            className={`chip${type === t ? " active" : ""}`}
           >
-            {countOf(t) != null ? `${t} (${countOf(t)})` : t}
+            {countOf(t) != null ? `${t} · ${countOf(t)}` : t}
           </button>
         ))}
       </div>
+
+      {/* 数据集列表 */}
       <DataTable rows={rows} onSelect={openDetail} />
-      <div className="pager">
-        <button disabled={loading || history.length === 0} onClick={goPrev}>
+
+      {/* 翻页 */}
+      <div className="ds-pager">
+        <button className="btn btn-ghost" disabled={loading || history.length === 0} onClick={goPrev}>
           上一页
         </button>
-        <button disabled={loading || !nextCursor} onClick={goNext}>
+        <button className="btn btn-ghost" disabled={loading || !nextCursor} onClick={goNext}>
           下一页
         </button>
       </div>
-      {/* GUI-T5: 详情弹层为纯展示组件（共享状态/监听在页面级 useShareTransfer） */}
+
+      {/* 传输历史 */}
+      {transferHistory.length > 0 && (
+        <details className="card ds-history">
+          <summary>
+            传输历史（{transferHistory.length}）
+          </summary>
+          <div className="ds-history-body">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: "left", padding: "8px 14px", color: "hsl(var(--text-dim))", fontWeight: 600 }}>时间</th>
+                  <th style={{ textAlign: "left", padding: "8px 14px", color: "hsl(var(--text-dim))", fontWeight: 600 }}>方向</th>
+                  <th style={{ textAlign: "left", padding: "8px 14px", color: "hsl(var(--text-dim))", fontWeight: 600 }}>数据集/码</th>
+                  <th style={{ textAlign: "left", padding: "8px 14px", color: "hsl(var(--text-dim))", fontWeight: 600 }}>状态</th>
+                  <th style={{ textAlign: "right", padding: "8px 14px", color: "hsl(var(--text-dim))", fontWeight: 600 }}>字节</th>
+                </tr>
+              </thead>
+              <tbody>
+                {transferHistory.map((h, i) => (
+                  <tr key={i} style={{ borderTop: "1px solid hsl(var(--border-soft, var(--border)))" }}>
+                    <td style={{ padding: "8px 14px", fontFamily: "ui-monospace, monospace", color: "hsl(var(--text-faint))" }}>{fmtTs(h.time)}</td>
+                    <td style={{ padding: "8px 14px" }}>{h.direction === "send" ? "发送" : "接收"}</td>
+                    <td style={{ padding: "8px 14px", fontFamily: "ui-monospace, monospace" }}>{h.dataset}</td>
+                    <td>{codeStatus(h)}</td>
+                    <td className="num">{(h.bytes_sent + h.bytes_received).toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
+
+      {/* 详情弹层 */}
       {detail && (
         <DatasetDetailModal
           detail={detail}
@@ -478,7 +486,8 @@ export default function DatasetsPage() {
           onShareCancel={() => void cancelShare()}
         />
       )}
-      {/* 续传确认弹窗（接收侧 resume 事件触发；继续=关弹窗，引擎已自动续传） */}
+
+      {/* 续传确认弹窗（接收） */}
       {resumeAsk && (
         <ResumeDialog
           done={resumeAsk.done}
@@ -487,7 +496,8 @@ export default function DatasetsPage() {
           onReject={rejectResume}
         />
       )}
-      {/* 续传确认弹窗（共享侧 share://progress resume 事件触发；继续=关弹窗，引擎已自动续传） */}
+
+      {/* 续传确认弹窗（共享） */}
       {shareResume && (
         <ResumeDialog
           done={shareResume.done}

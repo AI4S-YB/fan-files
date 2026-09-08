@@ -2,7 +2,7 @@
 
 [package]
 name = "fan-files-desktop"
-version = "0.1.0"
+version = "0.2.7"
 description = "fan-files desktop shell (Tauri 2)"
 authors = ["you"]
 edition = "2021"

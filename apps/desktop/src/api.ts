@@ -5,6 +5,43 @@ export function setApiBase(port: number) {
   base = `http://127.0.0.1:${port}`;
 }
 
+// share 端 timeout layer 倒灶，但浏览器 fetch 自身不超时——防御性双保：
+// 若 share 进程卡死/Tauri IPC 桥挂死，UI 也必须在有限时间内给出"超时、重试"的反馈，
+// 而不是永远转圈。chat-search LLM 上限 20s → 宽给 30s；其他接口 10s。
+export class ApiTimeoutError extends Error {
+  constructor(public readonly ms: number) {
+    super(`请求超时（>${ms}ms）`);
+    this.name = "ApiTimeoutError";
+  }
+}
+
+/// 带超时与 AbortController 的 fetch 封装。超时抛 ApiTimeoutError（无 status，
+/// 由调用处与原生 TypeError 一并处理为"引擎可能繁忙/卡死——重试"）。
+async function fetchJSON(
+  path: string,
+  init: RequestInit | undefined,
+  ms: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(`${base}${path}`, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (e: unknown) {
+    // abort() 在 fetch 端会在将来版本变成 AbortSignal.timeout（当前已广泛支持）；
+    // 这里显式区分超时信号 vs 其它网络错误。
+    const abortErr = e as { name?: string };
+    if (abortErr?.name === "AbortError") throw new ApiTimeoutError(ms);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+const TIMEOUT_CHAT = 30_000;
+const TIMEOUT_DEFAULT = 10_000;
+
 // 只读导出，供测试断言 base 已被更新（正常业务代码不应读它）。
 export function getApiBase(): string {
   return base;
@@ -96,6 +133,8 @@ export interface ChatQuery {
 export interface ChatSearchResp {
   query: ChatQuery;
   results: DatasetSummary[];
+  /** 后端检测到与数据搜索无关时为 "irrelevant" — 前端显示友好提示而非降级 */
+  reason?: string | null;
 }
 
 // 对应后端 DatasetQuery：q/species/type/cursor/limit/sort/order。
@@ -135,7 +174,7 @@ export class ApiError extends Error {
 
 // Envelope 包装：{ data: T }
 async function get<T>(path: string): Promise<T> {
-  const r = await fetch(`${base}${path}`);
+  const r = await fetchJSON(path, undefined, TIMEOUT_DEFAULT);
   if (!r.ok) throw new ApiError(r.status);
   const body = await r.json();
   return body.data as T;
@@ -143,18 +182,22 @@ async function get<T>(path: string): Promise<T> {
 
 // 分页 Envelope：{ data: T[], meta: PageMeta }
 async function getPage<T>(path: string): Promise<PageEnvelope<T>> {
-  const r = await fetch(`${base}${path}`);
+  const r = await fetchJSON(path, undefined, TIMEOUT_DEFAULT);
   if (!r.ok) throw new ApiError(r.status);
   return (await r.json()) as PageEnvelope<T>;
 }
 
 // POST + Envelope 包装：{ data: T }（chat-search 等写/语义端点）
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const r = await fetch(`${base}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const r = await fetchJSON(
+    path,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    path === "/api/v1/chat-search" ? TIMEOUT_CHAT : TIMEOUT_DEFAULT,
+  );
   if (!r.ok) throw new ApiError(r.status);
   const data = await r.json();
   return data.data as T;

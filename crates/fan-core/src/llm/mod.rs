@@ -5,7 +5,7 @@ use prompt::{LlmOutput, system_prompt};
 use std::time::Duration;
 use tracing::info;
 
-const LLM_REQUEST_TIMEOUT_SECS: u64 = 180;
+const LLM_REQUEST_TIMEOUT_SECS: u64 = 25;
 
 pub struct LlmClient {
     pub config: LlmConfig,
@@ -86,7 +86,7 @@ impl LlmClient {
 }
 
 /// 按 api_type 构造 LLM 请求（url/headers/body）
-/// openai    → openai_chat_url(endpoint)（CC Switch OPENAI_BASE_URL 可能不含 /v1/chat/completions）
+/// openai    → openai_chat_url(endpoint)（base URL 可能不含 /v1/chat/completions）
 ///             headers: Authorization: Bearer {api_key}
 ///             body: {"model","messages","temperature":0.1}
 /// anthropic → anthropic_messages_url(endpoint)（endpoint 无 /v1 时拼）
@@ -125,7 +125,7 @@ pub fn build_llm_request(
 
 /// openai Chat Completions 端点 URL 规范化：
 /// - 已含 /chat/completions → 原样
-/// - 已含 /v1 → 拼 /chat/completions（CC Switch OPENAI_BASE_URL 形态，如 https://api.deepseek.com/v1）
+/// - 已含 /v1 → 拼 /chat/completions（base URL 形态，如 https://api.deepseek.com/v1）
 /// - 否则 → 拼 /v1/chat/completions
 fn openai_chat_url(endpoint: &str) -> String {
     let ep = endpoint.trim_end_matches('/');
@@ -337,7 +337,7 @@ mod tests {
     /// 否则 → 拼 /v1/chat/completions；尾斜杠不产生 //。
     #[test]
     fn openai_chat_url_three_forms() {
-        // CC Switch OPENAI_BASE_URL 形态
+        // OPENAI_BASE_URL 形态
         assert_eq!(
             openai_chat_url("https://api.deepseek.com/v1"),
             "https://api.deepseek.com/v1/chat/completions"

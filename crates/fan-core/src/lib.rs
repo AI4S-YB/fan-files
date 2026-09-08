@@ -1,4 +1,3 @@
-pub mod cc_switch;
 pub mod config;
 pub mod discovery;
 pub mod detector;

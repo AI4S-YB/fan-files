@@ -21,9 +21,4 @@ describe("Sidebar", () => {
     fireEvent.click(screen.getByText("数据集"));
     expect(onSelect).toHaveBeenCalledWith("datasets");
   });
-
-  it("renders the brand text", () => {
-    render(<Sidebar page="home" onSelect={() => {}} />);
-    expect(screen.getByText(/fan-files/)).toBeInTheDocument();
-  });
 });

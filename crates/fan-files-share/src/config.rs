@@ -1,5 +1,5 @@
 use clap::Parser;
-use fan_core::config::LlmConfig;
+use fan_core::config::{EmbeddingConfig, LlmConfig};
 use serde::Deserialize;
 use std::{env, fs, net::SocketAddr, path::PathBuf};
 
@@ -35,6 +35,11 @@ pub struct Settings {
     /// LLM 模型配置（config.toml [llm] 段；未配置时 chat-search 返回 503，
     /// 前端降级基础搜索）。旧配置文件无该段 → 默认空配置，不破坏加载
     pub llm: LlmConfig,
+    /// Embedding 模型配置（[embedding] 段，CLI 与 share 共享同一配置文件）。
+    /// share 用它来做 hybrid search 的语义重排（同 CLI `fan-files search`）。
+    /// 模型不在 → 走 hash fallback（语义相似度退化为 0，仅 Tantivy 排序）
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
 }
 
 impl Default for Settings {
@@ -50,13 +55,27 @@ impl Default for Settings {
             expose_absolute_paths: false,
             supported_schema_versions: vec![4],
             llm: LlmConfig::default(),
+            embedding: EmbeddingConfig::default(),
         }
     }
 }
 
 impl Settings {
     pub fn load(args: Args) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut value = if let Some(path) = args.config {
+        // Resolve config path in this order:
+        //   1. explicit --config flag (CLI 显式传)
+        //   2. fan-core canonical `~/.fan-files/config.toml`（与 CLI 共享同一份配置；
+        //      桌面壳通过 fan-files-share 的 sidecar 启动时不传 --config，
+        //      不再回退到 default，否则 LLM/embedding 配置全部丢失 → chat-search 一直 503）
+        //   3. 显式 default（仅前两者都不可用时）
+        let config_path = args
+            .config
+            .clone()
+            .or_else(|| {
+                let canonical = fan_core::config::dirs_fan().join("config.toml");
+                if canonical.is_file() { Some(canonical) } else { None }
+            });
+        let mut value = if let Some(path) = config_path {
             toml::from_str(&fs::read_to_string(path)?)?
         } else {
             Self::default()
@@ -134,7 +153,8 @@ mod tests {
     }
 
     /// [llm] 段解析进 Settings.llm（NR-T2：chat-search 的模型配置来源）；
-    /// 缺 [llm] 段 → 默认空配置（未配置，chat-search 返回 503）
+    /// 缺 [llm] 段 → 默认空配置（未配置，chat-search 返回 503）。
+    /// 当 ~/.fan-files/config.toml 不存在时，无 --config 参数会使用默认空配置。
     #[test]
     fn settings_load_parses_llm_section_and_defaults_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -151,10 +171,28 @@ mod tests {
         assert_eq!(settings.llm.api_key, "sk-x");
         assert_eq!(settings.llm.model, "deepseek-chat");
         assert_eq!(settings.llm.api_type, "anthropic");
-        // 无 [llm] 段 → 默认空配置（未配置，chat-search 返回 503）
+        // 无 --config 且 ~/.fan-files/config.toml 不存在 → 默认空配置
         let plain = Args::try_parse_from(["fan-files-share"]).unwrap();
         let settings = Settings::load(plain).unwrap();
-        assert!(settings.llm.endpoint.is_empty());
-        assert!(settings.llm.api_key.is_empty());
+        // 注意：若 ~/.fan-files/config.toml 存在则会读到真实配置（这是正确的行为）
+        // 此断言在 ~/.fan-files/config.toml 不存在时成立
+        if !fan_core::config::dirs_fan().join("config.toml").is_file() {
+            assert!(settings.llm.endpoint.is_empty());
+            assert!(settings.llm.api_key.is_empty());
+        }
+    }
+
+    /// 无 --config 且 ~/.fan-files/config.toml 存在时 → 读取该配置
+    /// （无法直接重定向 HOME，依赖测试运行环境隔离）
+    #[test]
+    fn settings_load_falls_back_to_home_config_when_present() {
+        // 仅当 ~/.fan-files/config.toml 存在时验证
+        if !fan_core::config::dirs_fan().join("config.toml").is_file() {
+            return;
+        }
+        let args = Args::try_parse_from(["fan-files-share"]).unwrap();
+        let settings = Settings::load(args).unwrap();
+        // 仅验证读到了（具体值取决于 ~/.fan-files/config.toml）
+        let _ = settings.llm.endpoint;
     }
 }

@@ -1,9 +1,10 @@
+import { Sun, Moon, Monitor } from "lucide-react";
 import { useTheme } from "../hooks/useTheme";
 
-const options: { value: "light" | "dark" | "system"; icon: string; label: string }[] = [
-  { value: "light", icon: "☀️", label: "浅色" },
-  { value: "dark",  icon: "🌙", label: "暗色" },
-  { value: "system", icon: "💻", label: "跟随系统" },
+const options: { value: "light" | "dark" | "system"; Icon: typeof Sun; label: string; shortcut: string }[] = [
+  { value: "light",  Icon: Sun,     label: "浅色",  shortcut: "L" },
+  { value: "dark",   Icon: Moon,    label: "暗色",  shortcut: "D" },
+  { value: "system", Icon: Monitor, label: "跟随系统", shortcut: "S" },
 ];
 
 export default function ThemeToggle({ compact = false }: { compact?: boolean }) {
@@ -12,14 +13,7 @@ export default function ThemeToggle({ compact = false }: { compact?: boolean }) 
     <div
       role="group"
       aria-label="主题切换"
-      style={{
-        display: "inline-flex",
-        padding: 2,
-        borderRadius: "var(--radius)",
-        background: "hsl(var(--bg-elevated))",
-        border: "1px solid hsl(var(--border))",
-        gap: 2,
-      }}
+      className={`theme-toggle ${compact ? "theme-toggle-compact" : ""}`}
     >
       {options.map((o) => {
         const active = theme === o.value;
@@ -28,24 +22,13 @@ export default function ThemeToggle({ compact = false }: { compact?: boolean }) 
             key={o.value}
             type="button"
             aria-pressed={active}
-            title={o.label}
+            title={`${o.label} (⌘${o.shortcut})`}
+            aria-keyshortcuts={`Meta+${o.shortcut}`}
             onClick={() => setTheme(o.value)}
-            style={{
-              padding: compact ? "2px 6px" : "4px 10px",
-              fontSize: compact ? 12 : 13,
-              border: "none",
-              borderRadius: "var(--radius-sm)",
-              background: active ? "hsl(var(--bg))" : "transparent",
-              color: active ? "hsl(var(--fg))" : "hsl(var(--fg-muted))",
-              boxShadow: active
-                ? "var(--shadow-sm), 0 0 0 1px hsl(var(--primary) / .5)"
-                : "none",
-              cursor: "pointer",
-              transition: "all 150ms ease",
-            }}
+            className={`theme-toggle-btn ${active ? "active" : ""}`}
           >
-            <span aria-hidden="true">{o.icon}</span>
-            {!compact && <span style={{ marginLeft: 4 }}>{o.label}</span>}
+            <o.Icon size={compact ? 12 : 13} />
+            {!compact && <span>{o.label}</span>}
           </button>
         );
       })}

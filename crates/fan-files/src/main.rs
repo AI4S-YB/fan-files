@@ -115,23 +115,6 @@ enum Commands {
     /// Manage registered servers
     #[command(subcommand)]
     Servers(ServersAction),
-    /// Configuration queries (JSON output for GUI)
-    #[command(subcommand)]
-    Config(ConfigAction),
-}
-
-#[derive(Subcommand)]
-enum ConfigAction {
-    /// Output CC Switch LLM endpoint as JSON (active profile; --list all profiles; --profile <name> select)
-    /// ({"api_type","base_url","api_key","model"}; none found → {"error":"not-found"} + exit 1)
-    CcSwitch {
-        /// List all profiles as JSON array [{"name","api_type","model"},...]
-        #[arg(long)]
-        list: bool,
-        /// Read a specific profile by name
-        #[arg(long)]
-        profile: Option<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -317,9 +300,6 @@ fn main() {
             ServersAction::Remove { name } => commands::servers::remove(&name),
             ServersAction::Scan { name, agent } => commands::servers::scan_one_inner(&name, agent),
             ServersAction::Watch { name } => commands::servers::watch_remote(&name),
-        },
-        Commands::Config(action) => match action {
-            ConfigAction::CcSwitch { list, profile } => commands::config::cc_switch(list, profile),
         },
     }
 }

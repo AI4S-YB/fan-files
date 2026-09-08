@@ -2,73 +2,100 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ["v*"]
 
 permissions:
   contents: write
 
 jobs:
-  build-linux:
-    name: Build (linux-x86_64)
-    runs-on: ubuntu-22.04
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            artifact_ext: AppImage
+          - platform: macos-latest
+            artifact_ext: dmg
+          - platform: windows-latest
+            artifact_ext: msi
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
-      - name: Install system dependencies
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # Tauri v2 system deps + sidecar build deps (candle-onnx needs protoc,
+      # libclang/pkg-config for bindgen-ish deps — mirrors release.yml)
+      - name: Linux deps
+        if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake libclang-dev libssl-dev \
-            pkg-config protobuf-compiler libprotobuf-dev libsqlite3-dev
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libssl-dev \
+            build-essential cmake libclang-dev pkg-config \
+            protobuf-compiler libprotobuf-dev libsqlite3-dev
+
+      - name: macOS deps
+        if: matrix.platform == 'macos-latest'
+        run: brew install protobuf cmake
+
+      - name: Windows deps
+        if: matrix.platform == 'windows-latest'
+        run: choco install protoc -y
 
       - name: Build release binary
         run: cargo build --release --bin fan-files
 
-      - name: Package
-        run: |
-          cd target/release
-          strip fan-files
-          tar czf fan-files-linux-x86_64.tar.gz fan-files
+      - name: Build desktop (Tauri bundle includes sidecars)
+        working-directory: apps/desktop
+        run: npm install && npm run tauri build -- --bundles app
+        timeout-minutes: 30
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+      # Desktop bundle 输出到 src-tauri/target/release/bundle/
+      # macOS .dmg / linux .AppImage / windows .msi
+
+      - name: Upload CLI binary
+        uses: actions/upload-artifact@v4
         with:
-          files: target/release/fan-files-linux-x86_64.tar.gz
-          body_path: RELEASE.md
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: "cli-${{ matrix.platform }}"
+          path: target/release/fan-files
 
-  build-macos:
-    name: Build (macOS-arm64)
-    runs-on: macos-latest
+      - name: Upload desktop bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: "desktop-${{ matrix.platform }}"
+          path: apps/desktop/src-tauri/target/release/bundle/**
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
-        run: |
-          brew install cmake protobuf openssl@3
-
-      - name: Build release binary
-        env:
-          OPENSSL_ROOT_DIR: /usr/local/opt/openssl@3
-        run: cargo build --release --bin fan-files
-
-      - name: Package
-        run: |
-          cd target/release
-          strip fan-files || true
-          tar czf fan-files-macos-arm64.tar.gz fan-files
-
-      - name: Upload to release
+      - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/fan-files-macos-arm64.tar.gz
+          files: release-artifacts/**
+          tag_name: ${{ github.ref_name }}
+          body_path: RELEASE.md
+          draft: false
+          prerelease: false
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

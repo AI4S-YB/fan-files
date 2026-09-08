@@ -4,3 +4,5 @@ target/
 docs/
 
 .superpowers/
+.pnpm-store/
+node_modules/

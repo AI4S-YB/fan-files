@@ -8,7 +8,7 @@ mod state;
 use clap::Parser;
 use config::{Args, Settings};
 use state::AppState;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::{
     catch_panic::CatchPanicLayer,

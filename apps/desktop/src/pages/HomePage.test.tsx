@@ -44,8 +44,12 @@ beforeEach(() => {
   };
   // 按命令名分发：read_config 返回配置对象，scan_state 返回布尔（ScanPanel 轮询）
   vi.mocked(invoke).mockImplementation((cmd: string) => {
-    if (cmd === "scan_state") return Promise.resolve(false);
-    return Promise.resolve(mockConfig);
+    switch (cmd) {
+      case "scan_state":       return Promise.resolve(false);
+      case "read_config":      return Promise.resolve(mockConfig);
+      case "transfer_history": return Promise.resolve([]);
+      default:                 return Promise.resolve(undefined);
+    }
   });
   vi.mocked(listen).mockImplementation(
     (name: string, cb: EventCallback<unknown>) => {
@@ -60,8 +64,8 @@ describe("HomePage", () => {
     mockConfig = { ...mockConfig, include: [] };
     mockedApi.fetchStats.mockResolvedValue(null as never); // 无索引
     render(<HomePage onGoSettings={onGoSettings} />);
-    // 按钮文案为 "📁 选择目录开始扫描"，用正则做子串匹配
-    const cta = await screen.findByText(/选择目录开始扫描/);
+    // 按钮文案为 "选择目录开始"
+    const cta = await screen.findByText(/选择目录开始/);
     expect(cta).toBeInTheDocument();
     fireEvent.click(cta);
     expect(onGoSettings).toHaveBeenCalledTimes(1);
@@ -124,6 +128,7 @@ describe("HomePage", () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0));
     });
-    expect(vi.mocked(listen)).toHaveBeenCalledTimes(3);
+    // ScanPanel: 3 (progress/done/error) + HomePage: 4 (share://progress/done, receive://progress/done)
+    expect(vi.mocked(listen)).toHaveBeenCalledTimes(7);
   });
 });

@@ -88,8 +88,8 @@ export default function ScanPanel({ onDone }: { onDone?: () => void }) {
 
   return (
     <div className="scan-panel">
-      <button className="primary" disabled={running} onClick={scan}>
-        {running ? "扫描中…" : "🔄 重新扫描"}
+      <button className="btn btn-primary" disabled={running} onClick={scan}>
+        {running ? <><span className="spinner" /> 扫描中…</> : "重新扫描"}
       </button>
       {lines.length > 0 && <pre className="scan-log">{lines.join("\n")}</pre>}
     </div>

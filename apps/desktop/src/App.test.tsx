@@ -68,27 +68,25 @@ beforeEach(() => {
 });
 
 describe("App shell", () => {
-  it("renders sidebar with four entries", async () => {
+  it("renders sidebar with four nav entries", async () => {
     const { container } = render(<App />);
-    // HomePage 挂载后有异步状态更新，等 ScanPanel 出现以 flush 掉它们
-    await screen.findByText("🔄 重新扫描");
-    // 页面正文里也有"首页"等文案（如 h2），断言范围限定在侧边栏内（aria-label="主导航"）
-    const sidebar = within(container.querySelector('nav[aria-label="主导航"]') as HTMLElement);
+    await screen.findByText("重新扫描");
+    const nav = within(container.querySelector('nav[aria-label="主导航"]') as HTMLElement);
     for (const label of ["首页", "数据集", "搜索", "设置"]) {
-      expect(sidebar.getByText(label)).toBeInTheDocument();
+      expect(nav.getByRole("button", { name: new RegExp(label) })).toBeInTheDocument();
     }
   });
   it("switches page on sidebar click", async () => {
     const { container } = render(<App />);
-    await screen.findByText("🔄 重新扫描");
-    const sidebar = within(container.querySelector('nav[aria-label="主导航"]') as HTMLElement);
-    const btn = sidebar.getByText("数据集").closest("button")!;
+    await screen.findByText("重新扫描");
+    const nav = within(container.querySelector('nav[aria-label="主导航"]') as HTMLElement);
+    const btn = nav.getByRole("button", { name: /数据集/ }).closest("button")!;
     fireEvent.click(btn);
     expect(btn).toHaveAttribute("aria-current", "page");
   });
   it("sets api base from get_share_port", async () => {
     render(<App />);
-    await screen.findByText("🔄 重新扫描");
+    await screen.findByText("重新扫描");
     expect(invoke).toHaveBeenCalledWith("get_share_port");
     expect(api.getApiBase()).toBe("http://127.0.0.1:17951");
   });
@@ -98,7 +96,7 @@ describe("App shell", () => {
       read_config: { include: [], exclude: [], endpoint: "", api_key: "", model: "" },
     });
     render(<App />);
-    fireEvent.click(await screen.findByText(/选择目录开始扫描/));
+    fireEvent.click(await screen.findByText(/选择目录开始/));
     expect(
       await screen.findByRole("button", { name: "保存配置" })
     ).toBeInTheDocument();
@@ -112,7 +110,7 @@ describe("App shell", () => {
     window.addEventListener("fan-scan-done", onScan);
     try {
       render(<App />);
-      await screen.findByText("🔄 重新扫描");
+      await screen.findByText("重新扫描");
       act(() => eventMock.emit("scan://done", 0));
       expect(heard).toBe(1);
       act(() => eventMock.emit("scan://done", 1));

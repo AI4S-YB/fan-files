@@ -73,3 +73,20 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         with:
           projectPath: apps/desktop
+          packageName: "fan-files-desktop"
+
+      - name: Upload desktop bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "desktop-${{ matrix.platform }}"
+          path: apps/desktop/src-tauri/target/release/bundle/**
+          if-no-files-found: warn
+
+      # 开发分支构建产物也上传，供 Review 使用
+      - name: Upload CLI binary
+        if: matrix.platform == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "cli-macOS-arm64"
+          path: target/release/fan-files

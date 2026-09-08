@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, EmbeddingConfig};
 use candle_core::{Device, Tensor};
 use std::collections::HashMap;
 use std::io::Read;
@@ -28,8 +28,18 @@ struct OnnxModel {
 impl EmbeddingEngine {
     /// Create the engine without loading the model yet.
     /// The ONNX model (~90MB) is loaded lazily on first embed() call.
+    ///
+    /// Accepts the full `Config` for backward compatibility (CLI path) and
+    /// `EmbeddingConfig` for the share crate / desktop sidecar that does
+    /// not need the rest of the configuration.
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
-        let model_name = config.embedding.model.clone();
+        Self::with_embedding_config(config.embedding.clone())
+    }
+
+    /// Create the engine from a bare `EmbeddingConfig`. Used by `fan-files-share`
+    /// which only needs the embedding model name (no scan/watch/transfer knobs).
+    pub fn with_embedding_config(embedding: EmbeddingConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let model_name = embedding.model.clone();
         let dim = Self::model_dim(&model_name);
 
         Ok(Self {
